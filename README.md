@@ -89,6 +89,19 @@ match_by_label = true
 
 `herdr-plugin.toml` declares event hooks for `pane.agent_status_changed`, `pane.closed`, `workspace.closed`, `workspace.focused`, and `workspace.renamed`, plus a `startup` hook. herdr spawns `cmux_herdr.py` for each event, passing the payload in `HERDR_PLUGIN_EVENT_JSON`. The script keeps per-pane status in `$HERDR_PLUGIN_STATE_DIR/state.json`, aggregates it per herdr workspace, and drives the cmux CLI (`notify`, `set-status` / `clear-status`, `mark-notification-read`). All cmux failures are logged and tolerated, so a closed cmux app never breaks herdr.
 
+## Development
+
+Requires [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync                 # create .venv with dev dependencies
+uv run pytest           # run tests
+uv run ruff check .     # lint
+uv run ruff format .    # format
+```
+
+CI runs lint, format check, and tests on Python 3.11 and 3.13. The plugin itself is executed by herdr with the system `python3` (3.11+), so keep it free of third-party runtime dependencies.
+
 ## License
 
 [MIT](LICENSE)
