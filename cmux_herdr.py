@@ -98,8 +98,9 @@ def cmux_workspaces_by_title(cfg):
 def herdr_session_pids():
     session = os.environ.get("HERDR_SESSION", "")
     try:
-        proc = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
-                              text=True, timeout=10)
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=10
+        )
     except subprocess.TimeoutExpired:
         return []
     pids = []
@@ -114,11 +115,15 @@ def herdr_session_pids():
         if re.search(r"\b(server|remote-client-bridge)\b", args):
             continue
         if re.search(r"(^|\s)--session(=|\s)", args):
-            if session and not re.search(rf"--session(=|\s+){re.escape(session)}(\s|$)", args):
+            if session and not re.search(
+                rf"--session(=|\s+){re.escape(session)}(\s|$)", args
+            ):
                 continue
             pids.append(int(pid))
         elif re.search(r"(^|\s)session\s+attach(\s|$)", args):
-            if session and not re.search(rf"session\s+attach\s+{re.escape(session)}(\s|$)", args):
+            if session and not re.search(
+                rf"session\s+attach\s+{re.escape(session)}(\s|$)", args
+            ):
                 continue
             pids.append(int(pid))
         elif re.match(r"^\S*herdr\s*$", args):
@@ -168,7 +173,11 @@ def detect_session_workspace(cfg, state):
             proc = run([binary, "top", "--all", "--processes", "--json"], timeout=20)
             if proc.returncode == 0:
                 ref = find_pid_workspace(json.loads(proc.stdout), set(pids))
-        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        except (
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+        ) as e:
             log(f"session workspace detection failed: {e}")
     if ref:
         state["session_ref"] = {"ref": ref, "at": time.time()}
@@ -201,7 +210,10 @@ def resolve_cmux_workspace(cfg, state, ws_id):
     if not ref and cfg.get("match_by_label", True) and label:
         ref = cmux_workspaces_by_title(cfg).get(label.strip().lower())
     if not ref:
-        log(f"no cmux workspace mapping for herdr workspace {ws_id} ({label!r}); skipping")
+        log(
+            f"no cmux workspace mapping for herdr workspace {ws_id} "
+            f"({label!r}); skipping"
+        )
     return ref, label
 
 
@@ -221,13 +233,35 @@ def update_pill(cfg, state, ws_id):
         parts = [f"{waiting} waiting"]
         if working:
             parts.append(f"{working} working")
-        cmux_cli(cfg, ["set-status", key, " · ".join(parts),
-                       "--workspace", ref, "--color", STATUS_COLOR_WAITING,
-                       "--priority", "20"])
+        cmux_cli(
+            cfg,
+            [
+                "set-status",
+                key,
+                " · ".join(parts),
+                "--workspace",
+                ref,
+                "--color",
+                STATUS_COLOR_WAITING,
+                "--priority",
+                "20",
+            ],
+        )
     elif working:
-        cmux_cli(cfg, ["set-status", key, f"{working} working",
-                       "--workspace", ref, "--color", STATUS_COLOR_WORKING,
-                       "--priority", "10"])
+        cmux_cli(
+            cfg,
+            [
+                "set-status",
+                key,
+                f"{working} working",
+                "--workspace",
+                ref,
+                "--color",
+                STATUS_COLOR_WORKING,
+                "--priority",
+                "10",
+            ],
+        )
     else:
         cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
 
@@ -264,11 +298,21 @@ def on_agent_status_changed(cfg, state, data):
         agent = pane["agent"]
         label = ws.get("label") or ws_id
         if status == "blocked":
-            notify(cfg, state, ws_id, f"{agent}: waiting for input",
-                   f"{label} · {pane['title'] or pane_id}")
+            notify(
+                cfg,
+                state,
+                ws_id,
+                f"{agent}: waiting for input",
+                f"{label} · {pane['title'] or pane_id}",
+            )
         else:
-            notify(cfg, state, ws_id, f"{agent}: finished",
-                   f"{label} · {pane['title'] or pane_id}")
+            notify(
+                cfg,
+                state,
+                ws_id,
+                f"{agent}: finished",
+                f"{label} · {pane['title'] or pane_id}",
+            )
 
     update_pill(cfg, state, ws_id)
 
@@ -366,11 +410,15 @@ def main():
         else:
             state.pop("session_ref", None)
             ref = detect_session_workspace(cfg, state)
-            print(json.dumps({
-                "cmux_workspace": ref,
-                "herdr_session": os.environ.get("HERDR_SESSION"),
-                "candidate_pids": herdr_session_pids(),
-            }))
+            print(
+                json.dumps(
+                    {
+                        "cmux_workspace": ref,
+                        "herdr_session": os.environ.get("HERDR_SESSION"),
+                        "candidate_pids": herdr_session_pids(),
+                    }
+                )
+            )
         save_state(state)
     except Exception as e:
         log(f"unhandled error in {mode}: {e!r}")
