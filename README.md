@@ -22,16 +22,24 @@ The plugin must be linked into the herdr **server** that runs on the same machin
 ## Install
 
 ```bash
+herdr plugin install tomoya55/cmux-herdr
+```
+
+Once installed, the plugin stays enabled across herdr server restarts. A `startup` hook reconciles state from `herdr agent list` on server start, and all updates after that are event-driven.
+
+To update to the latest main, reinstall; to pin a release, pass `--ref <tag>`.
+
+For development, link a local checkout instead (hooks spawn the script fresh on every event, so edits take effect without reinstalling):
+
+```bash
 git clone https://github.com/tomoya55/cmux-herdr.git
 herdr plugin link /path/to/cmux-herdr
 ```
 
-Once linked, the plugin stays enabled across herdr server restarts. A `startup` hook reconciles state from `herdr agent list` on server start, and all updates after that are event-driven. Updating the plugin is just `git pull` — hooks spawn the script fresh on every event, so no restart is needed.
-
 To remove it:
 
 ```bash
-herdr plugin unlink cmux-herdr
+herdr plugin uninstall cmux-herdr
 ```
 
 ## How cmux workspaces are resolved
