@@ -1,0 +1,29 @@
+id = "cmux-herdr"
+name = "cmux-herdr"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Propagate herdr agent status to the cmux sidebar"
+platforms = ["macos"]
+
+[[startup]]
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
+
+[[events]]
+on = "pane.closed"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
+
+[[events]]
+on = "workspace.closed"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
+
+[[events]]
+on = "workspace.focused"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
