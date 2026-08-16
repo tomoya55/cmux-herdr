@@ -1,0 +1,6 @@
+cmux_bin = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+match_by_label = true
+
+[workspaces]
+
+[labels]
