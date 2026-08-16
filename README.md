@@ -91,4 +91,4 @@ match_by_label = true
 
 ## License
 
-TBD
+[MIT](LICENSE)
