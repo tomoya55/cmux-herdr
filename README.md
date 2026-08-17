@@ -8,7 +8,26 @@ When you run a herdr session inside a cmux workspace, cmux has no way to know wh
   - `blocked` → `<agent>: waiting for input`
   - `done` → `<agent>: finished`
 - **A status pill** on the cmux workspace showing the live aggregate, e.g. `1 waiting · 2 working` (orange while any agent waits for input, blue while agents are working, cleared when everything is idle)
-- Focusing the herdr workspace marks the corresponding cmux notifications as read
+- Notifications are marked read when you focus the herdr workspace, and also as soon as the agent leaves `blocked`/`done` — answering or dismissing the prompt means the notification has been actioned
+- **Self-healing reconcile** on herdr server start: rebuilds pills from `herdr agent list`, clears pills/notifications left behind by sessions that ended while the server was down, and sweeps orphaned `herdr.*` sidebar entries that plugin state no longer knows about
+
+## Manual refresh
+
+If the cmux sidebar ever looks stale (stuck `waiting` pills or unread badges), invoke the plugin action:
+
+```bash
+herdr plugin action invoke cmux-herdr.refresh
+```
+
+This re-runs the full reconcile: it re-pushes the current aggregate, clears orphaned `herdr.*` pills across all cmux workspaces, and marks leftover herdr notifications as read (as long as no agent is currently waiting for input). You can also bind it to a key:
+
+```toml
+[[keys.command]]
+key = "prefix+r"
+type = "plugin_action"
+command = "cmux-herdr.refresh"
+description = "refresh cmux sidebar"
+```
 
 ## Requirements
 
@@ -95,7 +114,7 @@ match_by_label = true
 
 ## How it works
 
-`herdr-plugin.toml` declares event hooks for `pane.agent_status_changed`, `pane.closed`, `workspace.closed`, `workspace.focused`, and `workspace.renamed`, plus a `startup` hook. herdr spawns `cmux_herdr.py` for each event, passing the payload in `HERDR_PLUGIN_EVENT_JSON`. The script keeps per-pane status in `$HERDR_PLUGIN_STATE_DIR/state.json`, aggregates it per herdr workspace, and drives the cmux CLI (`notify`, `set-status` / `clear-status`, `mark-notification-read`). All cmux failures are logged and tolerated, so a closed cmux app never breaks herdr.
+`herdr-plugin.toml` declares event hooks for `pane.agent_status_changed`, `pane.closed`, `workspace.closed`, `workspace.focused`, and `workspace.renamed`, plus a `startup` hook and a `refresh` action (both run the reconcile path). herdr spawns `cmux_herdr.py` for each event, passing the payload in `HERDR_PLUGIN_EVENT_JSON`. The script keeps per-pane status in `$HERDR_PLUGIN_STATE_DIR/state.json`, aggregates it per herdr workspace, and drives the cmux CLI (`notify`, `set-status` / `clear-status`, `mark-notification-read`). All cmux failures are logged and tolerated, so a closed cmux app never breaks herdr.
 
 ## Development
 

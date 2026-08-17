@@ -15,6 +15,8 @@ DEFAULT_CMUX_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 STATUS_COLOR_WAITING = "#ff9500"
 STATUS_COLOR_WORKING = "#0a84ff"
 DETECT_TTL_SECONDS = 300
+NOTIFICATION_SUBTITLE = "herdr"
+NOTIFICATION_TITLE_RE = re.compile(r": (waiting for input|finished)$")
 
 state_dir = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", "."))
 config_dir = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "."))
@@ -93,6 +95,37 @@ def cmux_workspaces_by_title(cfg):
         if m:
             result[m.group(2).strip().lower()] = m.group(1)
     return result
+
+
+def cmux_herdr_status_keys(cfg, ref):
+    binary = cfg.get("cmux_bin") or DEFAULT_CMUX_BIN
+    try:
+        proc = run([binary, "list-status", "--workspace", ref])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    keys = []
+    for line in proc.stdout.splitlines():
+        m = re.match(r"^(herdr\.\S+?)=", line.strip())
+        if m:
+            keys.append(m.group(1))
+    return keys
+
+
+def cmux_notifications(cfg):
+    binary = cfg.get("cmux_bin") or DEFAULT_CMUX_BIN
+    try:
+        proc = run([binary, "list-notifications", "--json"])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
 
 
 def herdr_session_pids():
@@ -270,7 +303,76 @@ def notify(cfg, state, ws_id, title, body):
     ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
     if not ref:
         return
-    cmux_cli(cfg, ["notify", "--title", title, "--body", body, "--workspace", ref])
+    cmux_cli(
+        cfg,
+        [
+            "notify",
+            "--title",
+            title,
+            "--subtitle",
+            NOTIFICATION_SUBTITLE,
+            "--body",
+            body,
+            "--workspace",
+            ref,
+        ],
+    )
+
+
+def mark_read(cfg, state, ws_id):
+    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+    if not ref:
+        return
+    cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
+
+
+def has_attention_panes(panes):
+    return any(p["status"] in ATTENTION_STATUSES for p in panes.values())
+
+
+def sweep_orphan_pills(cfg, state):
+    """Clear herdr.* status pills that no active herdr workspace owns.
+
+    Orphans appear when the plugin state was lost (e.g. the herdr server was
+    reinstalled) while cmux kept the sidebar entries.
+    """
+    active_keys = {
+        status_key(ws_id)
+        for ws_id, ws in state["workspaces"].items()
+        if ws.get("panes")
+    }
+    for ref in cmux_workspaces_by_title(cfg).values():
+        for key in cmux_herdr_status_keys(cfg, ref):
+            if key not in active_keys:
+                log(f"clearing orphaned status {key} on {ref}")
+                cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
+
+
+def is_our_notification(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("subtitle") == NOTIFICATION_SUBTITLE:
+        return True
+    # Notifications sent before the subtitle tag existed
+    return bool(NOTIFICATION_TITLE_RE.search(str(item.get("title") or "")))
+
+
+def sweep_notifications(cfg, state):
+    """Mark our unread notifications read once nothing needs attention.
+
+    Skipped entirely while any pane is blocked/done, since unread
+    notifications may still be legitimate then.
+    """
+    if any(
+        has_attention_panes(ws.get("panes", {})) for ws in state["workspaces"].values()
+    ):
+        return
+    for item in cmux_notifications(cfg):
+        if item.get("is_read") or not is_our_notification(item):
+            continue
+        notif_id = item.get("id")
+        if notif_id:
+            cmux_cli(cfg, ["mark-notification-read", "--id", notif_id])
 
 
 def get_workspace(state, ws_id):
@@ -283,6 +385,7 @@ def on_agent_status_changed(cfg, state, data):
     status = data["agent_status"]
     ws = get_workspace(state, ws_id)
     panes = ws["panes"]
+    was_attention = panes.get(pane_id, {}).get("status") in ATTENTION_STATUSES
 
     if status in TRACKED_STATUSES:
         panes[pane_id] = {
@@ -313,6 +416,10 @@ def on_agent_status_changed(cfg, state, data):
                 f"{agent}: finished",
                 f"{label} · {pane['title'] or pane_id}",
             )
+    elif was_attention and not has_attention_panes(panes):
+        # Leaving blocked/done means the prompt was answered or dismissed;
+        # the notifications for this workspace have been actioned.
+        mark_read(cfg, state, ws_id)
 
     update_pill(cfg, state, ws_id)
 
@@ -323,8 +430,14 @@ def on_pane_closed(cfg, state, data):
     if not ws_id or not pane_id:
         return
     ws = state["workspaces"].get(ws_id)
-    if ws and ws["panes"].pop(pane_id, None) is not None:
-        update_pill(cfg, state, ws_id)
+    if not ws:
+        return
+    pane = ws["panes"].pop(pane_id, None)
+    if pane is None:
+        return
+    if pane["status"] in ATTENTION_STATUSES and not has_attention_panes(ws["panes"]):
+        mark_read(cfg, state, ws_id)
+    update_pill(cfg, state, ws_id)
 
 
 def on_workspace_closed(cfg, state, data):
@@ -342,9 +455,7 @@ def on_workspace_focused(cfg, state, data):
     ws_id = data.get("workspace_id")
     if not ws_id:
         return
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
-    if ref:
-        cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
+    mark_read(cfg, state, ws_id)
 
 
 def on_workspace_renamed(cfg, state, data):
@@ -369,6 +480,7 @@ def handle_event(cfg, state, event):
 
 
 def reconcile(cfg, state):
+    previous = state["workspaces"]
     state["workspaces"] = {}
     try:
         agents = herdr_cli(["agent", "list"]).get("agents", [])
@@ -390,6 +502,20 @@ def reconcile(cfg, state):
         }
     for ws_id in ws_ids:
         update_pill(cfg, state, ws_id)
+    # Clear pills/notifications left behind by workspaces that no longer have
+    # tracked agents (e.g. the session ended while the server was down).
+    for ws_id, entry in previous.items():
+        panes = entry.get("panes", {})
+        if ws_id in state["workspaces"] or not panes:
+            continue
+        state["workspaces"][ws_id] = {"label": entry.get("label", ""), "panes": {}}
+        update_pill(cfg, state, ws_id)
+        if has_attention_panes(panes):
+            mark_read(cfg, state, ws_id)
+        state["workspaces"].pop(ws_id, None)
+    # Sweep cmux-side leftovers that the plugin state no longer knows about.
+    sweep_orphan_pills(cfg, state)
+    sweep_notifications(cfg, state)
 
 
 def main():

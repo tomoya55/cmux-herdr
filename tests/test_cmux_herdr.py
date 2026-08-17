@@ -121,6 +121,40 @@ def test_pane_closed_updates_pill(cfg, state, cmux_calls):
     assert pill[0][2] == "1 working"
 
 
+def test_leaving_attention_marks_notifications_read(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    cmux_calls.clear()
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
+
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+
+
+def test_other_attention_pane_keeps_notifications_unread(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    ch.handle_event(cfg, state, status_event("w1:p2", "w1", "blocked"))
+    cmux_calls.clear()
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
+
+    assert [c for c in cmux_calls if c[0] == "mark-notification-read"] == []
+
+
+def test_pane_closed_attention_marks_notifications_read(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    cmux_calls.clear()
+    ch.handle_event(
+        cfg,
+        state,
+        {
+            "event": "pane_closed",
+            "data": {"type": "pane_closed", "pane_id": "w1:p1", "workspace_id": "w1"},
+        },
+    )
+
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+
+
 def test_workspace_closed_clears_status(cfg, state, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
     cmux_calls.clear()
@@ -331,6 +365,121 @@ def test_reconcile_rebuilds_state(monkeypatch, cfg, state, cmux_calls):
     assert list(state["workspaces"]["w2"]["panes"]) == ["w2:p1"]
     pills = [c for c in cmux_calls if c[0] == "set-status"]
     assert len(pills) == 2
+
+
+def test_reconcile_clears_stale_workspace(monkeypatch, cfg, state, cmux_calls):
+    state["workspaces"]["w1"] = {
+        "label": "",
+        "panes": {
+            "w1:p1": {"status": "blocked", "agent": "claude", "title": "fix"},
+        },
+    }
+    monkeypatch.setattr(ch, "herdr_cli", lambda args: {"agents": []})
+
+    ch.reconcile(cfg, state)
+
+    assert "w1" not in state["workspaces"]
+    clear = [c for c in cmux_calls if c[0] == "clear-status"]
+    assert clear == [["clear-status", "herdr.w1", "--workspace", "workspace:1"]]
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+
+
+def reconcile_run(monkeypatch, responses, agents):
+    """Run reconcile with a fake cmux CLI driven by per-command responses."""
+    calls = []
+
+    def fake_run(cmd, timeout=10):
+        calls.append(cmd[1:])
+        out = responses.get(cmd[1], "") if len(cmd) > 1 else ""
+        if cmd[1] == "list-status":
+            out = responses.get(("list-status", cmd[-1]), "")
+        return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    monkeypatch.setattr(ch, "run", fake_run)
+    monkeypatch.setattr(ch, "herdr_cli", lambda args: {"agents": agents})
+    return calls
+
+
+def test_reconcile_clears_orphan_pills(monkeypatch, cfg, state):
+    calls = reconcile_run(
+        monkeypatch,
+        {
+            "list-workspaces": "workspace:1  hd:tom\nworkspace:2  other\n",
+            ("list-status", "workspace:1"): (
+                "herdr.w9=1 waiting color=#ff9500 priority=20\n"
+            ),
+        },
+        agents=[],
+    )
+
+    ch.reconcile(cfg, state)
+
+    assert ["clear-status", "herdr.w9", "--workspace", "workspace:1"] in calls
+
+
+def test_reconcile_keeps_active_pill_keys(monkeypatch, cfg, state):
+    calls = reconcile_run(
+        monkeypatch,
+        {
+            "list-workspaces": "workspace:1  hd:tom\n",
+            ("list-status", "workspace:1"): (
+                "herdr.w1=1 working color=#0a84ff priority=10\n"
+            ),
+        },
+        agents=[
+            {
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "working",
+                "terminal_title_stripped": "task",
+            },
+        ],
+    )
+
+    ch.reconcile(cfg, state)
+
+    assert [c for c in calls if c[0] == "clear-status"] == []
+
+
+def test_reconcile_marks_stale_notifications_read(monkeypatch, cfg, state):
+    notifications = json.dumps(
+        [
+            {"id": "n1", "is_read": False, "title": "claude: waiting for input"},
+            {"id": "n2", "is_read": True, "title": "codex: finished"},
+            {"id": "n3", "is_read": False, "title": "Build finished"},
+        ]
+    )
+    calls = reconcile_run(monkeypatch, {"list-notifications": notifications}, agents=[])
+
+    ch.reconcile(cfg, state)
+
+    read = [c for c in calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--id", "n1"]]
+
+
+def test_reconcile_keeps_notifications_while_attention(monkeypatch, cfg, state):
+    notifications = json.dumps(
+        [{"id": "n1", "is_read": False, "title": "claude: waiting for input"}]
+    )
+    calls = reconcile_run(
+        monkeypatch,
+        {"list-notifications": notifications},
+        agents=[
+            {
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "blocked",
+                "terminal_title_stripped": "fix",
+            },
+        ],
+    )
+
+    ch.reconcile(cfg, state)
+
+    assert [c for c in calls if c[0] == "mark-notification-read"] == []
 
 
 def test_state_roundtrip(monkeypatch, tmp_path):

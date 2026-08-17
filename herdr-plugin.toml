@@ -8,6 +8,11 @@ platforms = ["macos"]
 [[startup]]
 command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile"]
 
+[[actions]]
+id = "refresh"
+title = "Refresh cmux sidebar"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
