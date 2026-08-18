@@ -795,6 +795,42 @@ def test_remote_identity_change_drops_socket_path(cmux_calls, remote_title_map):
     assert entry["identity"] == ["other-host", "tom"]
 
 
+def test_remote_mark_read_respects_other_remote_on_same_workspace(cmux_calls):
+    rstate = {
+        "remotes": {
+            "a": {"panes": {}, "ref": "workspace:9", "cmux_title": "t"},
+            "b": {"panes": {"w1:p1": {"status": "blocked"}}, "ref": "workspace:9"},
+        }
+    }
+    ch.remote_mark_read_ref({}, rstate, "a", "workspace:9")
+    assert cmux_calls == []
+
+    ch.remote_mark_read_ref({}, rstate, "b", "workspace:9")
+    assert cmux_calls == [["mark-notification-read", "--workspace", "workspace:9"]]
+
+
+def test_remote_ref_clears_pill_when_title_moves(monkeypatch, cmux_calls):
+    monkeypatch.setattr(
+        ch, "cmux_workspaces_by_title", lambda cfg: {"maguro:hd:tom": "workspace:10"}
+    )
+    entry = {"cmux_title": "maguro:hd:tom", "ref": "workspace:9", "ref_at": 0}
+
+    ref = ch.remote_ref({}, "tom", entry)
+
+    assert ref == "workspace:10"
+    assert ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"] in (
+        cmux_calls
+    )
+
+
+def test_poll_interval_validation():
+    assert ch.poll_interval({}) == ch.REMOTE_DEFAULT_POLL_SECONDS
+    assert ch.poll_interval({"poll_seconds": 5}) == 5.0
+    assert ch.poll_interval({"poll_seconds": "abc"}) == ch.REMOTE_DEFAULT_POLL_SECONDS
+    assert ch.poll_interval({"poll_seconds": -1}) == ch.REMOTE_DEFAULT_POLL_SECONDS
+    assert ch.poll_interval({"poll_seconds": 0.1}) == 0.5
+
+
 def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls):
     titles = {}
     monkeypatch.setattr(ch, "cmux_workspaces_by_title", lambda cfg: dict(titles))
