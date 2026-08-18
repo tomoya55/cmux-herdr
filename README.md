@@ -36,7 +36,41 @@ description = "refresh cmux sidebar"
 - cmux.app (the plugin talks to it via the bundled CLI at `/Applications/cmux.app/Contents/Resources/bin/cmux`)
 - Python 3.11+ (for `tomllib`)
 
-The plugin must be linked into the herdr **server** that runs on the same machine as cmux. Hooks are executed by the herdr server, so a herdr session attached via `--remote` from the cmux machine will not work.
+The plugin must be linked into the herdr **server** that runs on the same machine as cmux. Hooks are executed by the herdr server, so a herdr session attached via `--remote` from the cmux machine will not trigger them — use the remote daemon below for those sessions.
+
+## Remote sessions
+
+Sessions attached via `herdr --remote <host>` run on a remote herdr server, so the local plugin never sees their events. To bridge them, list the remote sessions in `config.toml`:
+
+```toml
+[[remotes]]
+ssh_target = "maguro.example.ts.net"   # anything ssh(1) accepts
+session = "tom"                        # remote herdr session name
+cmux_title = "maguro:hd:tom"           # title of the cmux workspace to update
+# name = "maguro-tom"                  # optional; defaults to "<ssh_target>:<session>"
+                                       # (hashed "remote-<digest>" for IPv6/URI targets)
+# poll_seconds = 2                     # optional
+# herdr_bin = "/home/tom/.local/bin/herdr"  # optional; set an absolute path when
+                                       # herdr is not on the remote's non-interactive PATH
+```
+
+The plugin's startup hook spawns a local daemon (`cmux_herdr.py remote`, logs to `$HERDR_PLUGIN_STATE_DIR/remote.log`) that for each `[[remotes]]` entry:
+
+1. Discovers the remote session's API socket via `ssh <target> herdr session list --json`
+2. Forwards it to a local unix socket with `ssh -L <local>:<remote> -N` (stock OpenSSH, nothing to install on the remote)
+3. Polls `agent.list` / `workspace.list` over the herdr socket protocol and pushes the aggregate to the cmux workspace whose title matches `cmux_title`
+
+Remote agents then get the same treatment as local ones — notifications on `blocked`/`done` and a `N waiting · N working` pill (status key `herdr.remote.<name>`) — aggregated across the whole remote session. Notifications are marked read as soon as no remote agent needs attention. The tunnel reconnects automatically after network or remote server restarts, and the daemon picks up `config.toml` edits (including removing or retargeting remotes) within a few seconds. A newer daemon spawned after a plugin upgrade or local checkout edit replaces an outdated one automatically.
+
+If the daemon was not running when you add your first `[[remotes]]` entry (it exits immediately when no remotes are configured), start it via the refresh action (`herdr plugin action invoke cmux-herdr.refresh`) or by restarting the herdr server.
+
+**SSH auth must be non-interactive**: the daemon runs `ssh` with `BatchMode=yes`, so the remote host must accept a local key. If interactive login needs a password or Touch ID, authorize a key once:
+
+```bash
+ssh <target> 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_ed25519.pub
+```
+
+Unlike local sessions, remote workspaces cannot be auto-detected (the TUI runs locally but the agents run remotely), so `cmux_title` is required, and `done`/`idle` transitions caused by focusing the remote TUI are only observed at the next poll.
 
 ## Install
 
@@ -115,6 +149,8 @@ match_by_label = true
 ## How it works
 
 `herdr-plugin.toml` declares event hooks for `pane.agent_status_changed`, `pane.closed`, `workspace.closed`, `workspace.focused`, and `workspace.renamed`, plus a `startup` hook and a `refresh` action (both run the reconcile path). herdr spawns `cmux_herdr.py` for each event, passing the payload in `HERDR_PLUGIN_EVENT_JSON`. The script keeps per-pane status in `$HERDR_PLUGIN_STATE_DIR/state.json`, aggregates it per herdr workspace, and drives the cmux CLI (`notify`, `set-status` / `clear-status`, `mark-notification-read`). All cmux failures are logged and tolerated, so a closed cmux app never breaks herdr.
+
+Remote sessions are handled separately by a long-lived `cmux_herdr.py remote` daemon (spawned by the startup hook, single instance guarded by a pidfile). It keeps its own `remote-state.json`, so it never races the event-hook writes to `state.json`, and its `herdr.remote.*` pills are excluded from the local orphan sweep.
 
 ## Development
 
