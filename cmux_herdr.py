@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -630,8 +631,11 @@ def clear_remote_pill(cfg, name, entry, ref):
 
 
 def retry_pending_clears(cfg, name, entry):
+    pending = entry.get("pending_clear")
+    if isinstance(pending, str):  # scalar format from an earlier version
+        pending = [pending]
     remaining = []
-    for ref in entry.get("pending_clear") or []:
+    for ref in pending or []:
         if not cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
             remaining.append(ref)
     if remaining:
@@ -1020,24 +1024,32 @@ def pid_is_remote_daemon(pid):
     return any(p.endswith("cmux_herdr.py") for p in parts) and "remote" in parts
 
 
+def live_daemon_pid(pid_path):
+    """PID of the running remote daemon, or None (stale/absent pidfile)."""
+    if not pid_path.exists():
+        return None
+    try:
+        pid = int(read_pidfile(pid_path).get("pid", 0))
+    except (TypeError, ValueError):
+        return None
+    if not pid:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    if not pid_is_remote_daemon(pid):
+        log(f"ignoring stale pidfile: pid {pid} is not a cmux-herdr daemon")
+        return None
+    return pid
+
+
 def take_over_daemon(pid_path):
     """Ensure this is the only (and latest-code) remote daemon running."""
-    if not pid_path.exists():
+    old_pid = live_daemon_pid(pid_path)
+    if old_pid is None:
         return
     info = read_pidfile(pid_path)
-    try:
-        old_pid = int(info.get("pid", 0))
-    except (TypeError, ValueError):
-        old_pid = 0
-    if not old_pid:
-        return
-    try:
-        os.kill(old_pid, 0)
-    except OSError:
-        return
-    if not pid_is_remote_daemon(old_pid):
-        log(f"ignoring stale pidfile: pid {old_pid} is not a cmux-herdr daemon")
-        return
     self = daemon_self_info()
     if info.get("script") == self["script"] and info.get("mtime") == self["mtime"]:
         log(f"remote daemon already running (pid {old_pid})")
@@ -1058,6 +1070,14 @@ def take_over_daemon(pid_path):
     raise SystemExit(1)
 
 
+def poll_remote_worker(cfg, rstate, rcfg, procs, results):
+    name = remote_name(rcfg)
+    try:
+        results[name] = ("ok", poll_remote(cfg, rstate, name, rcfg, procs))
+    except Exception as e:
+        results[name] = ("err", e)
+
+
 def remote_daemon(cfg):
     # A malformed config must not look like "no remotes" (which triggers
     # cleanup); keep the previous behavior of doing nothing instead.
@@ -1066,19 +1086,26 @@ def remote_daemon(cfg):
         return 1
     cfg = strict
     remotes = remote_configs(cfg)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_path = state_dir / "remote.pid"
     if not remotes:
         # No remotes configured: retire anything a previous daemon left
         # behind (pills, unread notifications, stale state), then exit.
         # A new daemon is spawned by each startup hook and refresh action.
-        rstate = load_remote_state()
-        for name in list(rstate.get("remotes", {})):
-            retire_remote(cfg, rstate, name, {}, {})
-        sweep_remote_orphan_pills(cfg, [])
-        save_remote_state(rstate)
+        with open(state_dir / "remote.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if live_daemon_pid(pid_path) is not None:
+                # The running daemon hot-reloads the empty config and
+                # retires its remotes itself.
+                log("remote daemon already running; leaving cleanup to it")
+                return 0
+            rstate = load_remote_state()
+            for name in list(rstate.get("remotes", {})):
+                retire_remote(cfg, rstate, name, {}, {})
+            sweep_remote_orphan_pills(cfg, [])
+            save_remote_state(rstate)
         log("no [[remotes]] configured; remote daemon exiting")
         return 0
-    state_dir.mkdir(parents=True, exist_ok=True)
-    pid_path = state_dir / "remote.pid"
     # Serialize concurrent startup/refresh invocations: only one daemon
     # may take over and write the pidfile.
     with open(state_dir / "remote.lock", "w") as lock:
@@ -1132,6 +1159,7 @@ def remote_daemon(cfg):
                     del watched[name]
             for name, identity in active.items():
                 watched.setdefault(name, identity)
+            due = []
             for rcfg in remotes:
                 name = remote_name(rcfg)
                 # Clamp deadlines far in the future so a decreased
@@ -1144,15 +1172,46 @@ def remote_daemon(cfg):
                     next_due[name] = cap
                 if time.time() < next_due.get(name, 0):
                     continue
-                try:
-                    changed = poll_remote(cfg, rstate, name, rcfg, procs)
-                except Exception as e:
-                    log(f"remote {name}: {e}")
+                due.append(rcfg)
+            # Poll due remotes in parallel so one unreachable remote cannot
+            # starve the others (each poll can block for many seconds).
+            results = {}
+            threads = [
+                threading.Thread(
+                    target=poll_remote_worker,
+                    args=(cfg, rstate, r, procs, results),
+                    daemon=True,
+                )
+                for r in due
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            any_changed = False
+            for rcfg in due:
+                name = remote_name(rcfg)
+                status, value = results.get(name, ("err", "poll did not finish"))
+                if status == "ok":
+                    any_changed |= value
+                    next_due[name] = time.time() + poll_interval(rcfg)
+                else:
+                    log(f"remote {name}: {value}")
                     next_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
+            if any_changed:
+                save_remote_state(rstate)
+            # Retry pill cleanups left behind by retired remotes.
+            configured_names = {remote_name(r) for r in remotes}
+            for name in list(rstate["remotes"]):
+                if name in configured_names:
                     continue
-                if changed:
+                entry = rstate["remotes"][name]
+                if not entry.get("pending_clear"):
+                    continue
+                retry_pending_clears(cfg, name, entry)
+                if not entry.get("pending_clear"):
+                    rstate["remotes"].pop(name, None)
                     save_remote_state(rstate)
-                next_due[name] = time.time() + poll_interval(rcfg)
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
