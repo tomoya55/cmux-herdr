@@ -884,6 +884,9 @@ def test_remote_name_defaults_to_target_and_session():
     )
     assert ch.remote_name({"ssh_target": "maguro", "session": "hd"}) == "maguro:hd"
     assert ch.remote_name({"ssh_target": "maguro", "session": "hd", "name": "x"}) == "x"
+    # colon-containing targets (IPv6, ssh:// URIs) fall back to a hash
+    name = ch.remote_name({"ssh_target": "ssh://tom@host:2222", "session": "hd"})
+    assert name.startswith("remote-") and len(name) == len("remote-") + 8
 
 
 def test_remote_configs_rejects_malformed_entries(capsys):
@@ -894,7 +897,6 @@ def test_remote_configs_rejects_malformed_entries(capsys):
         {"ssh_target": "a", "session": "s", "cmux_title": 1},
         {"ssh_target": "a", "session": "s", "name": ["x"], "cmux_title": "t"},
         {"ssh_target": "a", "session": "s"},  # cmux_title is required
-        {"ssh_target": "a:1", "session": "s", "cmux_title": "t"},  # ambiguous name
     ]
     for bad in bad_entries:
         assert ch.remote_configs({"remotes": [bad]}) is None, bad

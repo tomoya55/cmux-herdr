@@ -616,8 +616,12 @@ def socket_rpc(sock_path, method, params, timeout=10):
 def remote_name(rcfg):
     if rcfg.get("name"):
         return rcfg["name"]
-    # ":" keeps the pair unambiguous ("a-b", "c" vs "a", "b-c").
-    return f"{rcfg['ssh_target']}:{rcfg['session']}"
+    target, session = rcfg["ssh_target"], rcfg["session"]
+    if ":" in target or ":" in session:
+        # IPv6 / ssh:// forms would make "target:session" ambiguous.
+        digest = hashlib.sha1(f"{target}\0{session}".encode()).hexdigest()[:8]
+        return f"remote-{digest}"
+    return f"{target}:{session}"
 
 
 def remote_key(name):
@@ -992,9 +996,6 @@ def remote_configs(cfg):
         if r.get("name") is not None and not isinstance(r["name"], str):
             log(f"remote {r!r}: name must be a string")
             return None
-        if not r.get("name") and (":" in r["ssh_target"] or ":" in r["session"]):
-            log(f"remote {r!r}: ':' in ssh_target/session needs an explicit name")
-            return None
         if not isinstance(r.get("cmux_title"), str) or not r.get("cmux_title"):
             log(f"remote {remote_name(r)!r}: cmux_title is required")
             return None
@@ -1101,7 +1102,8 @@ def take_over_daemon(pid_path):
     # The plugin was reinstalled or edited since the old daemon started.
     log(f"replacing outdated remote daemon (pid {old_pid})")
     os.kill(old_pid, signal.SIGTERM)
-    deadline = time.time() + 5
+    # Must exceed the old daemon's worst-case shutdown (worker quiesce).
+    deadline = time.time() + 15
     while time.time() < deadline:
         try:
             os.kill(old_pid, 0)
@@ -1134,26 +1136,33 @@ def poll_remote_worker(rcfg, procs, results):
         results[name] = {"ok": False, "identity": identity, "error": e}
 
 
-def tombstone_worker(cfg, rstate, names, done):
+def tombstone_worker(cfg, rstate, names, done, cancel):
     """Retry retired remotes' pill clears off the scheduling thread.
 
     Reads shared state but never mutates it; the main thread applies the
-    results only for remotes that are still retired.
+    results only for remotes that are still retired. Names in cancel
+    (remotes that became active again) are skipped before any cmux call.
     """
     for name in names:
+        if name in cancel:
+            done[name] = None
+            continue
         entry = rstate["remotes"].get(name)
         if not entry:
+            done[name] = None
             continue
         pending = entry.get("pending_clear")
         if isinstance(pending, str):  # scalar format from an earlier version
             pending = [pending]
         remaining = []
         for ref in pending or []:
+            if name in cancel:
+                break
             if not cmux_cli(
                 cfg, ["clear-status", remote_key(name), "--workspace", ref]
             ):
                 remaining.append(ref)
-        done[name] = remaining
+        done[name] = remaining if name not in cancel else None
 
 
 def remote_daemon(cfg):
@@ -1200,7 +1209,7 @@ def remote_daemon(cfg):
     next_due = {}
     inflight = {}  # name -> worker thread (fetch only; main thread applies)
     results = {}
-    tombstone = {"thread": None, "done": {}}
+    tombstone = {"thread": None, "done": {}, "cancel": set()}
     tombstone_due = {}
     # Seed watched from the startup config so a config change between
     # startup reconciliation and the first loop iteration is still caught.
@@ -1309,11 +1318,14 @@ def remote_daemon(cfg):
                 t.start()
             # Retry pill cleanups left behind by retired remotes, backed off
             # and off this thread (cmux calls can block for seconds).
+            # Re-added remotes cancel their in-flight cleanup so a late
+            # clear cannot wipe a freshly republished pill.
+            tombstone["cancel"].update(active)
             finished = tombstone["thread"]
             if finished is not None and not finished.is_alive():
                 for name, remaining in tombstone["done"].items():
-                    if name in active:
-                        continue  # re-added meanwhile; manages its own pills
+                    if remaining is None or name in active:
+                        continue  # cleanup aborted or remote re-added
                     entry = rstate["remotes"].get(name)
                     if entry is None:
                         continue
@@ -1337,7 +1349,13 @@ def remote_daemon(cfg):
                 if pending_names:
                     tombstone["thread"] = threading.Thread(
                         target=tombstone_worker,
-                        args=(cfg, rstate, pending_names, tombstone["done"]),
+                        args=(
+                            cfg,
+                            rstate,
+                            pending_names,
+                            tombstone["done"],
+                            tombstone["cancel"],
+                        ),
                         daemon=True,
                     )
                     tombstone["thread"].start()
