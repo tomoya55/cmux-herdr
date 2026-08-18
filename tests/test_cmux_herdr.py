@@ -809,18 +809,21 @@ def test_remote_mark_read_respects_other_remote_on_same_workspace(cmux_calls):
     assert cmux_calls == [["mark-notification-read", "--workspace", "workspace:9"]]
 
 
-def test_remote_ref_clears_pill_when_title_moves(monkeypatch, cmux_calls):
+def test_remote_ref_clears_pill_when_title_moves(monkeypatch, cmux_calls, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(
         ch, "cmux_workspaces_by_title", lambda cfg: {"maguro:hd:tom": "workspace:10"}
     )
     entry = {"cmux_title": "maguro:hd:tom", "ref": "workspace:9", "ref_at": 0}
 
-    ref = ch.remote_ref({}, "tom", entry)
+    ref = ch.remote_ref({}, {"remotes": {}}, "tom", entry)
 
     assert ref == "workspace:10"
     assert ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"] in (
         cmux_calls
     )
+    assert ["mark-notification-read", "--workspace", "workspace:9"] in cmux_calls
 
 
 def test_poll_interval_validation():

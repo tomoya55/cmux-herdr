@@ -621,8 +621,37 @@ def remote_sock_path(name):
     return Path(tempfile.gettempdir()) / f"cmux-herdr-{os.getuid()}-{digest}.sock"
 
 
-def remote_ref(cfg, name, entry):
+def clear_remote_pill(cfg, name, entry, ref):
+    """Clear a pill, remembering it for retry when cmux rejects the call."""
+    if cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
+        if entry.get("pending_clear") == ref:
+            entry.pop("pending_clear", None)
+    else:
+        entry["pending_clear"] = ref
+
+
+def local_attention_refs(cfg):
+    """Refs of cmux workspaces with local attention panes, resolved only via
+    side-effect-free mappings (explicit config and the cached session ref)."""
+    state = load_state()
+    refs = set()
+    for ws_id, ws in state.get("workspaces", {}).items():
+        if not has_attention_panes(ws.get("panes", {})):
+            continue
+        label = ws.get("label") or ""
+        ref = cfg.get("workspaces", {}).get(ws_id) or cfg.get("labels", {}).get(label)
+        if not ref:
+            ref = (state.get("session_ref") or {}).get("ref")
+        if ref:
+            refs.add(ref)
+    return refs
+
+
+def remote_ref(cfg, rstate, name, entry):
     """Resolve the cmux workspace ref for a remote via its configured title."""
+    pending = entry.get("pending_clear")
+    if pending:
+        clear_remote_pill(cfg, name, entry, pending)
     title = entry.get("cmux_title") or ""
     cached = entry.get("ref")
     if cached and time.time() - entry.get("ref_at", 0) < REMOTE_REF_TTL_SECONDS:
@@ -632,8 +661,9 @@ def remote_ref(cfg, name, entry):
         ref = cmux_workspaces_by_title(cfg).get(title.strip().lower())
     if ref:
         if cached and ref != cached:
-            # The title now resolves elsewhere; don't leave the pill behind.
-            cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", cached])
+            # The title now resolves elsewhere; don't leave anything behind.
+            clear_remote_pill(cfg, name, entry, cached)
+            remote_mark_read_ref(cfg, rstate, name, cached)
         entry["ref"] = ref
         entry["ref_at"] = time.time()
         return ref
@@ -642,7 +672,7 @@ def remote_ref(cfg, name, entry):
         if age < REMOTE_STALE_REF_TTL_SECONDS:
             return cached  # tolerate transient cmux lookup failures
         # Unresolvable for too long: drop the pill from the stale workspace.
-        cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", cached])
+        clear_remote_pill(cfg, name, entry, cached)
         entry.pop("ref", None)
         entry.pop("ref_at", None)
         entry["pill_published"] = False
@@ -651,8 +681,8 @@ def remote_ref(cfg, name, entry):
     return None
 
 
-def remote_notify(cfg, name, entry, title, body):
-    ref = remote_ref(cfg, name, entry)
+def remote_notify(cfg, rstate, name, entry, title, body):
+    ref = remote_ref(cfg, rstate, name, entry)
     if not ref:
         return
     cmux_cli(
@@ -672,24 +702,26 @@ def remote_notify(cfg, name, entry, title, body):
 
 
 def remote_mark_read_ref(cfg, rstate, name, ref):
-    """Mark a workspace read, unless another remote with attention panes
-    still targets it (mark-notification-read is workspace-wide)."""
+    """Mark a workspace read, unless another herdr source with attention
+    panes still targets it (mark-notification-read is workspace-wide)."""
     for other_name, other in rstate.get("remotes", {}).items():
         if other_name == name:
             continue
         if other.get("ref") == ref and has_attention_panes(other.get("panes", {})):
             return
+    if ref in local_attention_refs(cfg):
+        return
     cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
 
 
 def remote_mark_read(cfg, rstate, name, entry):
-    ref = remote_ref(cfg, name, entry)
+    ref = remote_ref(cfg, rstate, name, entry)
     if ref:
         remote_mark_read_ref(cfg, rstate, name, ref)
 
 
-def update_remote_pill(cfg, name, entry):
-    ref = remote_ref(cfg, name, entry)
+def update_remote_pill(cfg, rstate, name, entry):
+    ref = remote_ref(cfg, rstate, name, entry)
     entry["pill_at"] = time.time()
     if not ref:
         entry["pill_published"] = False
@@ -703,7 +735,7 @@ def reroute_remote(cfg, rstate, name, entry, cmux_title):
     old_ref = entry.pop("ref", None)
     entry.pop("ref_at", None)
     if old_ref:
-        cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", old_ref])
+        clear_remote_pill(cfg, name, entry, old_ref)
         remote_mark_read_ref(cfg, rstate, name, old_ref)
     entry["cmux_title"] = cmux_title
     entry["pill_published"] = False
@@ -746,7 +778,7 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
         # (e.g. a cmux restart).
         stale = time.time() - entry.get("pill_at", 0) > REMOTE_REF_TTL_SECONDS
         if stale or not entry.get("pill_published"):
-            update_remote_pill(cfg, name, entry)
+            update_remote_pill(cfg, rstate, name, entry)
         return changed
 
     label = cmux_title or name
@@ -756,10 +788,10 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
             body = f"{label} · {what}"
             if p["status"] == "blocked":
                 remote_notify(
-                    cfg, name, entry, f"{p['agent']}: waiting for input", body
+                    cfg, rstate, name, entry, f"{p['agent']}: waiting for input", body
                 )
             else:
-                remote_notify(cfg, name, entry, f"{p['agent']}: finished", body)
+                remote_notify(cfg, rstate, name, entry, f"{p['agent']}: finished", body)
 
     was_attention = has_attention_panes(old)
     entry["panes"] = new
@@ -767,7 +799,7 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     if was_attention and not has_attention_panes(new):
         # The prompt was answered or dismissed on the remote side.
         remote_mark_read(cfg, rstate, name, entry)
-    update_remote_pill(cfg, name, entry)
+    update_remote_pill(cfg, rstate, name, entry)
     return changed
 
 
@@ -1033,18 +1065,15 @@ def remote_daemon(cfg):
     for name in list(rstate["remotes"]):
         entry = rstate["remotes"][name]
         rcfg = configured.get(name)
-        identity = entry.get("identity")
-        if rcfg is None or (
-            identity is not None and identity != [rcfg["ssh_target"], rcfg["session"]]
-        ):
+        if rcfg is None or entry.get("identity") != [
+            rcfg["ssh_target"],
+            rcfg["session"],
+        ]:
             # Persisted while a previous daemon was running, or the entry
-            # was retargeted while no daemon was alive; never retired.
+            # was retargeted (or written by a version without identity
+            # tracking) while no daemon was alive; never retired.
             retire_remote(cfg, rstate, name, procs, next_due)
             continue
-        if identity is None:
-            # Pre-upgrade entry: cannot verify the target; force the
-            # forwarded socket to be re-resolved.
-            entry.pop("socket_path", None)
         title = rcfg.get("cmux_title") or ""
         if entry.get("cmux_title") != title:
             # Title changed while no daemon was running; reroute now so the
@@ -1076,7 +1105,10 @@ def remote_daemon(cfg):
                 watched.setdefault(name, identity)
             for rcfg in remotes:
                 name = remote_name(rcfg)
-                if time.time() < next_due.get(name, 0):
+                # Clamp the deadline so a decreased poll_seconds applies now.
+                deadline = min(next_due.get(name, 0), time.time() + poll_interval(rcfg))
+                next_due[name] = deadline
+                if time.time() < deadline:
                     continue
                 try:
                     changed = poll_remote(cfg, rstate, name, rcfg, procs)
