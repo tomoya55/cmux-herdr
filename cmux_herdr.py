@@ -21,6 +21,17 @@ TRACKED_STATUSES = ATTENTION_STATUSES | {"working"}
 DEFAULT_CMUX_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 STATUS_COLOR_WAITING = "#ff9500"
 STATUS_COLOR_WORKING = "#0a84ff"
+ICON_WAITING = "hourglass"
+ICON_DONE = "checkmark.circle"
+ICON_WORKING = "bolt"
+PANE_STATUS_WORDS = {"blocked": "waiting", "done": "finished", "working": "working"}
+PANE_STATUS_ICONS = {
+    "blocked": ICON_WAITING,
+    "done": ICON_DONE,
+    "working": ICON_WORKING,
+}
+LOG_LEVELS = {"blocked": "warning", "done": "success", "working": "progress"}
+LOG_WORDS = {"blocked": "waiting for input", "done": "finished", "working": "working"}
 DETECT_TTL_SECONDS = 300
 NOTIFICATION_SUBTITLE = "herdr"
 NOTIFICATION_TITLE_RE = re.compile(r": (waiting for input|finished)$")
@@ -320,7 +331,16 @@ def status_key(ws_id):
     return f"herdr.{ws_id}"
 
 
-def push_pill(cfg, ref, key, panes):
+def sanitize_key(part):
+    """Pane ids contain characters like ':'; keep status keys simple."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", part)
+
+
+def pane_key(base, pane_id):
+    return f"{base}.{sanitize_key(pane_id)}"
+
+
+def push_pill(cfg, ref, key, panes, per_pane=False):
     waiting = sum(1 for p in panes.values() if p["status"] in ATTENTION_STATUSES)
     working = sum(1 for p in panes.values() if p["status"] == "working")
     if waiting:
@@ -339,6 +359,8 @@ def push_pill(cfg, ref, key, panes):
                 STATUS_COLOR_WAITING,
                 "--priority",
                 "20",
+                "--icon",
+                ICON_WAITING,
             ],
         )
     elif working:
@@ -354,10 +376,72 @@ def push_pill(cfg, ref, key, panes):
                 STATUS_COLOR_WORKING,
                 "--priority",
                 "10",
+                "--icon",
+                ICON_WORKING,
             ],
         )
     else:
         cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
+    if not per_pane:
+        return
+    # Per-pane pills are only ever (re)set here; removals are cleared
+    # explicitly by the callers that observe them (events, snapshot diffs,
+    # teardown) and by the orphan sweeps.
+    for pane_id, pane in panes.items():
+        status = pane["status"]
+        attention = status in ATTENTION_STATUSES
+        cmux_cli(
+            cfg,
+            [
+                "set-status",
+                pane_key(key, pane_id),
+                f"{pane['agent']}: {PANE_STATUS_WORDS.get(status, status)}",
+                "--workspace",
+                ref,
+                "--color",
+                STATUS_COLOR_WAITING if attention else STATUS_COLOR_WORKING,
+                "--priority",
+                "15" if attention else "5",
+                "--icon",
+                PANE_STATUS_ICONS.get(status, ICON_WORKING),
+            ],
+        )
+
+
+def clear_pane_pill(cfg, state, ws_id, pane_id):
+    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+    if ref:
+        cmux_cli(
+            cfg,
+            ["clear-status", pane_key(status_key(ws_id), pane_id), "--workspace", ref],
+        )
+
+
+def log_transition(cfg, ref, status, agent, what):
+    """Append one agent status transition to the workspace's sidebar log."""
+    msg = LOG_WORDS[status]
+    if what:
+        msg = f"{msg} · {what}"
+    cmux_cli(
+        cfg,
+        [
+            "log",
+            "--level",
+            LOG_LEVELS[status],
+            "--source",
+            agent,
+            "--workspace",
+            ref,
+            "--",
+            msg,
+        ],
+    )
+
+
+def log_agent_status(cfg, state, ws_id, status, agent, what):
+    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+    if ref:
+        log_transition(cfg, ref, status, agent, what)
 
 
 def update_pill(cfg, state, ws_id):
@@ -365,7 +449,17 @@ def update_pill(cfg, state, ws_id):
     if not ref:
         return
     panes = state["workspaces"].get(ws_id, {}).get("panes", {})
-    push_pill(cfg, ref, status_key(ws_id), panes)
+    push_pill(cfg, ref, status_key(ws_id), panes, per_pane=per_pane_enabled(cfg))
+
+
+def per_pane_enabled(cfg):
+    return bool(cfg.get("per_pane_status"))
+
+
+def sidebar_log_enabled(cfg, status):
+    if not cfg.get("sidebar_log", True):
+        return False
+    return status in ATTENTION_STATUSES or bool(cfg.get("sidebar_log_working"))
 
 
 def notify(cfg, state, ws_id, title, body):
@@ -415,6 +509,10 @@ def sweep_orphan_pills(cfg, state):
         for ws_id, ws in state["workspaces"].items()
         if ws.get("panes")
     }
+    if per_pane_enabled(cfg):
+        for ws_id, ws in state["workspaces"].items():
+            for pane_id in ws.get("panes", {}):
+                active_keys.add(pane_key(status_key(ws_id), pane_id))
     for ref in cmux_workspaces_by_title(cfg).values():
         for key in cmux_herdr_status_keys(cfg, ref):
             if key.startswith(REMOTE_KEY_PREFIX):
@@ -469,6 +567,7 @@ def on_agent_status_changed(cfg, state, data):
     panes = ws["panes"]
     was_attention = panes.get(pane_id, {}).get("status") in ATTENTION_STATUSES
 
+    removed = None
     if status in TRACKED_STATUSES:
         panes[pane_id] = {
             "status": status,
@@ -476,7 +575,7 @@ def on_agent_status_changed(cfg, state, data):
             "title": data.get("title") or "",
         }
     else:
-        panes.pop(pane_id, None)
+        removed = panes.pop(pane_id, None)
 
     if status in ATTENTION_STATUSES:
         pane = panes[pane_id]
@@ -503,6 +602,14 @@ def on_agent_status_changed(cfg, state, data):
         # the notifications for this workspace have been actioned.
         mark_read(cfg, state, ws_id)
 
+    if status in TRACKED_STATUSES and sidebar_log_enabled(cfg, status):
+        pane = panes[pane_id]
+        log_agent_status(
+            cfg, state, ws_id, status, pane["agent"], pane["title"] or pane_id
+        )
+
+    if removed is not None and per_pane_enabled(cfg):
+        clear_pane_pill(cfg, state, ws_id, pane_id)
     update_pill(cfg, state, ws_id)
 
 
@@ -517,6 +624,8 @@ def on_pane_closed(cfg, state, data):
     pane = ws["panes"].pop(pane_id, None)
     if pane is None:
         return
+    if per_pane_enabled(cfg):
+        clear_pane_pill(cfg, state, ws_id, pane_id)
     if pane["status"] in ATTENTION_STATUSES and not has_attention_panes(ws["panes"]):
         mark_read(cfg, state, ws_id)
     update_pill(cfg, state, ws_id)
@@ -531,6 +640,17 @@ def on_workspace_closed(cfg, state, data):
         ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
         if ref:
             cmux_cli(cfg, ["clear-status", status_key(ws_id), "--workspace", ref])
+            if per_pane_enabled(cfg):
+                for pane_id in ws["panes"]:
+                    cmux_cli(
+                        cfg,
+                        [
+                            "clear-status",
+                            pane_key(status_key(ws_id), pane_id),
+                            "--workspace",
+                            ref,
+                        ],
+                    )
 
 
 def on_workspace_focused(cfg, state, data):
@@ -588,9 +708,18 @@ def reconcile(cfg, state):
     # tracked agents (e.g. the session ended while the server was down).
     for ws_id, entry in previous.items():
         panes = entry.get("panes", {})
-        if ws_id in state["workspaces"] or not panes:
+        if ws_id in state["workspaces"]:
+            if per_pane_enabled(cfg):
+                # Panes that vanished since the last run lose their pills.
+                for pane_id in set(panes) - set(state["workspaces"][ws_id]["panes"]):
+                    clear_pane_pill(cfg, state, ws_id, pane_id)
+            continue
+        if not panes:
             continue
         state["workspaces"][ws_id] = {"label": entry.get("label", ""), "panes": {}}
+        if per_pane_enabled(cfg):
+            for pane_id in panes:
+                clear_pane_pill(cfg, state, ws_id, pane_id)
         update_pill(cfg, state, ws_id)
         if has_attention_panes(panes):
             mark_read(cfg, state, ws_id)
@@ -652,9 +781,28 @@ def remote_sock_path(name):
     return Path(tempfile.gettempdir()) / f"cmux-herdr-{os.getuid()}-{digest}.sock"
 
 
+def clear_remote_pill_keys(cfg, name, entry, ref):
+    """Clear the aggregate pill and any per-pane pills; True when cmux
+    accepted every clear."""
+    base = remote_key(name)
+    keys = {base}
+    if per_pane_enabled(cfg):
+        keys |= {pane_key(base, pid) for pid in entry.get("panes", {})}
+    # Also catch per-pane pills left behind by older state (e.g. the feature
+    # was toggled off) so teardown never strands them.
+    for k in cmux_herdr_status_keys(cfg, ref):
+        if k == base or k.startswith(base + "."):
+            keys.add(k)
+    ok = True
+    for k in sorted(keys):
+        if not cmux_cli(cfg, ["clear-status", k, "--workspace", ref]):
+            ok = False
+    return ok
+
+
 def clear_remote_pill(cfg, name, entry, ref):
     """Clear a pill, remembering it for retry when cmux rejects the call."""
-    if cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
+    if clear_remote_pill_keys(cfg, name, entry, ref):
         return
     pending = entry.get("pending_clear")
     if isinstance(pending, str):  # scalar format from an earlier version
@@ -672,7 +820,7 @@ def retry_pending_clears(cfg, name, entry):
         pending = [pending]
     remaining = []
     for ref in pending or []:
-        if not cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
+        if not clear_remote_pill_keys(cfg, name, entry, ref):
             remaining.append(ref)
     if remaining:
         entry["pending_clear"] = remaining
@@ -759,6 +907,12 @@ def remote_notify(cfg, rstate, name, entry, title, body):
     )
 
 
+def remote_log(cfg, rstate, name, entry, status, agent, what):
+    ref = remote_ref(cfg, rstate, name, entry)
+    if ref:
+        log_transition(cfg, ref, status, agent, what)
+
+
 def remote_mark_read_ref(cfg, rstate, name, ref):
     """Mark a workspace read, unless another herdr source with attention
     panes still targets it (mark-notification-read is workspace-wide)."""
@@ -784,7 +938,13 @@ def update_remote_pill(cfg, rstate, name, entry):
     if not ref:
         entry["pill_published"] = False
         return
-    push_pill(cfg, ref, remote_key(name), entry.get("panes", {}))
+    push_pill(
+        cfg,
+        ref,
+        remote_key(name),
+        entry.get("panes", {}),
+        per_pane=per_pane_enabled(cfg),
+    )
     entry["pill_published"] = True
 
 
@@ -841,8 +1001,11 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
 
     label = cmux_title or name
     for pid, p in new.items():
-        if p["status"] in ATTENTION_STATUSES and old_statuses.get(pid) != p["status"]:
-            what = p["title"] or labels.get(p["workspace_id"]) or pid
+        prev = old_statuses.get(pid)
+        if prev == p["status"]:
+            continue
+        what = p["title"] or labels.get(p["workspace_id"]) or pid
+        if p["status"] in ATTENTION_STATUSES:
             body = f"{label} · {what}"
             if p["status"] == "blocked":
                 remote_notify(
@@ -850,6 +1013,24 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
                 )
             else:
                 remote_notify(cfg, rstate, name, entry, f"{p['agent']}: finished", body)
+        if sidebar_log_enabled(cfg, p["status"]):
+            remote_log(cfg, rstate, name, entry, p["status"], p["agent"], what)
+
+    if per_pane_enabled(cfg):
+        removed = [pid for pid in old if pid not in new]
+        if removed:
+            ref = remote_ref(cfg, rstate, name, entry)
+            if ref:
+                for pid in removed:
+                    cmux_cli(
+                        cfg,
+                        [
+                            "clear-status",
+                            pane_key(remote_key(name), pid),
+                            "--workspace",
+                            ref,
+                        ],
+                    )
 
     was_attention = has_attention_panes(old)
     entry["panes"] = new
@@ -986,9 +1167,17 @@ def fetch_remote(name, rcfg, entry, procs):
 def sweep_remote_orphan_pills(cfg, remotes):
     """Clear herdr.remote.* pills for remotes no longer in the config."""
     active = {remote_key(remote_name(r)) for r in remotes}
+    # Per-pane pills of active remotes belong to them; everything else with
+    # the remote prefix is orphaned. When the feature is off, per-pane pills
+    # of active remotes are orphans too (left over from when it was on).
+    prefixes = tuple(k + "." for k in active) if per_pane_enabled(cfg) else ()
     for ref in cmux_workspaces_by_title(cfg).values():
         for key in cmux_herdr_status_keys(cfg, ref):
-            if key.startswith(REMOTE_KEY_PREFIX) and key not in active:
+            if (
+                key.startswith(REMOTE_KEY_PREFIX)
+                and key not in active
+                and not key.startswith(prefixes)
+            ):
                 log(f"clearing orphaned remote status {key} on {ref}")
                 cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
 
@@ -1183,9 +1372,7 @@ def tombstone_worker(cfg, rstate, names, done, cancel):
         for ref in pending or []:
             if name in cancel:
                 break
-            if not cmux_cli(
-                cfg, ["clear-status", remote_key(name), "--workspace", ref]
-            ):
+            if not clear_remote_pill_keys(cfg, name, entry, ref):
                 remaining.append(ref)
         done[name] = remaining if name not in cancel else None
 
@@ -1262,6 +1449,7 @@ def remote_daemon(cfg):
             # old workspace is cleaned even if the remote is unreachable.
             reroute_remote(cfg, rstate, name, entry, title)
     sweep_remote_orphan_pills(cfg, remotes)
+    last_per_pane = per_pane_enabled(cfg)
     names = [remote_name(r) for r in remotes]
     log(f"remote daemon started (pid {os.getpid()}); watching: {', '.join(names)}")
     try:
@@ -1273,6 +1461,11 @@ def remote_daemon(cfg):
                 else:
                     cfg = new_cfg
             remotes = remote_configs(cfg) or []
+            if per_pane_enabled(cfg) != last_per_pane:
+                # Toggling the feature changes which herdr.remote.* keys are
+                # orphans (per-pane pills of active remotes when disabled).
+                sweep_remote_orphan_pills(cfg, remotes)
+                last_per_pane = per_pane_enabled(cfg)
             active = {
                 remote_name(r): (
                     r["ssh_target"],

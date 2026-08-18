@@ -1,6 +1,18 @@
 cmux_bin = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 match_by_label = true
 
+# Append agent status transitions to the cmux sidebar log (default: true).
+# blocked -> warning, done -> success. Transitions only; reconcile does not
+# backfill, so restarts never duplicate entries.
+# sidebar_log = true
+
+# Also log when an agent starts working (noisy; default: false).
+# sidebar_log_working = false
+
+# Show a status pill per agent (e.g. "claude: waiting") in addition to the
+# aggregate pill (default: false).
+# per_pane_status = false
+
 [workspaces]
 
 [labels]
