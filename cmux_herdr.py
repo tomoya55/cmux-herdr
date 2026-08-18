@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -584,11 +586,21 @@ def socket_rpc(sock_path, method, params, timeout=10):
 
 
 def remote_name(rcfg):
-    return rcfg.get("name") or rcfg["session"]
+    if rcfg.get("name"):
+        return rcfg["name"]
+    host = rcfg["ssh_target"].split("@")[-1].split(".")[0]
+    return f"{host}-{rcfg['session']}"
 
 
 def remote_key(name):
     return f"{REMOTE_KEY_PREFIX}{name}"
+
+
+def remote_sock_path(name):
+    # AF_UNIX paths are limited to ~104 bytes on macOS, so keep this short
+    # and independent of the (unbounded) configured remote name.
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+    return Path(tempfile.gettempdir()) / f"cmux-herdr-{os.getuid()}-{digest}.sock"
 
 
 def remote_ref(cfg, name, entry):
@@ -638,9 +650,12 @@ def remote_mark_read(cfg, name, entry):
 
 def update_remote_pill(cfg, name, entry):
     ref = remote_ref(cfg, name, entry)
+    entry["pill_at"] = time.time()
     if not ref:
+        entry["pill_published"] = False
         return
     push_pill(cfg, ref, remote_key(name), entry.get("panes", {}))
+    entry["pill_published"] = True
 
 
 def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
@@ -652,8 +667,13 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     changed = False
     cmux_title = rcfg.get("cmux_title") or ""
     if entry.get("cmux_title") != cmux_title:
+        # Clear the pill on the previous workspace before rerouting.
+        old_ref = entry.pop("ref", None)
+        entry.pop("ref_at", None)
+        if old_ref:
+            cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", old_ref])
         entry["cmux_title"] = cmux_title
-        entry.pop("ref", None)
+        entry["pill_published"] = False
         changed = True
 
     old = entry["panes"]
@@ -670,6 +690,11 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
             "workspace_id": a.get("workspace_id") or "",
         }
     if new == old:
+        # Republish when the pill was never pushed (e.g. the cmux workspace did
+        # not exist yet) or may have been lost (e.g. a cmux restart).
+        stale = time.time() - entry.get("pill_at", 0) > REMOTE_REF_TTL_SECONDS
+        if not changed and (stale or not entry.get("pill_published")):
+            update_remote_pill(cfg, name, entry)
         return changed
 
     label = cmux_title or name
@@ -727,12 +752,12 @@ def drop_forward(name, entry, procs):
     if proc is not None and proc.poll() is None:
         proc.terminate()
     entry.pop("socket_path", None)
-    (state_dir / f"remote-{name}.sock").unlink(missing_ok=True)
+    remote_sock_path(name).unlink(missing_ok=True)
 
 
 def ensure_forward(name, rcfg, entry, procs):
     """Return the local end of an ssh unix-socket forward, (re)spawning it."""
-    local_sock = state_dir / f"remote-{name}.sock"
+    local_sock = remote_sock_path(name)
     proc = procs.get(name)
     if proc is not None and proc.poll() is None and local_sock.exists():
         return local_sock
@@ -808,14 +833,43 @@ def sweep_remote_orphan_pills(cfg, remotes):
 
 
 def remote_configs(cfg):
-    return [
-        r for r in cfg.get("remotes", []) if r.get("ssh_target") and r.get("session")
-    ]
+    remotes = []
+    seen = set()
+    for r in cfg.get("remotes", []):
+        if not (r.get("ssh_target") and r.get("session")):
+            continue
+        name = remote_name(r)
+        if name in seen:
+            log(f"duplicate remote name {name!r}; set a unique `name` in [[remotes]]")
+            continue
+        seen.add(name)
+        remotes.append(r)
+    return remotes
+
+
+def retire_remote(cfg, rstate, name, procs, next_due):
+    """Tear down a remote that was removed from the config or retargeted."""
+    entry = rstate["remotes"].pop(name, {})
+    drop_forward(name, entry, procs)
+    next_due.pop(name, None)
+    ref = entry.get("ref")
+    if not ref:
+        title = (entry.get("cmux_title") or "").strip().lower()
+        if title:
+            ref = cmux_workspaces_by_title(cfg).get(title)
+    if ref:
+        cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref])
+        cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
+    save_remote_state(rstate)
 
 
 def remote_daemon(cfg):
     remotes = remote_configs(cfg)
     if not remotes:
+        # No remotes configured: clean up anything a previous daemon left
+        # behind, then exit. A new daemon is spawned by each startup hook.
+        sweep_remote_orphan_pills(cfg, [])
+        save_remote_state({"remotes": {}})
         log("no [[remotes]] configured; remote daemon exiting")
         return 0
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -831,6 +885,7 @@ def remote_daemon(cfg):
     rstate = load_remote_state()
     procs = {}
     next_due = {}
+    watched = {}
     sweep_remote_orphan_pills(cfg, remotes)
     names = [remote_name(r) for r in remotes]
     log(f"remote daemon started (pid {os.getpid()}); watching: {', '.join(names)}")
@@ -838,20 +893,27 @@ def remote_daemon(cfg):
         while True:
             cfg = load_config()  # pick up config edits without a restart
             remotes = remote_configs(cfg)
-            now = time.time()
+            active = {remote_name(r): (r["ssh_target"], r["session"]) for r in remotes}
+            for name, identity in list(watched.items()):
+                if active.get(name) != identity:
+                    log(f"remote {name}: removed or retargeted; tearing down")
+                    retire_remote(cfg, rstate, name, procs, next_due)
+                    del watched[name]
+            for name, identity in active.items():
+                watched.setdefault(name, identity)
             for rcfg in remotes:
                 name = remote_name(rcfg)
-                if now < next_due.get(name, 0):
+                if time.time() < next_due.get(name, 0):
                     continue
                 try:
                     changed = poll_remote(cfg, rstate, name, rcfg, procs)
                 except Exception as e:
                     log(f"remote {name}: {e}")
-                    next_due[name] = now + REMOTE_ERROR_BACKOFF_SECONDS
+                    next_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
                     continue
                 if changed:
                     save_remote_state(rstate)
-                next_due[name] = now + float(
+                next_due[name] = time.time() + float(
                     rcfg.get("poll_seconds") or REMOTE_DEFAULT_POLL_SECONDS
                 )
             time.sleep(0.5)

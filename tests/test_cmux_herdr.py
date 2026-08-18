@@ -698,8 +698,74 @@ def test_remote_title_change_reroutes_pill(cmux_calls, remote_title_map):
         {}, rstate, "tom", rcfg, [remote_agent("w1:p1", "working")], {}
     )
     assert changed is True
-    # title no longer resolvable -> no stale ref reuse after title change
-    assert cmux_calls == []
+    # the pill on the previous workspace is cleared before rerouting
+    clears = [c for c in cmux_calls if c[0] == "clear-status"]
+    assert clears == [
+        ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"]
+    ]
+    # new title is not in the map -> no stale ref reuse, no pill yet
+    assert [c for c in cmux_calls if c[0] == "set-status"] == []
+
+
+def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls):
+    titles = {}
+    monkeypatch.setattr(ch, "cmux_workspaces_by_title", lambda cfg: dict(titles))
+    rstate = {"remotes": {}}
+    agents = [remote_agent("w1:p1", "working")]
+
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    assert cmux_calls == []  # title not resolvable yet
+
+    titles["maguro:hd:tom"] = "workspace:9"
+    changed = ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    assert changed is False  # snapshot unchanged, but the pill is retried
+    pill = [c for c in cmux_calls if c[0] == "set-status"]
+    assert len(pill) == 1
+    assert pill[0][1] == "herdr.remote.tom"
+    assert "workspace:9" in pill[0]
+
+
+def test_remote_name_defaults_to_host_and_session():
+    assert (
+        ch.remote_name({"ssh_target": "tom@maguro.example.ts.net", "session": "tom"})
+        == "maguro-tom"
+    )
+    assert ch.remote_name({"ssh_target": "maguro", "session": "hd"}) == "maguro-hd"
+    assert ch.remote_name({"ssh_target": "maguro", "session": "hd", "name": "x"}) == "x"
+
+
+def test_remote_configs_skips_duplicate_names(capsys):
+    cfg = {
+        "remotes": [
+            {"ssh_target": "a", "session": "s", "name": "dup"},
+            {"ssh_target": "b", "session": "s", "name": "dup"},
+        ]
+    }
+    remotes = ch.remote_configs(cfg)
+    assert [r["ssh_target"] for r in remotes] == ["a"]
+    assert "duplicate remote name" in capsys.readouterr().err
+
+
+def test_retire_remote_clears_pill_and_state(monkeypatch, cmux_calls, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    rstate = {
+        "remotes": {
+            "tom": {
+                "panes": {"w1:p1": {"status": "blocked"}},
+                "ref": "workspace:9",
+                "cmux_title": "maguro:hd:tom",
+            }
+        }
+    }
+    ch.retire_remote({}, rstate, "tom", {}, {})
+
+    assert rstate["remotes"] == {}
+    assert ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"] in (
+        cmux_calls
+    )
+    assert ["mark-notification-read", "--workspace", "workspace:9"] in cmux_calls
+    saved = json.loads((tmp_path / "remote-state.json").read_text())
+    assert saved["remotes"] == {}
 
 
 def test_sweep_orphan_pills_keeps_remote_keys(monkeypatch, cfg, state):
