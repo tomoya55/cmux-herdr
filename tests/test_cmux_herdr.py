@@ -876,12 +876,13 @@ def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls)
 
 
 def test_remote_name_defaults_to_target_and_session():
-    # The full target is preserved so distinct users/hosts cannot collide.
+    # The full target with an unambiguous separator, so distinct
+    # users/hosts/sessions cannot collide.
     assert (
         ch.remote_name({"ssh_target": "tom@maguro.example.ts.net", "session": "tom"})
-        == "tom@maguro.example.ts.net-tom"
+        == "tom@maguro.example.ts.net:tom"
     )
-    assert ch.remote_name({"ssh_target": "maguro", "session": "hd"}) == "maguro-hd"
+    assert ch.remote_name({"ssh_target": "maguro", "session": "hd"}) == "maguro:hd"
     assert ch.remote_name({"ssh_target": "maguro", "session": "hd", "name": "x"}) == "x"
 
 
@@ -891,7 +892,9 @@ def test_remote_configs_rejects_malformed_entries(capsys):
             "bad",
             {"ssh_target": 42, "session": "s"},
             {"ssh_target": "a", "session": "s", "cmux_title": 1},
-            {"ssh_target": "a", "session": "s"},
+            {"ssh_target": "a", "session": "s", "name": ["x"], "cmux_title": "t"},
+            {"ssh_target": "a", "session": "s"},  # cmux_title is required
+            {"ssh_target": "a", "session": "s", "cmux_title": "t"},
         ]
     }
     remotes = ch.remote_configs(cfg)
@@ -899,14 +902,22 @@ def test_remote_configs_rejects_malformed_entries(capsys):
     err = capsys.readouterr().err
     assert "expected a table" in err
     assert "ssh_target/session required" in err
-    assert "cmux_title must be a string" in err
+    assert "cmux_title must be a string" in err or "cmux_title is required" in err
+    assert "name must be a string" in err
+
+
+def test_remote_configs_none_when_all_entries_invalid():
+    assert ch.remote_configs({"remotes": ["bad"]}) is None
+    assert ch.remote_configs({"remotes": "bad"}) is None
+    assert ch.remote_configs({}) == []
+    assert ch.remote_configs({"remotes": []}) == []
 
 
 def test_remote_configs_skips_duplicate_names(capsys):
     cfg = {
         "remotes": [
-            {"ssh_target": "a", "session": "s", "name": "dup"},
-            {"ssh_target": "b", "session": "s", "name": "dup"},
+            {"ssh_target": "a", "session": "s", "name": "dup", "cmux_title": "t"},
+            {"ssh_target": "b", "session": "s", "name": "dup", "cmux_title": "t"},
         ]
     }
     remotes = ch.remote_configs(cfg)
