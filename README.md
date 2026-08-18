@@ -47,7 +47,8 @@ Sessions attached via `herdr --remote <host>` run on a remote herdr server, so t
 ssh_target = "maguro.example.ts.net"   # anything ssh(1) accepts
 session = "tom"                        # remote herdr session name
 cmux_title = "maguro:hd:tom"           # title of the cmux workspace to update
-# name = "maguro-tom"                  # optional; defaults to "<ssh_target>-<session>"
+# name = "maguro-tom"                  # optional; defaults to "<ssh_target>:<session>"
+                                       # (hashed "remote-<digest>" for IPv6/URI targets)
 # poll_seconds = 2                     # optional
 ```
 

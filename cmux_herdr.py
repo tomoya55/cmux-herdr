@@ -1333,6 +1333,7 @@ def remote_daemon(cfg):
                             entry = rstate["remotes"].get(name)
                             if entry is not None:
                                 entry["pill_published"] = False
+                                save_remote_state(rstate)
                         continue
                     entry = rstate["remotes"].get(name)
                     if entry is None:
