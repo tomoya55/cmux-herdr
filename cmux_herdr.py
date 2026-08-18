@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -667,11 +668,13 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     changed = False
     cmux_title = rcfg.get("cmux_title") or ""
     if entry.get("cmux_title") != cmux_title:
-        # Clear the pill on the previous workspace before rerouting.
+        # Clear the pill and any unread notifications on the previous
+        # workspace before rerouting.
         old_ref = entry.pop("ref", None)
         entry.pop("ref_at", None)
         if old_ref:
             cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", old_ref])
+            cmux_cli(cfg, ["mark-notification-read", "--workspace", old_ref])
         entry["cmux_title"] = cmux_title
         entry["pill_published"] = False
         changed = True
@@ -690,10 +693,11 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
             "workspace_id": a.get("workspace_id") or "",
         }
     if new == old:
-        # Republish when the pill was never pushed (e.g. the cmux workspace did
-        # not exist yet) or may have been lost (e.g. a cmux restart).
+        # Republish when the pill was never pushed (e.g. the cmux workspace
+        # did not exist yet, or the title just changed) or may have been lost
+        # (e.g. a cmux restart).
         stale = time.time() - entry.get("pill_at", 0) > REMOTE_REF_TTL_SECONDS
-        if not changed and (stale or not entry.get("pill_published")):
+        if stale or not entry.get("pill_published"):
             update_remote_pill(cfg, name, entry)
         return changed
 
@@ -863,29 +867,73 @@ def retire_remote(cfg, rstate, name, procs, next_due):
     save_remote_state(rstate)
 
 
+def daemon_self_info():
+    script = os.path.abspath(__file__)
+    try:
+        mtime = os.path.getmtime(script)
+    except OSError:
+        mtime = 0
+    return {"pid": os.getpid(), "script": script, "mtime": mtime}
+
+
+def take_over_daemon(pid_path):
+    """Ensure this is the only (and latest-code) remote daemon running."""
+    if not pid_path.exists():
+        return
+    info = {}
+    old_pid = None
+    try:
+        info = json.loads(pid_path.read_text())
+        old_pid = int(info.get("pid", 0))
+        os.kill(old_pid, 0)
+        alive = True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        alive = False
+    if not alive:
+        return
+    self = daemon_self_info()
+    if info.get("script") == self["script"] and info.get("mtime") == self["mtime"]:
+        log(f"remote daemon already running (pid {old_pid})")
+        raise SystemExit(0)
+    # The plugin was reinstalled or edited since the old daemon started.
+    log(f"replacing outdated remote daemon (pid {old_pid})")
+    os.kill(old_pid, signal.SIGTERM)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(old_pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
+
+
 def remote_daemon(cfg):
     remotes = remote_configs(cfg)
     if not remotes:
-        # No remotes configured: clean up anything a previous daemon left
-        # behind, then exit. A new daemon is spawned by each startup hook.
+        # No remotes configured: retire anything a previous daemon left
+        # behind (pills, unread notifications, stale state), then exit.
+        # A new daemon is spawned by each startup hook and refresh action.
+        rstate = load_remote_state()
+        for name in list(rstate.get("remotes", {})):
+            retire_remote(cfg, rstate, name, {}, {})
         sweep_remote_orphan_pills(cfg, [])
-        save_remote_state({"remotes": {}})
+        save_remote_state(rstate)
         log("no [[remotes]] configured; remote daemon exiting")
         return 0
     state_dir.mkdir(parents=True, exist_ok=True)
     pid_path = state_dir / "remote.pid"
-    if pid_path.exists():
-        try:
-            os.kill(int(pid_path.read_text().strip()), 0)
-            log(f"remote daemon already running (pid {pid_path.read_text().strip()})")
-            return 0
-        except (OSError, ValueError):
-            pass
-    pid_path.write_text(str(os.getpid()))
+    take_over_daemon(pid_path)
+    pid_path.write_text(json.dumps(daemon_self_info()))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     rstate = load_remote_state()
     procs = {}
     next_due = {}
     watched = {}
+    active_names = {remote_name(r) for r in remotes}
+    for name in list(rstate["remotes"]):
+        if name not in active_names:
+            # Persisted while a previous daemon was running; never retired.
+            retire_remote(cfg, rstate, name, procs, next_due)
     sweep_remote_orphan_pills(cfg, remotes)
     names = [remote_name(r) for r in remotes]
     log(f"remote daemon started (pid {os.getpid()}); watching: {', '.join(names)}")
@@ -922,7 +970,13 @@ def remote_daemon(cfg):
     finally:
         for name in list(procs):
             drop_forward(name, rstate["remotes"].get(name, {}), procs)
-        pid_path.unlink(missing_ok=True)
+        # Only unlink our own pidfile; a replacement daemon may have
+        # already written its own.
+        try:
+            if json.loads(pid_path.read_text()).get("pid") == os.getpid():
+                pid_path.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
     return 0
 
 

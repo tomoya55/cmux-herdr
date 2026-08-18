@@ -11,7 +11,7 @@ command = ["/bin/zsh", "-c", "python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" recon
 [[actions]]
 id = "refresh"
 title = "Refresh cmux sidebar"
-command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile"]
+command = ["/bin/zsh", "-c", "python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile; nohup python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" remote >>\"$HERDR_PLUGIN_STATE_DIR/remote.log\" 2>&1 &"]
 
 [[events]]
 on = "pane.agent_status_changed"

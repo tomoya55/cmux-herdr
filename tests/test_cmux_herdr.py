@@ -698,13 +698,58 @@ def test_remote_title_change_reroutes_pill(cmux_calls, remote_title_map):
         {}, rstate, "tom", rcfg, [remote_agent("w1:p1", "working")], {}
     )
     assert changed is True
-    # the pill on the previous workspace is cleared before rerouting
+    # the pill and unread notifications on the previous workspace are cleared
     clears = [c for c in cmux_calls if c[0] == "clear-status"]
     assert clears == [
         ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"]
     ]
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
     # new title is not in the map -> no stale ref reuse, no pill yet
     assert [c for c in cmux_calls if c[0] == "set-status"] == []
+
+
+def test_remote_title_change_publishes_to_new_workspace(monkeypatch, cmux_calls):
+    monkeypatch.setattr(
+        ch,
+        "cmux_workspaces_by_title",
+        lambda cfg: {"maguro:hd:tom": "workspace:9", "maguro:hd:other": "workspace:10"},
+    )
+    rstate = {"remotes": {}}
+    agents = [remote_agent("w1:p1", "working")]
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    cmux_calls.clear()
+
+    rcfg = dict(REMOTE_CFG, cmux_title="maguro:hd:other")
+    ch.apply_remote_snapshot({}, rstate, "tom", rcfg, agents, {})
+
+    pill = [c for c in cmux_calls if c[0] == "set-status"]
+    assert len(pill) == 1
+    assert pill[0][1] == "herdr.remote.tom"
+    assert "workspace:10" in pill[0]
+
+
+def test_remote_daemon_without_remotes_cleans_up(monkeypatch, cmux_calls, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    ch.save_remote_state(
+        {
+            "remotes": {
+                "tom": {
+                    "panes": {"w1:p1": {"status": "blocked"}},
+                    "ref": "workspace:9",
+                    "cmux_title": "maguro:hd:tom",
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(ch, "cmux_workspaces_by_title", lambda cfg: {})
+
+    assert ch.remote_daemon({}) == 0
+
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
+    saved = json.loads((tmp_path / "remote-state.json").read_text())
+    assert saved["remotes"] == {}
 
 
 def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls):

@@ -57,7 +57,9 @@ The plugin's startup hook spawns a local daemon (`cmux_herdr.py remote`, logs to
 2. Forwards it to a local unix socket with `ssh -L <local>:<remote> -N` (stock OpenSSH, nothing to install on the remote)
 3. Polls `agent.list` / `workspace.list` over the herdr socket protocol and pushes the aggregate to the cmux workspace whose title matches `cmux_title`
 
-Remote agents then get the same treatment as local ones — notifications on `blocked`/`done` and a `N waiting · N working` pill (status key `herdr.remote.<name>`) — aggregated across the whole remote session. Notifications are marked read as soon as no remote agent needs attention. The tunnel reconnects automatically after network or remote server restarts, and the daemon picks up `config.toml` edits within a few seconds.
+Remote agents then get the same treatment as local ones — notifications on `blocked`/`done` and a `N waiting · N working` pill (status key `herdr.remote.<name>`) — aggregated across the whole remote session. Notifications are marked read as soon as no remote agent needs attention. The tunnel reconnects automatically after network or remote server restarts, and the daemon picks up `config.toml` edits (including removing or retargeting remotes) within a few seconds. A newer daemon spawned after a plugin upgrade or local checkout edit replaces an outdated one automatically.
+
+If the daemon was not running when you add your first `[[remotes]]` entry (it exits immediately when no remotes are configured), start it via the refresh action (`herdr plugin action invoke cmux-herdr.refresh`) or by restarting the herdr server.
 
 **SSH auth must be non-interactive**: the daemon runs `ssh` with `BatchMode=yes`, so the remote host must accept a local key. If interactive login needs a password or Touch ID, authorize a key once:
 
