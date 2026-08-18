@@ -623,25 +623,44 @@ def remote_sock_path(name):
 
 def clear_remote_pill(cfg, name, entry, ref):
     """Clear a pill, remembering it for retry when cmux rejects the call."""
-    if cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
-        if entry.get("pending_clear") == ref:
-            entry.pop("pending_clear", None)
+    if not cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
+        pending = entry.setdefault("pending_clear", [])
+        if ref not in pending:
+            pending.append(ref)
+
+
+def retry_pending_clears(cfg, name, entry):
+    remaining = []
+    for ref in entry.get("pending_clear") or []:
+        if not cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
+            remaining.append(ref)
+    if remaining:
+        entry["pending_clear"] = remaining
     else:
-        entry["pending_clear"] = ref
+        entry.pop("pending_clear", None)
 
 
 def local_attention_refs(cfg):
     """Refs of cmux workspaces with local attention panes, resolved only via
-    side-effect-free mappings (explicit config and the cached session ref)."""
+    side-effect-free mappings (explicit config, env, cached session ref, and
+    label-title matching)."""
     state = load_state()
     refs = set()
+    env_ref = os.environ.get("CMUX_WORKSPACE_ID")
+    titles = None
     for ws_id, ws in state.get("workspaces", {}).items():
         if not has_attention_panes(ws.get("panes", {})):
             continue
         label = ws.get("label") or ""
         ref = cfg.get("workspaces", {}).get(ws_id) or cfg.get("labels", {}).get(label)
         if not ref:
+            ref = env_ref
+        if not ref:
             ref = (state.get("session_ref") or {}).get("ref")
+        if not ref and cfg.get("match_by_label", True) and label:
+            if titles is None:
+                titles = cmux_workspaces_by_title(cfg)
+            ref = titles.get(label.strip().lower())
         if ref:
             refs.add(ref)
     return refs
@@ -649,9 +668,8 @@ def local_attention_refs(cfg):
 
 def remote_ref(cfg, rstate, name, entry):
     """Resolve the cmux workspace ref for a remote via its configured title."""
-    pending = entry.get("pending_clear")
-    if pending:
-        clear_remote_pill(cfg, name, entry, pending)
+    if entry.get("pending_clear"):
+        retry_pending_clears(cfg, name, entry)
     title = entry.get("cmux_title") or ""
     cached = entry.get("ref")
     if cached and time.time() - entry.get("ref_at", 0) < REMOTE_REF_TTL_SECONDS:
@@ -942,18 +960,29 @@ def remote_configs(cfg):
 
 
 def retire_remote(cfg, rstate, name, procs, next_due):
-    """Tear down a remote that was removed from the config or retargeted."""
-    entry = rstate["remotes"].pop(name, {})
+    """Tear down a remote that was removed from the config or retargeted.
+
+    Keeps a minimal entry behind when cmux rejects a pill clear, so a later
+    daemon start retries the cleanup instead of stranding the pill.
+    """
+    entry = rstate["remotes"].get(name, {})
     drop_forward(name, entry, procs)
     next_due.pop(name, None)
+    retry_pending_clears(cfg, name, entry)
     ref = entry.get("ref")
     if not ref:
         title = (entry.get("cmux_title") or "").strip().lower()
         if title:
             ref = cmux_workspaces_by_title(cfg).get(title)
     if ref:
-        cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref])
+        clear_remote_pill(cfg, name, entry, ref)
         remote_mark_read_ref(cfg, rstate, name, ref)
+    if entry.get("pending_clear"):
+        entry["panes"] = {}
+        entry.pop("ref", None)
+        log(f"remote {name}: retired, but pill cleanup is still pending")
+    else:
+        rstate["remotes"].pop(name, None)
     save_remote_state(rstate)
 
 
@@ -1105,10 +1134,15 @@ def remote_daemon(cfg):
                 watched.setdefault(name, identity)
             for rcfg in remotes:
                 name = remote_name(rcfg)
-                # Clamp the deadline so a decreased poll_seconds applies now.
-                deadline = min(next_due.get(name, 0), time.time() + poll_interval(rcfg))
-                next_due[name] = deadline
-                if time.time() < deadline:
+                # Clamp deadlines far in the future so a decreased
+                # poll_seconds applies promptly, without undoing the error
+                # backoff (which is at most REMOTE_ERROR_BACKOFF_SECONDS).
+                cap = time.time() + max(
+                    poll_interval(rcfg), REMOTE_ERROR_BACKOFF_SECONDS
+                )
+                if next_due.get(name, 0) > cap:
+                    next_due[name] = cap
+                if time.time() < next_due.get(name, 0):
                     continue
                 try:
                     changed = poll_remote(cfg, rstate, name, rcfg, procs)
