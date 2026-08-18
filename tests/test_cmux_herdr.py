@@ -134,6 +134,29 @@ def test_leaving_attention_marks_notifications_read(cfg, state, cmux_calls):
     assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
 
 
+def test_local_mark_read_respects_remote_attention(
+    monkeypatch, cfg, state, cmux_calls, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    ch.save_remote_state(
+        {
+            "remotes": {
+                "maguro-tom": {
+                    "panes": {"w9:p1": {"status": "blocked"}},
+                    "ref": "workspace:1",
+                }
+            }
+        }
+    )
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    cmux_calls.clear()
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
+
+    # the local pane leaving attention must not clear the remote's
+    # still-unresolved notification on the same cmux workspace
+    assert [c for c in cmux_calls if c[0] == "mark-notification-read"] == []
+
+
 def test_other_attention_pane_keeps_notifications_unread(cfg, state, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
     ch.handle_event(cfg, state, status_event("w1:p2", "w1", "blocked"))
@@ -852,13 +875,31 @@ def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls)
     assert "workspace:9" in pill[0]
 
 
-def test_remote_name_defaults_to_host_and_session():
+def test_remote_name_defaults_to_target_and_session():
+    # The full target is preserved so distinct users/hosts cannot collide.
     assert (
         ch.remote_name({"ssh_target": "tom@maguro.example.ts.net", "session": "tom"})
-        == "maguro-tom"
+        == "tom@maguro.example.ts.net-tom"
     )
     assert ch.remote_name({"ssh_target": "maguro", "session": "hd"}) == "maguro-hd"
     assert ch.remote_name({"ssh_target": "maguro", "session": "hd", "name": "x"}) == "x"
+
+
+def test_remote_configs_rejects_malformed_entries(capsys):
+    cfg = {
+        "remotes": [
+            "bad",
+            {"ssh_target": 42, "session": "s"},
+            {"ssh_target": "a", "session": "s", "cmux_title": 1},
+            {"ssh_target": "a", "session": "s"},
+        ]
+    }
+    remotes = ch.remote_configs(cfg)
+    assert [r["ssh_target"] for r in remotes] == ["a"]
+    err = capsys.readouterr().err
+    assert "expected a table" in err
+    assert "ssh_target/session required" in err
+    assert "cmux_title must be a string" in err
 
 
 def test_remote_configs_skips_duplicate_names(capsys):

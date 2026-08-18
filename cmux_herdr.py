@@ -371,6 +371,11 @@ def mark_read(cfg, state, ws_id):
     ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
     if not ref:
         return
+    # mark-notification-read is workspace-wide; do not hide notifications
+    # for a remote that still needs attention on the same workspace.
+    for r in load_remote_state().get("remotes", {}).values():
+        if r.get("ref") == ref and has_attention_panes(r.get("panes", {})):
+            return
     cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
 
 
@@ -607,8 +612,7 @@ def socket_rpc(sock_path, method, params, timeout=10):
 def remote_name(rcfg):
     if rcfg.get("name"):
         return rcfg["name"]
-    host = rcfg["ssh_target"].split("@")[-1].split(".")[0]
-    return f"{host}-{rcfg['session']}"
+    return f"{rcfg['ssh_target']}-{rcfg['session']}"
 
 
 def remote_key(name):
@@ -624,10 +628,16 @@ def remote_sock_path(name):
 
 def clear_remote_pill(cfg, name, entry, ref):
     """Clear a pill, remembering it for retry when cmux rejects the call."""
-    if not cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
-        pending = entry.setdefault("pending_clear", [])
-        if ref not in pending:
-            pending.append(ref)
+    if cmux_cli(cfg, ["clear-status", remote_key(name), "--workspace", ref]):
+        return
+    pending = entry.get("pending_clear")
+    if isinstance(pending, str):  # scalar format from an earlier version
+        pending = [pending]
+    elif not isinstance(pending, list):
+        pending = []
+    if ref not in pending:
+        pending.append(ref)
+    entry["pending_clear"] = pending
 
 
 def retry_pending_clears(cfg, name, entry):
@@ -920,8 +930,8 @@ def poll_interval(rcfg):
     return max(value, 0.5)
 
 
-def poll_remote(cfg, rstate, name, rcfg, procs):
-    entry = rstate["remotes"].setdefault(name, {"panes": {}})
+def fetch_remote(name, rcfg, entry, procs):
+    """Network-only part of a poll; safe to run in a worker thread."""
     sock = ensure_forward(name, rcfg, entry, procs)
     try:
         agents = socket_rpc(sock, "agent.list", {}).get("agents", [])
@@ -935,7 +945,7 @@ def poll_remote(cfg, rstate, name, rcfg, procs):
         ws_id = w.get("workspace_id") or w.get("id")
         if ws_id:
             labels[ws_id] = w.get("label") or ""
-    return apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels)
+    return agents, labels
 
 
 def sweep_remote_orphan_pills(cfg, remotes):
@@ -951,8 +961,24 @@ def sweep_remote_orphan_pills(cfg, remotes):
 def remote_configs(cfg):
     remotes = []
     seen = set()
-    for r in cfg.get("remotes", []):
-        if not (r.get("ssh_target") and r.get("session")):
+    raw = cfg.get("remotes", [])
+    if not isinstance(raw, list):
+        log("[[remotes]] must be an array of tables; ignoring")
+        return []
+    for r in raw:
+        if not isinstance(r, dict):
+            log(f"invalid [[remotes]] entry {r!r}; expected a table")
+            continue
+        if not (
+            isinstance(r.get("ssh_target"), str)
+            and isinstance(r.get("session"), str)
+            and r["ssh_target"]
+            and r["session"]
+        ):
+            log(f"invalid [[remotes]] entry {r!r}; ssh_target/session required")
+            continue
+        if r.get("cmux_title") is not None and not isinstance(r["cmux_title"], str):
+            log(f"remote {r!r}: cmux_title must be a string; ignoring entry")
             continue
         name = remote_name(r)
         if name in seen:
@@ -1070,10 +1096,13 @@ def take_over_daemon(pid_path):
     raise SystemExit(1)
 
 
-def poll_remote_worker(cfg, rstate, rcfg, procs, results):
+def poll_remote_worker(rstate, rcfg, procs, results):
+    """Fetch one remote's snapshot in the background; the main thread applies
+    it, so all state/cmux mutations stay serialized."""
     name = remote_name(rcfg)
     try:
-        results[name] = ("ok", poll_remote(cfg, rstate, name, rcfg, procs))
+        entry = rstate["remotes"].setdefault(name, {"panes": {}})
+        results[name] = ("ok", fetch_remote(name, rcfg, entry, procs))
     except Exception as e:
         results[name] = ("err", e)
 
@@ -1116,7 +1145,15 @@ def remote_daemon(cfg):
     rstate = load_remote_state()
     procs = {}
     next_due = {}
-    watched = {}
+    inflight = {}  # name -> worker thread (fetch only; main thread applies)
+    results = {}
+    tombstone_due = {}
+    # Seed watched from the startup config so a config change between
+    # startup reconciliation and the first loop iteration is still caught.
+    watched = {
+        remote_name(r): (r["ssh_target"], r["session"], r.get("cmux_title") or "")
+        for r in remotes
+    }
     configured = {remote_name(r): r for r in remotes}
     for name in list(rstate["remotes"]):
         entry = rstate["remotes"][name]
@@ -1152,6 +1189,24 @@ def remote_daemon(cfg):
                 )
                 for r in remotes
             }
+            # Reap finished fetch workers and apply their snapshots on this
+            # thread, keeping all state and cmux mutations serialized.
+            for name, t in list(inflight.items()):
+                if t.is_alive():
+                    continue
+                del inflight[name]
+                status, value = results.pop(name, ("err", "poll did not finish"))
+                rcfg = next((r for r in remotes if remote_name(r) == name), None)
+                if rcfg is None:
+                    continue  # retired while the fetch was in flight
+                if status == "ok":
+                    agents, labels = value
+                    if apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
+                        save_remote_state(rstate)
+                    next_due[name] = time.time() + poll_interval(rcfg)
+                else:
+                    log(f"remote {name}: {value}")
+                    next_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
             for name, identity in list(watched.items()):
                 if active.get(name) != identity:
                     log(f"remote {name}: removed or retargeted; tearing down")
@@ -1159,9 +1214,12 @@ def remote_daemon(cfg):
                     del watched[name]
             for name, identity in active.items():
                 watched.setdefault(name, identity)
-            due = []
+            # Spawn fetches for due remotes without waiting for them, so one
+            # unreachable remote cannot starve the others.
             for rcfg in remotes:
                 name = remote_name(rcfg)
+                if name in inflight:
+                    continue
                 # Clamp deadlines far in the future so a decreased
                 # poll_seconds applies promptly, without undoing the error
                 # backoff (which is at most REMOTE_ERROR_BACKOFF_SECONDS).
@@ -1172,44 +1230,27 @@ def remote_daemon(cfg):
                     next_due[name] = cap
                 if time.time() < next_due.get(name, 0):
                     continue
-                due.append(rcfg)
-            # Poll due remotes in parallel so one unreachable remote cannot
-            # starve the others (each poll can block for many seconds).
-            results = {}
-            threads = [
-                threading.Thread(
+                t = threading.Thread(
                     target=poll_remote_worker,
-                    args=(cfg, rstate, r, procs, results),
+                    args=(rstate, rcfg, procs, results),
                     daemon=True,
                 )
-                for r in due
-            ]
-            for t in threads:
+                inflight[name] = t
                 t.start()
-            for t in threads:
-                t.join()
-            any_changed = False
-            for rcfg in due:
-                name = remote_name(rcfg)
-                status, value = results.get(name, ("err", "poll did not finish"))
-                if status == "ok":
-                    any_changed |= value
-                    next_due[name] = time.time() + poll_interval(rcfg)
-                else:
-                    log(f"remote {name}: {value}")
-                    next_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
-            if any_changed:
-                save_remote_state(rstate)
-            # Retry pill cleanups left behind by retired remotes.
-            configured_names = {remote_name(r) for r in remotes}
+            # Retry pill cleanups left behind by retired remotes, backed off.
             for name in list(rstate["remotes"]):
-                if name in configured_names:
+                if name in active:
                     continue
                 entry = rstate["remotes"][name]
                 if not entry.get("pending_clear"):
                     continue
+                if time.time() < tombstone_due.get(name, 0):
+                    continue
                 retry_pending_clears(cfg, name, entry)
-                if not entry.get("pending_clear"):
+                if entry.get("pending_clear"):
+                    tombstone_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
+                else:
+                    tombstone_due.pop(name, None)
                     rstate["remotes"].pop(name, None)
                     save_remote_state(rstate)
             time.sleep(0.5)

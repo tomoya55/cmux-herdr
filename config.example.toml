@@ -16,7 +16,7 @@ match_by_label = true
 # - herdr installed on the remote host
 #
 # [[remotes]]
-# name = "maguro-tom"               # optional; defaults to "<host>-<session>"
+# name = "maguro-tom"               # optional; defaults to "<ssh_target>-<session>"
 # ssh_target = "maguro.example.ts.net"
 # session = "tom"                   # remote herdr session name
 # cmux_title = "maguro:hd:tom"      # title of the cmux workspace to update
