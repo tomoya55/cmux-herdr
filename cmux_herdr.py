@@ -31,6 +31,10 @@ REMOTE_STALE_REF_TTL_SECONDS = 600
 REMOTE_DEFAULT_POLL_SECONDS = 2.0
 REMOTE_ERROR_BACKOFF_SECONDS = 10.0
 
+# Set when the remote daemon is shutting down; workers must not spawn new
+# SSH forwards after this point (the main thread is tearing them down).
+DAEMON_SHUTDOWN = threading.Event()
+
 state_dir = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", "."))
 config_dir = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "."))
 STATE_PATH = state_dir / "state.json"
@@ -874,6 +878,8 @@ def drop_forward(name, entry, procs):
 
 def ensure_forward(name, rcfg, entry, procs):
     """Return the local end of an ssh unix-socket forward, (re)spawning it."""
+    if DAEMON_SHUTDOWN.is_set():
+        raise SocketError("daemon is shutting down")
     local_sock = remote_sock_path(name)
     proc = procs.get(name)
     if proc is not None and proc.poll() is None and local_sock.exists():
@@ -884,6 +890,8 @@ def ensure_forward(name, rcfg, entry, procs):
     if not remote_path:
         remote_path = resolve_remote_socket(rcfg["ssh_target"], rcfg["session"])
         entry["socket_path"] = remote_path
+    if DAEMON_SHUTDOWN.is_set():
+        raise SocketError("daemon is shutting down")
     local_sock.unlink(missing_ok=True)
     procs[name] = subprocess.Popen(
         [
@@ -960,21 +968,19 @@ def sweep_remote_orphan_pills(cfg, remotes):
 
 
 def remote_configs(cfg):
-    """Validated [[remotes]] entries. Returns None when the config holds
-    remotes but none are usable, so callers can keep the previous config
-    instead of tearing everything down."""
-    remotes = []
-    seen = set()
+    """Validated [[remotes]] entries. Returns None when any entry is
+    unusable, so callers can keep the previous config instead of tearing
+    remotes down over a typo."""
     raw = cfg.get("remotes", [])
-    if not raw:
-        return []
     if not isinstance(raw, list):
         log("[[remotes]] must be an array of tables")
         return None
+    remotes = []
+    seen = set()
     for r in raw:
         if not isinstance(r, dict):
             log(f"invalid [[remotes]] entry {r!r}; expected a table")
-            continue
+            return None
         if not (
             isinstance(r.get("ssh_target"), str)
             and isinstance(r.get("session"), str)
@@ -982,21 +988,22 @@ def remote_configs(cfg):
             and r["session"]
         ):
             log(f"invalid [[remotes]] entry {r!r}; ssh_target/session required")
-            continue
+            return None
         if r.get("name") is not None and not isinstance(r["name"], str):
-            log(f"remote {r!r}: name must be a string; ignoring entry")
-            continue
+            log(f"remote {r!r}: name must be a string")
+            return None
+        if not r.get("name") and (":" in r["ssh_target"] or ":" in r["session"]):
+            log(f"remote {r!r}: ':' in ssh_target/session needs an explicit name")
+            return None
         if not isinstance(r.get("cmux_title"), str) or not r.get("cmux_title"):
-            log(f"remote {remote_name(r)!r}: cmux_title is required; ignoring entry")
-            continue
+            log(f"remote {remote_name(r)!r}: cmux_title is required")
+            return None
         name = remote_name(r)
         if name in seen:
             log(f"duplicate remote name {name!r}; set a unique `name` in [[remotes]]")
-            continue
+            return None
         seen.add(name)
         remotes.append(r)
-    if raw and not remotes:
-        return None
     return remotes
 
 
@@ -1128,12 +1135,25 @@ def poll_remote_worker(rcfg, procs, results):
 
 
 def tombstone_worker(cfg, rstate, names, done):
-    """Retry retired remotes' pill clears off the scheduling thread."""
+    """Retry retired remotes' pill clears off the scheduling thread.
+
+    Reads shared state but never mutates it; the main thread applies the
+    results only for remotes that are still retired.
+    """
     for name in names:
         entry = rstate["remotes"].get(name)
-        if entry and entry.get("pending_clear"):
-            retry_pending_clears(cfg, name, entry)
-            done[name] = not entry.get("pending_clear")
+        if not entry:
+            continue
+        pending = entry.get("pending_clear")
+        if isinstance(pending, str):  # scalar format from an earlier version
+            pending = [pending]
+        remaining = []
+        for ref in pending or []:
+            if not cmux_cli(
+                cfg, ["clear-status", remote_key(name), "--workspace", ref]
+            ):
+                remaining.append(ref)
+        done[name] = remaining
 
 
 def remote_daemon(cfg):
@@ -1291,13 +1311,19 @@ def remote_daemon(cfg):
             # and off this thread (cmux calls can block for seconds).
             finished = tombstone["thread"]
             if finished is not None and not finished.is_alive():
-                for name, cleared in tombstone["done"].items():
-                    if cleared:
+                for name, remaining in tombstone["done"].items():
+                    if name in active:
+                        continue  # re-added meanwhile; manages its own pills
+                    entry = rstate["remotes"].get(name)
+                    if entry is None:
+                        continue
+                    if remaining:
+                        entry["pending_clear"] = remaining
+                        tombstone_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
+                    else:
                         tombstone_due.pop(name, None)
                         rstate["remotes"].pop(name, None)
                         save_remote_state(rstate)
-                    else:
-                        tombstone_due[name] = time.time() + REMOTE_ERROR_BACKOFF_SECONDS
                 tombstone["thread"] = None
                 tombstone["done"] = {}
             if tombstone["thread"] is None:
@@ -1319,6 +1345,12 @@ def remote_daemon(cfg):
     except KeyboardInterrupt:
         pass
     finally:
+        DAEMON_SHUTDOWN.set()
+        # Quiesce fetch workers before tearing down their SSH forwards, so
+        # no worker can spawn a new forward after this loop has run.
+        deadline = time.time() + 10
+        for t in inflight.values():
+            t.join(max(0, deadline - time.time()))
         for name in list(procs):
             drop_forward(name, rstate["remotes"].get(name, {}), procs)
         # Only unlink our own pidfile; a replacement daemon may have

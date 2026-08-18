@@ -887,41 +887,34 @@ def test_remote_name_defaults_to_target_and_session():
 
 
 def test_remote_configs_rejects_malformed_entries(capsys):
-    cfg = {
-        "remotes": [
-            "bad",
-            {"ssh_target": 42, "session": "s"},
-            {"ssh_target": "a", "session": "s", "cmux_title": 1},
-            {"ssh_target": "a", "session": "s", "name": ["x"], "cmux_title": "t"},
-            {"ssh_target": "a", "session": "s"},  # cmux_title is required
-            {"ssh_target": "a", "session": "s", "cmux_title": "t"},
-        ]
-    }
-    remotes = ch.remote_configs(cfg)
-    assert [r["ssh_target"] for r in remotes] == ["a"]
-    err = capsys.readouterr().err
-    assert "expected a table" in err
-    assert "ssh_target/session required" in err
-    assert "cmux_title must be a string" in err or "cmux_title is required" in err
-    assert "name must be a string" in err
-
-
-def test_remote_configs_none_when_all_entries_invalid():
-    assert ch.remote_configs({"remotes": ["bad"]}) is None
+    # any invalid entry rejects the whole config so the last valid one is kept
+    bad_entries = [
+        "bad",
+        {"ssh_target": 42, "session": "s"},
+        {"ssh_target": "a", "session": "s", "cmux_title": 1},
+        {"ssh_target": "a", "session": "s", "name": ["x"], "cmux_title": "t"},
+        {"ssh_target": "a", "session": "s"},  # cmux_title is required
+        {"ssh_target": "a:1", "session": "s", "cmux_title": "t"},  # ambiguous name
+    ]
+    for bad in bad_entries:
+        assert ch.remote_configs({"remotes": [bad]}) is None, bad
     assert ch.remote_configs({"remotes": "bad"}) is None
+    assert ch.remote_configs({"remotes": ""}) is None
     assert ch.remote_configs({}) == []
     assert ch.remote_configs({"remotes": []}) == []
+    valid = {"ssh_target": "a", "session": "s", "cmux_title": "t"}
+    assert ch.remote_configs({"remotes": [valid]}) == [valid]
+    assert "expected a table" in capsys.readouterr().err
 
 
-def test_remote_configs_skips_duplicate_names(capsys):
+def test_remote_configs_rejects_duplicate_names(capsys):
     cfg = {
         "remotes": [
             {"ssh_target": "a", "session": "s", "name": "dup", "cmux_title": "t"},
             {"ssh_target": "b", "session": "s", "name": "dup", "cmux_title": "t"},
         ]
     }
-    remotes = ch.remote_configs(cfg)
-    assert [r["ssh_target"] for r in remotes] == ["a"]
+    assert ch.remote_configs(cfg) is None
     assert "duplicate remote name" in capsys.readouterr().err
 
 
