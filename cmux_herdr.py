@@ -1186,10 +1186,11 @@ def remote_daemon(cfg):
         with open(state_dir / "remote.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if live_daemon_pid(pid_path) is not None:
-                # The running daemon hot-reloads the empty config and
-                # retires its remotes itself.
-                log("remote daemon already running; leaving cleanup to it")
-                return 0
+                # A current daemon hot-reloads the empty config and retires
+                # its remotes itself (this raises SystemExit in that case);
+                # an outdated one is replaced so upgrades still take effect.
+                take_over_daemon(pid_path)
+                log("replaced outdated remote daemon before cleanup")
             rstate = load_remote_state()
             for name in list(rstate.get("remotes", {})):
                 retire_remote(cfg, rstate, name, {}, {})
