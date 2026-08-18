@@ -50,6 +50,8 @@ cmux_title = "maguro:hd:tom"           # title of the cmux workspace to update
 # name = "maguro-tom"                  # optional; defaults to "<ssh_target>:<session>"
                                        # (hashed "remote-<digest>" for IPv6/URI targets)
 # poll_seconds = 2                     # optional
+# herdr_bin = "/home/tom/.local/bin/herdr"  # optional; set an absolute path when
+                                       # herdr is not on the remote's non-interactive PATH
 ```
 
 The plugin's startup hook spawns a local daemon (`cmux_herdr.py remote`, logs to `$HERDR_PLUGIN_STATE_DIR/remote.log`) that for each `[[remotes]]` entry:

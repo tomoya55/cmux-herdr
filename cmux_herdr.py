@@ -844,7 +844,12 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     return changed
 
 
-def resolve_remote_socket(ssh_target, session):
+def resolve_remote_socket(rcfg):
+    ssh_target = rcfg["ssh_target"]
+    session = rcfg["session"]
+    # Note: non-interactive ssh gets a minimal PATH on the remote, so
+    # herdr_bin may need to be an absolute path in the config.
+    herdr_bin = rcfg.get("herdr_bin") or "herdr"
     proc = run(
         [
             "ssh",
@@ -853,7 +858,7 @@ def resolve_remote_socket(ssh_target, session):
             "-o",
             "ConnectTimeout=10",
             ssh_target,
-            "herdr",
+            herdr_bin,
             "session",
             "list",
             "--json",
@@ -862,7 +867,7 @@ def resolve_remote_socket(ssh_target, session):
     )
     if proc.returncode != 0:
         raise SocketError(
-            f"ssh {ssh_target} herdr session list failed: {proc.stderr.strip()}"
+            f"ssh {ssh_target} {herdr_bin} session list failed: {proc.stderr.strip()}"
         )
     for s in json.loads(proc.stdout).get("sessions", []):
         if s.get("name") == session:
@@ -892,7 +897,7 @@ def ensure_forward(name, rcfg, entry, procs):
         drop_forward(name, entry, procs)
     remote_path = entry.get("socket_path")
     if not remote_path:
-        remote_path = resolve_remote_socket(rcfg["ssh_target"], rcfg["session"])
+        remote_path = resolve_remote_socket(rcfg)
         entry["socket_path"] = remote_path
     if DAEMON_SHUTDOWN.is_set():
         raise SocketError("daemon is shutting down")
@@ -995,6 +1000,9 @@ def remote_configs(cfg):
             return None
         if r.get("name") is not None and not isinstance(r["name"], str):
             log(f"remote {r!r}: name must be a string")
+            return None
+        if r.get("herdr_bin") is not None and not isinstance(r["herdr_bin"], str):
+            log(f"remote {r!r}: herdr_bin must be a string")
             return None
         if not isinstance(r.get("cmux_title"), str) or not r.get("cmux_title"):
             log(f"remote {remote_name(r)!r}: cmux_title is required")

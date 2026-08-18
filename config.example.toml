@@ -22,3 +22,5 @@ match_by_label = true
 # session = "tom"                   # remote herdr session name
 # cmux_title = "maguro:hd:tom"      # title of the cmux workspace to update
 # poll_seconds = 2                  # optional
+# herdr_bin = "/Users/tom/.local/bin/herdr"  # optional; absolute path needed when
+#                                   # herdr is not on the remote's non-interactive PATH
