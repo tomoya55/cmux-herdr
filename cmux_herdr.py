@@ -1325,7 +1325,15 @@ def remote_daemon(cfg):
             if finished is not None and not finished.is_alive():
                 for name, remaining in tombstone["done"].items():
                     if remaining is None or name in active:
-                        continue  # cleanup aborted or remote re-added
+                        # Cleanup was cancelled (or a clear-status was still
+                        # in flight) when the remote became active again; a
+                        # late clear may have removed the new pill, so force
+                        # a republish on the next poll.
+                        if name in active:
+                            entry = rstate["remotes"].get(name)
+                            if entry is not None:
+                                entry["pill_published"] = False
+                        continue
                     entry = rstate["remotes"].get(name)
                     if entry is None:
                         continue
@@ -1347,6 +1355,9 @@ def remote_daemon(cfg):
                     and time.time() >= tombstone_due.get(name, 0)
                 ]
                 if pending_names:
+                    # This generation must not inherit cancellations from
+                    # when these names were active in the past.
+                    tombstone["cancel"] -= set(pending_names)
                     tombstone["thread"] = threading.Thread(
                         target=tombstone_worker,
                         args=(
