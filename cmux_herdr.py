@@ -102,8 +102,22 @@ def save_remote_state(rstate):
     tmp.replace(remote_state_path())
 
 
+# cmux attributes CLI notifications to the caller's pane via these inherited
+# env vars, overriding --workspace targeting (hooks and the remote daemon
+# inherit them from wherever the herdr server was started). Scrub them from
+# child processes so explicit --workspace refs win.
+CMUX_CALLER_IDENTITY_VARS = (
+    "CMUX_PANEL_ID",
+    "CMUX_SURFACE_ID",
+    "CMUX_TAB_ID",
+    "CMUX_WORKSPACE_ID",
+    "CMUX_TERMINAL_LIFECYCLE_ID",
+)
+
+
 def run(cmd, timeout=10):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    env = {k: v for k, v in os.environ.items() if k not in CMUX_CALLER_IDENTITY_VARS}
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def herdr_cli(args):
@@ -140,9 +154,12 @@ def cmux_workspaces_by_title(cfg):
         return {}
     result = {}
     for line in proc.stdout.splitlines():
-        m = re.match(r"^\s*(workspace:\S+)\s+(.+?)\s*$", line)
+        # The selected workspace row is prefixed with "*" and suffixed with
+        # "[selected]"; it must still resolve by its bare title.
+        m = re.match(r"^[\s*]*(workspace:\S+)\s+(.+?)\s*$", line)
         if m:
-            result[m.group(2).strip().lower()] = m.group(1)
+            title = re.sub(r"\s*\[selected\]$", "", m.group(2))
+            result[title.strip().lower()] = m.group(1)
     return result
 
 

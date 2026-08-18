@@ -350,6 +350,48 @@ def test_cmux_workspaces_by_title_parsing(monkeypatch):
     }
 
 
+def test_cmux_workspaces_by_title_parses_selected_row(monkeypatch):
+    def fake_run(cmd, timeout=10):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "  workspace:2  hd:tom\n"
+                "* workspace:7  maguro:hd:gutenberg  [selected]\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(ch, "run", fake_run)
+    assert ch.cmux_workspaces_by_title({}) == {
+        "hd:tom": "workspace:2",
+        "maguro:hd:gutenberg": "workspace:7",
+    }
+
+
+def test_run_scrubs_cmux_caller_identity_env(monkeypatch):
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ch.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setenv("CMUX_PANEL_ID", "panel-uuid")
+    monkeypatch.setenv("CMUX_SURFACE_ID", "surface-uuid")
+    monkeypatch.setenv("CMUX_TAB_ID", "tab-uuid")
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws-uuid")
+    monkeypatch.setenv("CMUX_TERMINAL_LIFECYCLE_ID", "lc-uuid")
+    monkeypatch.setenv("CMUX_SOCKET_CAPABILITY", "cap-token")
+
+    ch.run(["cmux", "notify"])
+
+    env = captured["env"]
+    assert env is not None
+    for var in ch.CMUX_CALLER_IDENTITY_VARS:
+        assert var not in env
+    assert env["CMUX_SOCKET_CAPABILITY"] == "cap-token"
+
+
 def test_reconcile_rebuilds_state(monkeypatch, cfg, state, cmux_calls):
     state["workspaces"]["stale"] = {
         "label": "",
