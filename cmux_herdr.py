@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import hashlib
 import json
 import os
@@ -46,6 +47,20 @@ def load_config():
     except Exception as e:
         log(f"failed to parse {path}: {e}")
         return {}
+
+
+def load_config_strict():
+    """Like load_config, but None on parse errors so callers can keep the
+    last valid config instead of treating it as empty."""
+    path = config_dir / "config.toml"
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except Exception as e:
+        log(f"failed to parse {path}: {e}; keeping previous config")
+        return None
 
 
 def load_state():
@@ -666,6 +681,12 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     """
     entry = rstate["remotes"].setdefault(name, {"panes": {}})
     changed = False
+    identity = [rcfg["ssh_target"], rcfg["session"]]
+    if entry.get("identity") != identity:
+        # Retargeted: the cached socket path belongs to the previous target.
+        entry["identity"] = identity
+        entry.pop("socket_path", None)
+        changed = True
     cmux_title = rcfg.get("cmux_title") or ""
     if entry.get("cmux_title") != cmux_title:
         # Clear the pill and any unread notifications on the previous
@@ -876,20 +897,48 @@ def daemon_self_info():
     return {"pid": os.getpid(), "script": script, "mtime": mtime}
 
 
+def read_pidfile(pid_path):
+    try:
+        data = json.loads(pid_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, int):  # pre-JSON format
+        return {"pid": data}
+    return data if isinstance(data, dict) else {}
+
+
+def pid_is_remote_daemon(pid):
+    """Guard against signaling an unrelated process after PID reuse."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    parts = proc.stdout.strip().split()
+    return any(p.endswith("cmux_herdr.py") for p in parts) and "remote" in parts
+
+
 def take_over_daemon(pid_path):
     """Ensure this is the only (and latest-code) remote daemon running."""
     if not pid_path.exists():
         return
-    info = {}
-    old_pid = None
+    info = read_pidfile(pid_path)
     try:
-        info = json.loads(pid_path.read_text())
         old_pid = int(info.get("pid", 0))
+    except (TypeError, ValueError):
+        old_pid = 0
+    if not old_pid:
+        return
+    try:
         os.kill(old_pid, 0)
-        alive = True
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        alive = False
-    if not alive:
+    except OSError:
+        return
+    if not pid_is_remote_daemon(old_pid):
+        log(f"ignoring stale pidfile: pid {old_pid} is not a cmux-herdr daemon")
         return
     self = daemon_self_info()
     if info.get("script") == self["script"] and info.get("mtime") == self["mtime"]:
@@ -908,6 +957,12 @@ def take_over_daemon(pid_path):
 
 
 def remote_daemon(cfg):
+    # A malformed config must not look like "no remotes" (which triggers
+    # cleanup); keep the previous behavior of doing nothing instead.
+    strict = load_config_strict()
+    if strict is None:
+        return 1
+    cfg = strict
     remotes = remote_configs(cfg)
     if not remotes:
         # No remotes configured: retire anything a previous daemon left
@@ -922,26 +977,45 @@ def remote_daemon(cfg):
         return 0
     state_dir.mkdir(parents=True, exist_ok=True)
     pid_path = state_dir / "remote.pid"
-    take_over_daemon(pid_path)
-    pid_path.write_text(json.dumps(daemon_self_info()))
+    # Serialize concurrent startup/refresh invocations: only one daemon
+    # may take over and write the pidfile.
+    with open(state_dir / "remote.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        take_over_daemon(pid_path)
+        pid_path.write_text(json.dumps(daemon_self_info()))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     rstate = load_remote_state()
     procs = {}
     next_due = {}
     watched = {}
-    active_names = {remote_name(r) for r in remotes}
+    configured = {remote_name(r): r for r in remotes}
     for name in list(rstate["remotes"]):
-        if name not in active_names:
-            # Persisted while a previous daemon was running; never retired.
+        entry = rstate["remotes"][name]
+        rcfg = configured.get(name)
+        identity = entry.get("identity")
+        if rcfg is None or (
+            identity is not None and identity != [rcfg["ssh_target"], rcfg["session"]]
+        ):
+            # Persisted while a previous daemon was running, or the entry
+            # was retargeted while no daemon was alive; never retired.
             retire_remote(cfg, rstate, name, procs, next_due)
     sweep_remote_orphan_pills(cfg, remotes)
     names = [remote_name(r) for r in remotes]
     log(f"remote daemon started (pid {os.getpid()}); watching: {', '.join(names)}")
     try:
         while True:
-            cfg = load_config()  # pick up config edits without a restart
+            new_cfg = load_config_strict()  # hot-reload, keep last valid
+            if new_cfg is not None:
+                cfg = new_cfg
             remotes = remote_configs(cfg)
-            active = {remote_name(r): (r["ssh_target"], r["session"]) for r in remotes}
+            active = {
+                remote_name(r): (
+                    r["ssh_target"],
+                    r["session"],
+                    r.get("cmux_title") or "",
+                )
+                for r in remotes
+            }
             for name, identity in list(watched.items()):
                 if active.get(name) != identity:
                     log(f"remote {name}: removed or retargeted; tearing down")
@@ -973,9 +1047,9 @@ def remote_daemon(cfg):
         # Only unlink our own pidfile; a replacement daemon may have
         # already written its own.
         try:
-            if json.loads(pid_path.read_text()).get("pid") == os.getpid():
+            if read_pidfile(pid_path).get("pid") == os.getpid():
                 pid_path.unlink(missing_ok=True)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except OSError:
             pass
     return 0
 

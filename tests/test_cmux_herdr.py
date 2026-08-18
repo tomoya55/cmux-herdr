@@ -731,6 +731,7 @@ def test_remote_title_change_publishes_to_new_workspace(monkeypatch, cmux_calls)
 
 def test_remote_daemon_without_remotes_cleans_up(monkeypatch, cmux_calls, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "config_dir", tmp_path)
     ch.save_remote_state(
         {
             "remotes": {
@@ -750,6 +751,48 @@ def test_remote_daemon_without_remotes_cleans_up(monkeypatch, cmux_calls, tmp_pa
     assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
     saved = json.loads((tmp_path / "remote-state.json").read_text())
     assert saved["remotes"] == {}
+
+
+def test_remote_daemon_malformed_config_does_not_clean_up(
+    monkeypatch, cmux_calls, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "config_dir", tmp_path)
+    (tmp_path / "config.toml").write_text("not = [valid")
+    ch.save_remote_state(
+        {"remotes": {"tom": {"panes": {"w1:p1": {"status": "blocked"}}}}}
+    )
+
+    assert ch.remote_daemon({}) == 1
+    assert cmux_calls == []
+    saved = json.loads((tmp_path / "remote-state.json").read_text())
+    assert "tom" in saved["remotes"]
+
+
+def test_read_pidfile_formats(tmp_path):
+    p = tmp_path / "remote.pid"
+    p.write_text("1234")  # pre-JSON format
+    assert ch.read_pidfile(p) == {"pid": 1234}
+    p.write_text('{"pid": 5, "script": "x", "mtime": 1}')
+    assert ch.read_pidfile(p)["script"] == "x"
+    p.write_text("garbage")
+    assert ch.read_pidfile(p) == {}
+
+
+def test_remote_identity_change_drops_socket_path(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    agents = [remote_agent("w1:p1", "working")]
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    rstate["remotes"]["tom"]["socket_path"] = "/old/path.sock"
+    cmux_calls.clear()
+
+    rcfg = dict(REMOTE_CFG, ssh_target="other-host")
+    changed = ch.apply_remote_snapshot({}, rstate, "tom", rcfg, agents, {})
+
+    assert changed is True
+    entry = rstate["remotes"]["tom"]
+    assert "socket_path" not in entry
+    assert entry["identity"] == ["other-host", "tom"]
 
 
 def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls):
