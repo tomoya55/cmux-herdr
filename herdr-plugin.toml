@@ -1,12 +1,12 @@
 id = "cmux-herdr"
 name = "cmux-herdr"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
 description = "Propagate herdr agent status to the cmux sidebar"
 platforms = ["macos"]
 
 [[startup]]
-command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile"]
+command = ["/bin/zsh", "-c", "python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile; nohup python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" remote >>\"$HERDR_PLUGIN_STATE_DIR/remote.log\" 2>&1 &"]
 
 [[actions]]
 id = "refresh"

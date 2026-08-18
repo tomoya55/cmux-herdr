@@ -4,3 +4,20 @@ match_by_label = true
 [workspaces]
 
 [labels]
+
+# Remote herdr sessions to watch over SSH. The plugin spawns a local daemon
+# (from its startup hook) that forwards each remote session's herdr API
+# socket and polls agent status, so remote agents get the same sidebar
+# notifications and status pill as local ones.
+#
+# Requirements per remote:
+# - non-interactive SSH auth (a key accepted by the remote host; the daemon
+#   runs ssh with BatchMode=yes and cannot answer prompts)
+# - herdr installed on the remote host
+#
+# [[remotes]]
+# name = "maguro-tom"               # optional; defaults to the session name
+# ssh_target = "maguro.example.ts.net"
+# session = "tom"                   # remote herdr session name
+# cmux_title = "maguro:hd:tom"      # title of the cmux workspace to update
+# poll_seconds = 2                  # optional

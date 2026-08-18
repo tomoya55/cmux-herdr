@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -17,6 +18,11 @@ STATUS_COLOR_WORKING = "#0a84ff"
 DETECT_TTL_SECONDS = 300
 NOTIFICATION_SUBTITLE = "herdr"
 NOTIFICATION_TITLE_RE = re.compile(r": (waiting for input|finished)$")
+
+REMOTE_KEY_PREFIX = "herdr.remote."
+REMOTE_REF_TTL_SECONDS = 60
+REMOTE_DEFAULT_POLL_SECONDS = 2.0
+REMOTE_ERROR_BACKOFF_SECONDS = 10.0
 
 state_dir = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", "."))
 config_dir = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "."))
@@ -51,6 +57,24 @@ def save_state(state):
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_PATH)
+
+
+def remote_state_path():
+    return state_dir / "remote-state.json"
+
+
+def load_remote_state():
+    try:
+        return json.loads(remote_state_path().read_text())
+    except Exception:
+        return {"remotes": {}}
+
+
+def save_remote_state(rstate):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    tmp = remote_state_path().with_suffix(".tmp")
+    tmp.write_text(json.dumps(rstate))
+    tmp.replace(remote_state_path())
 
 
 def run(cmd, timeout=10):
@@ -254,14 +278,9 @@ def status_key(ws_id):
     return f"herdr.{ws_id}"
 
 
-def update_pill(cfg, state, ws_id):
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
-    if not ref:
-        return
-    panes = state["workspaces"].get(ws_id, {}).get("panes", {})
+def push_pill(cfg, ref, key, panes):
     waiting = sum(1 for p in panes.values() if p["status"] in ATTENTION_STATUSES)
     working = sum(1 for p in panes.values() if p["status"] == "working")
-    key = status_key(ws_id)
     if waiting:
         parts = [f"{waiting} waiting"]
         if working:
@@ -297,6 +316,14 @@ def update_pill(cfg, state, ws_id):
         )
     else:
         cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
+
+
+def update_pill(cfg, state, ws_id):
+    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+    if not ref:
+        return
+    panes = state["workspaces"].get(ws_id, {}).get("panes", {})
+    push_pill(cfg, ref, status_key(ws_id), panes)
 
 
 def notify(cfg, state, ws_id, title, body):
@@ -343,6 +370,8 @@ def sweep_orphan_pills(cfg, state):
     }
     for ref in cmux_workspaces_by_title(cfg).values():
         for key in cmux_herdr_status_keys(cfg, ref):
+            if key.startswith(REMOTE_KEY_PREFIX):
+                continue  # owned by the remote daemon
             if key not in active_keys:
                 log(f"clearing orphaned status {key} on {ref}")
                 cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
@@ -365,6 +394,12 @@ def sweep_notifications(cfg, state):
     """
     if any(
         has_attention_panes(ws.get("panes", {})) for ws in state["workspaces"].values()
+    ):
+        return
+    remote = load_remote_state()
+    if any(
+        has_attention_panes(r.get("panes", {}))
+        for r in remote.get("remotes", {}).values()
     ):
         return
     for item in cmux_notifications(cfg):
@@ -518,14 +553,332 @@ def reconcile(cfg, state):
     sweep_notifications(cfg, state)
 
 
+# --- Remote session support (SSH-polled daemon) -----------------------------
+
+
+class SocketError(Exception):
+    pass
+
+
+def socket_rpc(sock_path, method, params, timeout=10):
+    """Single NDJSON request/response against a herdr API socket."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(str(sock_path))
+        s.sendall(
+            json.dumps({"id": "1", "method": method, "params": params}).encode() + b"\n"
+        )
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(1 << 16)
+            if not chunk:
+                raise SocketError(f"{method}: connection closed")
+            buf += chunk
+        msg = json.loads(buf.split(b"\n", 1)[0])
+    finally:
+        s.close()
+    if "error" in msg:
+        raise SocketError(f"{method}: {msg['error'].get('message')}")
+    return msg.get("result") or {}
+
+
+def remote_name(rcfg):
+    return rcfg.get("name") or rcfg["session"]
+
+
+def remote_key(name):
+    return f"{REMOTE_KEY_PREFIX}{name}"
+
+
+def remote_ref(cfg, name, entry):
+    """Resolve the cmux workspace ref for a remote via its configured title."""
+    title = entry.get("cmux_title") or ""
+    cached = entry.get("ref")
+    if cached and time.time() - entry.get("ref_at", 0) < REMOTE_REF_TTL_SECONDS:
+        return cached
+    ref = None
+    if title:
+        ref = cmux_workspaces_by_title(cfg).get(title.strip().lower())
+    if ref:
+        entry["ref"] = ref
+        entry["ref_at"] = time.time()
+        return ref
+    if cached:
+        return cached  # stale fallback while cmux is unreachable
+    log(f"no cmux workspace titled {title!r} for remote {name}; skipping")
+    return None
+
+
+def remote_notify(cfg, name, entry, title, body):
+    ref = remote_ref(cfg, name, entry)
+    if not ref:
+        return
+    cmux_cli(
+        cfg,
+        [
+            "notify",
+            "--title",
+            title,
+            "--subtitle",
+            NOTIFICATION_SUBTITLE,
+            "--body",
+            body,
+            "--workspace",
+            ref,
+        ],
+    )
+
+
+def remote_mark_read(cfg, name, entry):
+    ref = remote_ref(cfg, name, entry)
+    if ref:
+        cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
+
+
+def update_remote_pill(cfg, name, entry):
+    ref = remote_ref(cfg, name, entry)
+    if not ref:
+        return
+    push_pill(cfg, ref, remote_key(name), entry.get("panes", {}))
+
+
+def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
+    """Diff one remote agent.list snapshot against state and drive cmux.
+
+    Returns True when the tracked pane set changed.
+    """
+    entry = rstate["remotes"].setdefault(name, {"panes": {}})
+    changed = False
+    cmux_title = rcfg.get("cmux_title") or ""
+    if entry.get("cmux_title") != cmux_title:
+        entry["cmux_title"] = cmux_title
+        entry.pop("ref", None)
+        changed = True
+
+    old = entry["panes"]
+    old_statuses = {pid: p["status"] for pid, p in old.items()}
+    new = {}
+    for a in agents:
+        status = a.get("agent_status")
+        if status not in TRACKED_STATUSES:
+            continue
+        new[a["pane_id"]] = {
+            "status": status,
+            "agent": a.get("display_agent") or a.get("agent") or "agent",
+            "title": a.get("terminal_title_stripped") or a.get("terminal_title") or "",
+            "workspace_id": a.get("workspace_id") or "",
+        }
+    if new == old:
+        return changed
+
+    label = cmux_title or name
+    for pid, p in new.items():
+        if p["status"] in ATTENTION_STATUSES and old_statuses.get(pid) != p["status"]:
+            what = p["title"] or labels.get(p["workspace_id"]) or pid
+            body = f"{label} · {what}"
+            if p["status"] == "blocked":
+                remote_notify(
+                    cfg, name, entry, f"{p['agent']}: waiting for input", body
+                )
+            else:
+                remote_notify(cfg, name, entry, f"{p['agent']}: finished", body)
+
+    was_attention = has_attention_panes(old)
+    entry["panes"] = new
+    changed = True
+    if was_attention and not has_attention_panes(new):
+        # The prompt was answered or dismissed on the remote side.
+        remote_mark_read(cfg, name, entry)
+    update_remote_pill(cfg, name, entry)
+    return changed
+
+
+def resolve_remote_socket(ssh_target, session):
+    proc = run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            ssh_target,
+            "herdr",
+            "session",
+            "list",
+            "--json",
+        ],
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        raise SocketError(
+            f"ssh {ssh_target} herdr session list failed: {proc.stderr.strip()}"
+        )
+    for s in json.loads(proc.stdout).get("sessions", []):
+        if s.get("name") == session:
+            path = s.get("socket_path")
+            if path:
+                return path
+    raise SocketError(f"session {session!r} not found on {ssh_target}")
+
+
+def drop_forward(name, entry, procs):
+    proc = procs.pop(name, None)
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    entry.pop("socket_path", None)
+    (state_dir / f"remote-{name}.sock").unlink(missing_ok=True)
+
+
+def ensure_forward(name, rcfg, entry, procs):
+    """Return the local end of an ssh unix-socket forward, (re)spawning it."""
+    local_sock = state_dir / f"remote-{name}.sock"
+    proc = procs.get(name)
+    if proc is not None and proc.poll() is None and local_sock.exists():
+        return local_sock
+    if proc is not None:
+        drop_forward(name, entry, procs)
+    remote_path = entry.get("socket_path")
+    if not remote_path:
+        remote_path = resolve_remote_socket(rcfg["ssh_target"], rcfg["session"])
+        entry["socket_path"] = remote_path
+    local_sock.unlink(missing_ok=True)
+    procs[name] = subprocess.Popen(
+        [
+            "ssh",
+            "-N",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-L",
+            f"{local_sock}:{remote_path}",
+            rcfg["ssh_target"],
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if procs[name].poll() is not None:
+            drop_forward(name, entry, procs)
+            raise SocketError(
+                f"ssh forward to {rcfg['ssh_target']} failed to establish; "
+                "non-interactive (key-based) SSH auth is required"
+            )
+        if local_sock.exists():
+            return local_sock
+        time.sleep(0.2)
+    drop_forward(name, entry, procs)
+    raise SocketError(f"timed out waiting for ssh forward to {rcfg['ssh_target']}")
+
+
+def poll_remote(cfg, rstate, name, rcfg, procs):
+    entry = rstate["remotes"].setdefault(name, {"panes": {}})
+    sock = ensure_forward(name, rcfg, entry, procs)
+    try:
+        agents = socket_rpc(sock, "agent.list", {}).get("agents", [])
+        workspaces = socket_rpc(sock, "workspace.list", {}).get("workspaces", [])
+    except (SocketError, OSError, json.JSONDecodeError):
+        # Remote server restarted or tunnel went stale; rebuild it next time.
+        drop_forward(name, entry, procs)
+        raise
+    labels = {}
+    for w in workspaces:
+        ws_id = w.get("workspace_id") or w.get("id")
+        if ws_id:
+            labels[ws_id] = w.get("label") or ""
+    return apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels)
+
+
+def sweep_remote_orphan_pills(cfg, remotes):
+    """Clear herdr.remote.* pills for remotes no longer in the config."""
+    active = {remote_key(remote_name(r)) for r in remotes}
+    for ref in cmux_workspaces_by_title(cfg).values():
+        for key in cmux_herdr_status_keys(cfg, ref):
+            if key.startswith(REMOTE_KEY_PREFIX) and key not in active:
+                log(f"clearing orphaned remote status {key} on {ref}")
+                cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
+
+
+def remote_configs(cfg):
+    return [
+        r for r in cfg.get("remotes", []) if r.get("ssh_target") and r.get("session")
+    ]
+
+
+def remote_daemon(cfg):
+    remotes = remote_configs(cfg)
+    if not remotes:
+        log("no [[remotes]] configured; remote daemon exiting")
+        return 0
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_path = state_dir / "remote.pid"
+    if pid_path.exists():
+        try:
+            os.kill(int(pid_path.read_text().strip()), 0)
+            log(f"remote daemon already running (pid {pid_path.read_text().strip()})")
+            return 0
+        except (OSError, ValueError):
+            pass
+    pid_path.write_text(str(os.getpid()))
+    rstate = load_remote_state()
+    procs = {}
+    next_due = {}
+    sweep_remote_orphan_pills(cfg, remotes)
+    names = [remote_name(r) for r in remotes]
+    log(f"remote daemon started (pid {os.getpid()}); watching: {', '.join(names)}")
+    try:
+        while True:
+            cfg = load_config()  # pick up config edits without a restart
+            remotes = remote_configs(cfg)
+            now = time.time()
+            for rcfg in remotes:
+                name = remote_name(rcfg)
+                if now < next_due.get(name, 0):
+                    continue
+                try:
+                    changed = poll_remote(cfg, rstate, name, rcfg, procs)
+                except Exception as e:
+                    log(f"remote {name}: {e}")
+                    next_due[name] = now + REMOTE_ERROR_BACKOFF_SECONDS
+                    continue
+                if changed:
+                    save_remote_state(rstate)
+                next_due[name] = now + float(
+                    rcfg.get("poll_seconds") or REMOTE_DEFAULT_POLL_SECONDS
+                )
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for name in list(procs):
+            drop_forward(name, rstate["remotes"].get(name, {}), procs)
+        pid_path.unlink(missing_ok=True)
+    return 0
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in {"event", "reconcile", "detect"}:
-        print("usage: cmux_herdr.py <event|reconcile|detect>", file=sys.stderr)
+    if len(sys.argv) < 2 or sys.argv[1] not in {
+        "event",
+        "reconcile",
+        "detect",
+        "remote",
+    }:
+        print("usage: cmux_herdr.py <event|reconcile|detect|remote>", file=sys.stderr)
         return 2
     mode = sys.argv[1]
     cfg = load_config()
     state = load_state()
     try:
+        if mode == "remote":
+            return remote_daemon(cfg)
         if mode == "event":
             raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
             if not raw:

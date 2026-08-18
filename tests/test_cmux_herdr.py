@@ -1,6 +1,10 @@
 import json
+import os
+import socket
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -553,3 +557,245 @@ def test_cmux_cli_tolerates_timeout(monkeypatch):
 
     monkeypatch.setattr(ch, "run", slow)
     assert ch.cmux_cli({}, ["ping"]) is False
+
+
+# --- Remote daemon -----------------------------------------------------------
+
+
+REMOTE_CFG = {"ssh_target": "maguro", "session": "tom", "cmux_title": "maguro:hd:tom"}
+
+
+@pytest.fixture
+def remote_title_map(monkeypatch):
+    monkeypatch.setattr(
+        ch, "cmux_workspaces_by_title", lambda cfg: {"maguro:hd:tom": "workspace:9"}
+    )
+
+
+def remote_agent(pane_id, status, agent="claude", title="task", ws_id="w1"):
+    return {
+        "pane_id": pane_id,
+        "workspace_id": ws_id,
+        "agent": agent,
+        "agent_status": status,
+        "terminal_title_stripped": title,
+    }
+
+
+def test_remote_blocked_notifies_and_sets_pill(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    changed = ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
+    )
+
+    assert changed is True
+    notify = [c for c in cmux_calls if c[0] == "notify"]
+    assert len(notify) == 1
+    assert "claude: waiting for input" in notify[0]
+    assert "workspace:9" in notify[0]
+    assert "maguro:hd:tom · task" in notify[0]
+
+    pill = [c for c in cmux_calls if c[0] == "set-status"]
+    assert len(pill) == 1
+    assert pill[0][1] == "herdr.remote.tom"
+    assert pill[0][2] == "1 waiting"
+    assert "#ff9500" in pill[0]
+
+
+def test_remote_done_notifies_finished(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "done")], {}
+    )
+    notify = [c for c in cmux_calls if c[0] == "notify"]
+    assert len(notify) == 1
+    assert "claude: finished" in notify[0]
+
+
+def test_remote_working_pill_without_notification(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "working")], {}
+    )
+    assert [c for c in cmux_calls if c[0] == "notify"] == []
+    pill = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pill[0][2] == "1 working"
+    assert "#0a84ff" in pill[0]
+
+
+def test_remote_unchanged_snapshot_is_noop(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    agents = [remote_agent("w1:p1", "blocked")]
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    cmux_calls.clear()
+
+    changed = ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    assert changed is False
+    assert cmux_calls == []
+
+
+def test_remote_leaving_attention_marks_read(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
+    )
+    cmux_calls.clear()
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "working")], {}
+    )
+
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
+    pill = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pill[0][2] == "1 working"
+
+
+def test_remote_all_idle_clears_pill(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "working")], {}
+    )
+    cmux_calls.clear()
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "idle")], {}
+    )
+
+    clear = [c for c in cmux_calls if c[0] == "clear-status"]
+    assert clear == [["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"]]
+
+
+def test_remote_aggregates_across_workspaces(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    agents = [
+        remote_agent("w1:p1", "blocked", ws_id="w1"),
+        remote_agent("w2:p1", "working", agent="codex", ws_id="w2"),
+    ]
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+
+    pill = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pill[0][2] == "1 waiting · 1 working"
+
+
+def test_remote_without_title_skips_cmux(cmux_calls):
+    rstate = {"remotes": {}}
+    rcfg = {"ssh_target": "maguro", "session": "tom"}
+    changed = ch.apply_remote_snapshot(
+        {}, rstate, "tom", rcfg, [remote_agent("w1:p1", "blocked")], {}
+    )
+    assert changed is True
+    assert cmux_calls == []
+    assert rstate["remotes"]["tom"]["panes"]["w1:p1"]["status"] == "blocked"
+
+
+def test_remote_title_change_reroutes_pill(cmux_calls, remote_title_map):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "working")], {}
+    )
+    cmux_calls.clear()
+    rcfg = dict(REMOTE_CFG, cmux_title="maguro:hd:other")
+    changed = ch.apply_remote_snapshot(
+        {}, rstate, "tom", rcfg, [remote_agent("w1:p1", "working")], {}
+    )
+    assert changed is True
+    # title no longer resolvable -> no stale ref reuse after title change
+    assert cmux_calls == []
+
+
+def test_sweep_orphan_pills_keeps_remote_keys(monkeypatch, cfg, state):
+    calls = reconcile_run(
+        monkeypatch,
+        {
+            "list-workspaces": "workspace:1  hd:tom\n",
+            ("list-status", "workspace:1"): (
+                "herdr.remote.tom=1 waiting color=#ff9500 priority=20\n"
+                "herdr.w9=1 waiting color=#ff9500 priority=20\n"
+            ),
+        },
+        agents=[],
+    )
+
+    ch.reconcile(cfg, state)
+
+    clears = [c for c in calls if c[0] == "clear-status"]
+    assert clears == [["clear-status", "herdr.w9", "--workspace", "workspace:1"]]
+
+
+def test_sweep_notifications_skips_with_remote_attention(
+    monkeypatch, cfg, state, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    ch.save_remote_state(
+        {"remotes": {"tom": {"panes": {"w1:p1": {"status": "blocked"}}}}}
+    )
+    notifications = json.dumps(
+        [{"id": "n1", "is_read": False, "title": "claude: waiting for input"}]
+    )
+    calls = reconcile_run(monkeypatch, {"list-notifications": notifications}, agents=[])
+
+    ch.reconcile(cfg, state)
+
+    assert [c for c in calls if c[0] == "mark-notification-read"] == []
+
+
+def short_sock_path(name):
+    # AF_UNIX paths are limited to ~104 chars on macOS; tmp_path is too long.
+    path = Path(tempfile.gettempdir()) / f"ch-{os.getpid()}-{name}.sock"
+    path.unlink(missing_ok=True)
+    return path
+
+
+def test_socket_rpc_roundtrip():
+    import threading
+
+    sock_path = short_sock_path("rpc")
+    received = []
+    ready = threading.Event()
+
+    def serve():
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        srv.listen(1)
+        ready.set()
+        conn, _ = srv.accept()
+        data = b""
+        while b"\n" not in data:
+            data += conn.recv(1 << 16)
+        received.append(json.loads(data.strip()))
+        conn.sendall(b'{"id":"1","result":{"type":"pong"}}\n')
+        conn.close()
+        srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    ready.wait(5)
+    result = ch.socket_rpc(sock_path, "ping", {})
+    t.join(5)
+
+    assert result == {"type": "pong"}
+    assert received == [{"id": "1", "method": "ping", "params": {}}]
+
+
+def test_socket_rpc_error_raises():
+    import threading
+
+    sock_path = short_sock_path("err")
+    ready = threading.Event()
+
+    def serve():
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        srv.listen(1)
+        ready.set()
+        conn, _ = srv.accept()
+        conn.recv(1 << 16)
+        conn.sendall(b'{"id":"1","error":{"code":"bad","message":"nope"}}\n')
+        conn.close()
+        srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    ready.wait(5)
+    with pytest.raises(ch.SocketError, match="nope"):
+        ch.socket_rpc(sock_path, "ping", {})
+    t.join(5)
