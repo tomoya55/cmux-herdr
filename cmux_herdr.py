@@ -83,9 +83,19 @@ def load_config_strict():
 
 def load_state():
     try:
-        return json.loads(STATE_PATH.read_text())
+        state = json.loads(STATE_PATH.read_text())
     except Exception:
-        return {"workspaces": {}}
+        return {"sessions": {}}
+    if "workspaces" in state or "session_ref" in state:
+        # Pre-multi-session format: entries cannot be attributed to the
+        # session that owned them, so drop them. Each session rebuilds its
+        # own bucket from events/reconcile and the orphan sweep clears any
+        # pills the dropped entries leave behind.
+        state.pop("workspaces", None)
+        state.pop("session_ref", None)
+        log("dropped pre-multi-session state; pills will be rebuilt")
+    state.setdefault("sessions", {})
+    return state
 
 
 def save_state(state):
@@ -93,6 +103,31 @@ def save_state(state):
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_PATH)
+
+
+def current_session():
+    # herdr injects HERDR_SESSION into every hook; "" when run outside one.
+    return os.environ.get("HERDR_SESSION", "")
+
+
+def session_bucket(state):
+    """This session's slice of the shared plugin state.
+
+    One plugin state directory is shared by every herdr session on the
+    machine, and workspace ids (w1, w2, ...) are only unique within a
+    session, so all per-session data must live under the session's own
+    bucket to keep sessions from clobbering each other.
+    """
+    return state.setdefault("sessions", {}).setdefault(
+        current_session(), {"workspaces": {}}
+    )
+
+
+def all_workspaces(state):
+    """Iterate (bucket, ws_id, ws) across every session bucket."""
+    for bucket in state.get("sessions", {}).values():
+        for ws_id, ws in bucket.get("workspaces", {}).items():
+            yield bucket, ws_id, ws
 
 
 def remote_state_path():
@@ -266,12 +301,12 @@ def find_pid_workspace(node, pids, workspace_ref=None):
     return None
 
 
-def detect_session_workspace(cfg, state):
+def detect_session_workspace(cfg, bucket):
     env_ref = os.environ.get("CMUX_WORKSPACE_ID")
     if env_ref:
         return env_ref
 
-    cached = state.get("session_ref") or {}
+    cached = bucket.get("session_ref") or {}
     if cached.get("ref") and time.time() - cached.get("at", 0) < DETECT_TTL_SECONDS:
         return cached["ref"]
 
@@ -290,7 +325,7 @@ def detect_session_workspace(cfg, state):
         ) as e:
             log(f"session workspace detection failed: {e}")
     if ref:
-        state["session_ref"] = {"ref": ref, "at": time.time()}
+        bucket["session_ref"] = {"ref": ref, "at": time.time()}
         log(f"detected cmux workspace {ref} for this herdr session")
     elif cached.get("ref"):
         return cached["ref"]
@@ -307,16 +342,16 @@ def workspace_label(ws_id):
     return ""
 
 
-def resolve_cmux_workspace(cfg, state, ws_id):
-    entry = state["workspaces"].get(ws_id, {})
+def resolve_cmux_workspace(cfg, bucket, ws_id):
+    entry = bucket["workspaces"].get(ws_id, {})
     label = entry.get("label") or workspace_label(ws_id)
     if label and not entry.get("label"):
         entry["label"] = label
-        state["workspaces"][ws_id] = entry
+        bucket["workspaces"][ws_id] = entry
 
     ref = cfg.get("workspaces", {}).get(ws_id) or cfg.get("labels", {}).get(label)
     if not ref:
-        ref = detect_session_workspace(cfg, state)
+        ref = detect_session_workspace(cfg, bucket)
     if not ref and cfg.get("match_by_label", True) and label:
         ref = cmux_workspaces_by_title(cfg).get(label.strip().lower())
     if not ref:
@@ -408,8 +443,8 @@ def push_pill(cfg, ref, key, panes, per_pane=False):
         )
 
 
-def clear_pane_pill(cfg, state, ws_id, pane_id):
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+def clear_pane_pill(cfg, bucket, ws_id, pane_id):
+    ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
     if ref:
         cmux_cli(
             cfg,
@@ -438,17 +473,17 @@ def log_transition(cfg, ref, status, agent, what):
     )
 
 
-def log_agent_status(cfg, state, ws_id, status, agent, what):
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+def log_agent_status(cfg, bucket, ws_id, status, agent, what):
+    ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
     if ref:
         log_transition(cfg, ref, status, agent, what)
 
 
-def update_pill(cfg, state, ws_id):
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+def update_pill(cfg, bucket, ws_id):
+    ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
     if not ref:
         return
-    panes = state["workspaces"].get(ws_id, {}).get("panes", {})
+    panes = bucket["workspaces"].get(ws_id, {}).get("panes", {})
     push_pill(cfg, ref, status_key(ws_id), panes, per_pane=per_pane_enabled(cfg))
 
 
@@ -462,8 +497,8 @@ def sidebar_log_enabled(cfg, status):
     return status in ATTENTION_STATUSES or bool(cfg.get("sidebar_log_working"))
 
 
-def notify(cfg, state, ws_id, title, body):
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+def notify(cfg, bucket, ws_id, title, body):
+    ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
     if not ref:
         return
     cmux_cli(
@@ -482,8 +517,8 @@ def notify(cfg, state, ws_id, title, body):
     )
 
 
-def mark_read(cfg, state, ws_id):
-    ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+def mark_read(cfg, bucket, ws_id):
+    ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
     if not ref:
         return
     # mark-notification-read is workspace-wide; do not hide notifications
@@ -502,16 +537,17 @@ def sweep_orphan_pills(cfg, state):
     """Clear herdr.* status pills that no active herdr workspace owns.
 
     Orphans appear when the plugin state was lost (e.g. the herdr server was
-    reinstalled) while cmux kept the sidebar entries.
+    reinstalled) while cmux kept the sidebar entries. Active keys are the
+    union over all session buckets, so one session's reconcile never sweeps
+    another session's pills.
     """
-    active_keys = {
-        status_key(ws_id)
-        for ws_id, ws in state["workspaces"].items()
-        if ws.get("panes")
-    }
-    if per_pane_enabled(cfg):
-        for ws_id, ws in state["workspaces"].items():
-            for pane_id in ws.get("panes", {}):
+    active_keys = set()
+    for _, ws_id, ws in all_workspaces(state):
+        if not ws.get("panes"):
+            continue
+        active_keys.add(status_key(ws_id))
+        if per_pane_enabled(cfg):
+            for pane_id in ws["panes"]:
                 active_keys.add(pane_key(status_key(ws_id), pane_id))
     for ref in cmux_workspaces_by_title(cfg).values():
         for key in cmux_herdr_status_keys(cfg, ref):
@@ -538,7 +574,7 @@ def sweep_notifications(cfg, state):
     notifications may still be legitimate then.
     """
     if any(
-        has_attention_panes(ws.get("panes", {})) for ws in state["workspaces"].values()
+        has_attention_panes(ws.get("panes", {})) for _, _, ws in all_workspaces(state)
     ):
         return
     remote = load_remote_state()
@@ -555,15 +591,15 @@ def sweep_notifications(cfg, state):
             cmux_cli(cfg, ["mark-notification-read", "--id", notif_id])
 
 
-def get_workspace(state, ws_id):
-    return state["workspaces"].setdefault(ws_id, {"label": "", "panes": {}})
+def get_workspace(bucket, ws_id):
+    return bucket["workspaces"].setdefault(ws_id, {"label": "", "panes": {}})
 
 
-def on_agent_status_changed(cfg, state, data):
+def on_agent_status_changed(cfg, bucket, data):
     ws_id = data["workspace_id"]
     pane_id = data["pane_id"]
     status = data["agent_status"]
-    ws = get_workspace(state, ws_id)
+    ws = get_workspace(bucket, ws_id)
     panes = ws["panes"]
     was_attention = panes.get(pane_id, {}).get("status") in ATTENTION_STATUSES
 
@@ -584,7 +620,7 @@ def on_agent_status_changed(cfg, state, data):
         if status == "blocked":
             notify(
                 cfg,
-                state,
+                bucket,
                 ws_id,
                 f"{agent}: waiting for input",
                 f"{label} · {pane['title'] or pane_id}",
@@ -592,7 +628,7 @@ def on_agent_status_changed(cfg, state, data):
         else:
             notify(
                 cfg,
-                state,
+                bucket,
                 ws_id,
                 f"{agent}: finished",
                 f"{label} · {pane['title'] or pane_id}",
@@ -600,44 +636,44 @@ def on_agent_status_changed(cfg, state, data):
     elif was_attention and not has_attention_panes(panes):
         # Leaving blocked/done means the prompt was answered or dismissed;
         # the notifications for this workspace have been actioned.
-        mark_read(cfg, state, ws_id)
+        mark_read(cfg, bucket, ws_id)
 
     if status in TRACKED_STATUSES and sidebar_log_enabled(cfg, status):
         pane = panes[pane_id]
         log_agent_status(
-            cfg, state, ws_id, status, pane["agent"], pane["title"] or pane_id
+            cfg, bucket, ws_id, status, pane["agent"], pane["title"] or pane_id
         )
 
     if removed is not None and per_pane_enabled(cfg):
-        clear_pane_pill(cfg, state, ws_id, pane_id)
-    update_pill(cfg, state, ws_id)
+        clear_pane_pill(cfg, bucket, ws_id, pane_id)
+    update_pill(cfg, bucket, ws_id)
 
 
-def on_pane_closed(cfg, state, data):
+def on_pane_closed(cfg, bucket, data):
     ws_id = data.get("workspace_id")
     pane_id = data.get("pane_id")
     if not ws_id or not pane_id:
         return
-    ws = state["workspaces"].get(ws_id)
+    ws = bucket["workspaces"].get(ws_id)
     if not ws:
         return
     pane = ws["panes"].pop(pane_id, None)
     if pane is None:
         return
     if per_pane_enabled(cfg):
-        clear_pane_pill(cfg, state, ws_id, pane_id)
+        clear_pane_pill(cfg, bucket, ws_id, pane_id)
     if pane["status"] in ATTENTION_STATUSES and not has_attention_panes(ws["panes"]):
-        mark_read(cfg, state, ws_id)
-    update_pill(cfg, state, ws_id)
+        mark_read(cfg, bucket, ws_id)
+    update_pill(cfg, bucket, ws_id)
 
 
-def on_workspace_closed(cfg, state, data):
+def on_workspace_closed(cfg, bucket, data):
     ws_id = data.get("workspace_id")
     if not ws_id:
         return
-    ws = state["workspaces"].pop(ws_id, None)
+    ws = bucket["workspaces"].pop(ws_id, None)
     if ws:
-        ref, _ = resolve_cmux_workspace(cfg, state, ws_id)
+        ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
         if ref:
             cmux_cli(cfg, ["clear-status", status_key(ws_id), "--workspace", ref])
             if per_pane_enabled(cfg):
@@ -653,37 +689,98 @@ def on_workspace_closed(cfg, state, data):
                     )
 
 
-def on_workspace_focused(cfg, state, data):
+def on_workspace_focused(cfg, bucket, data):
     ws_id = data.get("workspace_id")
     if not ws_id:
         return
-    mark_read(cfg, state, ws_id)
+    mark_read(cfg, bucket, ws_id)
 
 
-def on_workspace_renamed(cfg, state, data):
+def on_workspace_renamed(cfg, bucket, data):
     ws_id = data.get("workspace_id")
-    if ws_id and ws_id in state["workspaces"]:
-        state["workspaces"][ws_id]["label"] = data.get("label") or ""
+    if ws_id and ws_id in bucket["workspaces"]:
+        bucket["workspaces"][ws_id]["label"] = data.get("label") or ""
 
 
 def handle_event(cfg, state, event):
+    bucket = session_bucket(state)
     data = event.get("data", {})
     kind = data.get("type")
     if kind == "pane_agent_status_changed":
-        on_agent_status_changed(cfg, state, data)
+        on_agent_status_changed(cfg, bucket, data)
     elif kind == "pane_closed":
-        on_pane_closed(cfg, state, data)
+        on_pane_closed(cfg, bucket, data)
     elif kind == "workspace_closed":
-        on_workspace_closed(cfg, state, data)
+        on_workspace_closed(cfg, bucket, data)
     elif kind == "workspace_focused":
-        on_workspace_focused(cfg, state, data)
+        on_workspace_focused(cfg, bucket, data)
     elif kind == "workspace_renamed":
-        on_workspace_renamed(cfg, state, data)
+        on_workspace_renamed(cfg, bucket, data)
+
+
+def retire_workspace(cfg, bucket, ws_id, entry):
+    """Clear pills/notifications for a workspace leaving the tracked set."""
+    panes = entry.get("panes", {})
+    if not panes:
+        return
+    if per_pane_enabled(cfg):
+        for pane_id in panes:
+            clear_pane_pill(cfg, bucket, ws_id, pane_id)
+    bucket["workspaces"][ws_id] = {"label": entry.get("label", ""), "panes": {}}
+    update_pill(cfg, bucket, ws_id)
+    if has_attention_panes(panes):
+        mark_read(cfg, bucket, ws_id)
+    bucket["workspaces"].pop(ws_id, None)
+
+
+def running_sessions():
+    """Names of herdr sessions with a live server, or None when unknown."""
+    binary = os.environ.get("HERDR_BIN_PATH", "herdr")
+    try:
+        proc = run([binary, "session", "list", "--json"])
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return {
+            s["name"]
+            for s in json.loads(proc.stdout).get("sessions", [])
+            if s.get("running")
+        }
+    except (json.JSONDecodeError, AttributeError, TypeError, KeyError):
+        return None
+
+
+def prune_dead_sessions(cfg, state):
+    """Clear pills and state of herdr sessions that are gone for good.
+
+    Reconcile only sees the current session's agents, so without this a
+    session that ended and never restarted would keep its pills forever.
+    Live sessions' buckets are left untouched; their own hooks keep them
+    fresh.
+    """
+    sessions = state.get("sessions", {})
+    names = [n for n in sessions if n]
+    if not names:
+        return
+    running = running_sessions()
+    if running is None:
+        return
+    for name in names:
+        if name in running:
+            continue
+        bucket = sessions[name]
+        for ws_id, entry in list(bucket.get("workspaces", {}).items()):
+            retire_workspace(cfg, bucket, ws_id, entry)
+        del sessions[name]
+        log(f"cleared state of ended herdr session {name!r}")
 
 
 def reconcile(cfg, state):
-    previous = state["workspaces"]
-    state["workspaces"] = {}
+    bucket = session_bucket(state)
+    previous = dict(bucket["workspaces"])
+    bucket["workspaces"].clear()
     try:
         agents = herdr_cli(["agent", "list"]).get("agents", [])
     except Exception as e:
@@ -696,35 +793,30 @@ def reconcile(cfg, state):
             continue
         ws_id = a["workspace_id"]
         ws_ids.add(ws_id)
-        ws = get_workspace(state, ws_id)
+        ws = get_workspace(bucket, ws_id)
         ws["panes"][a["pane_id"]] = {
             "status": status,
             "agent": a.get("display_agent") or a.get("agent") or "agent",
             "title": a.get("terminal_title_stripped") or "",
         }
     for ws_id in ws_ids:
-        update_pill(cfg, state, ws_id)
+        update_pill(cfg, bucket, ws_id)
     # Clear pills/notifications left behind by workspaces that no longer have
-    # tracked agents (e.g. the session ended while the server was down).
+    # tracked agents (e.g. the session ended while the server was down). Only
+    # this session's bucket is rebuilt: agent list is session-scoped, so
+    # other sessions' workspaces must be left alone.
     for ws_id, entry in previous.items():
         panes = entry.get("panes", {})
-        if ws_id in state["workspaces"]:
+        if ws_id in bucket["workspaces"]:
             if per_pane_enabled(cfg):
                 # Panes that vanished since the last run lose their pills.
-                for pane_id in set(panes) - set(state["workspaces"][ws_id]["panes"]):
-                    clear_pane_pill(cfg, state, ws_id, pane_id)
+                for pane_id in set(panes) - set(bucket["workspaces"][ws_id]["panes"]):
+                    clear_pane_pill(cfg, bucket, ws_id, pane_id)
             continue
-        if not panes:
-            continue
-        state["workspaces"][ws_id] = {"label": entry.get("label", ""), "panes": {}}
-        if per_pane_enabled(cfg):
-            for pane_id in panes:
-                clear_pane_pill(cfg, state, ws_id, pane_id)
-        update_pill(cfg, state, ws_id)
-        if has_attention_panes(panes):
-            mark_read(cfg, state, ws_id)
-        state["workspaces"].pop(ws_id, None)
-    # Sweep cmux-side leftovers that the plugin state no longer knows about.
+        retire_workspace(cfg, bucket, ws_id, entry)
+    # Sweep sessions that ended without restarting, then cmux-side leftovers
+    # that the plugin state no longer knows about.
+    prune_dead_sessions(cfg, state)
     sweep_orphan_pills(cfg, state)
     sweep_notifications(cfg, state)
 
@@ -836,7 +928,7 @@ def local_attention_refs(cfg):
     refs = set()
     env_ref = os.environ.get("CMUX_WORKSPACE_ID")
     titles = None
-    for ws_id, ws in state.get("workspaces", {}).items():
+    for bucket, ws_id, ws in all_workspaces(state):
         if not has_attention_panes(ws.get("panes", {})):
             continue
         label = ws.get("label") or ""
@@ -844,7 +936,7 @@ def local_attention_refs(cfg):
         if not ref:
             ref = env_ref
         if not ref:
-            ref = (state.get("session_ref") or {}).get("ref")
+            ref = (bucket.get("session_ref") or {}).get("ref")
         if not ref and cfg.get("match_by_label", True) and label:
             if titles is None:
                 titles = cmux_workspaces_by_title(cfg)
@@ -1635,8 +1727,9 @@ def main():
         elif mode == "reconcile":
             reconcile(cfg, state)
         else:
-            state.pop("session_ref", None)
-            ref = detect_session_workspace(cfg, state)
+            bucket = session_bucket(state)
+            bucket.pop("session_ref", None)
+            ref = detect_session_workspace(cfg, bucket)
             print(
                 json.dumps(
                     {

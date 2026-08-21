@@ -165,6 +165,8 @@ Per-agent pills use status keys like `herdr.<workspace>.<pane>` (local) and `her
 
 `herdr-plugin.toml` declares event hooks for `pane.agent_status_changed`, `pane.closed`, `workspace.closed`, `workspace.focused`, and `workspace.renamed`, plus a `startup` hook and a `refresh` action (both run the reconcile path). herdr spawns `cmux_herdr.py` for each event, passing the payload in `HERDR_PLUGIN_EVENT_JSON`. The script keeps per-pane status in `$HERDR_PLUGIN_STATE_DIR/state.json`, aggregates it per herdr workspace, and drives the cmux CLI (`notify`, `set-status` / `clear-status`, `log`, `mark-notification-read`). All cmux failures are logged and tolerated, so a closed cmux app never breaks herdr.
 
+The state directory is shared by every herdr session on the machine, but workspace ids are only unique within a session, so `state.json` is namespaced per herdr session (`HERDR_SESSION`). Reconcile (startup/refresh) rebuilds only the invoking session's bucket — `herdr agent list` is session-scoped — and never touches other sessions' pills; the orphan sweep and notification sweep decide from the union of all sessions. Buckets of sessions that have ended without restarting are pruned (via `herdr session list`) so their pills do not linger.
+
 Remote sessions are handled separately by a long-lived `cmux_herdr.py remote` daemon (spawned by the startup hook, single instance guarded by a pidfile). It keeps its own `remote-state.json`, so it never races the event-hook writes to `state.json`, and its `herdr.remote.*` pills are excluded from the local orphan sweep.
 
 ## Development

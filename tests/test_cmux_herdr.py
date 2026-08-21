@@ -14,7 +14,25 @@ import cmux_herdr as ch
 
 @pytest.fixture
 def state():
-    return {"workspaces": {}}
+    return {"sessions": {}}
+
+
+@pytest.fixture
+def bucket(state):
+    return ch.session_bucket(state)
+
+
+@pytest.fixture
+def workspaces(bucket):
+    return bucket["workspaces"]
+
+
+@pytest.fixture(autouse=True)
+def no_session_env(monkeypatch):
+    # Tests must not inherit the session/workspace of a surrounding herdr or
+    # cmux pane; state is namespaced per herdr session.
+    monkeypatch.delenv("HERDR_SESSION", raising=False)
+    monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
 
 
 @pytest.fixture
@@ -96,12 +114,12 @@ def test_aggregates_across_panes(cfg, state, cmux_calls):
     assert pill[0][2] == "1 waiting · 1 working"
 
 
-def test_idle_removes_pane_and_clears_pill(cfg, state, cmux_calls):
+def test_idle_removes_pane_and_clears_pill(cfg, state, workspaces, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
     cmux_calls.clear()
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "idle"))
 
-    assert state["workspaces"]["w1"]["panes"] == {}
+    assert workspaces["w1"]["panes"] == {}
     assert [c for c in cmux_calls if c[0] == "notify"] == []
     clear = [c for c in cmux_calls if c[0] == "clear-status"]
     assert len(clear) == 1
@@ -182,7 +200,7 @@ def test_pane_closed_attention_marks_notifications_read(cfg, state, cmux_calls):
     assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
 
 
-def test_workspace_closed_clears_status(cfg, state, cmux_calls):
+def test_workspace_closed_clears_status(cfg, state, workspaces, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
     cmux_calls.clear()
     ch.handle_event(
@@ -198,7 +216,7 @@ def test_workspace_closed_clears_status(cfg, state, cmux_calls):
         },
     )
 
-    assert "w1" not in state["workspaces"]
+    assert "w1" not in workspaces
     clear = [c for c in cmux_calls if c[0] == "clear-status"]
     assert len(clear) == 1
 
@@ -327,9 +345,11 @@ def test_per_pane_pills_off_by_default(cfg, state, cmux_calls):
     assert [c[1] for c in pills] == ["herdr.w1"]
 
 
-def test_reconcile_clears_removed_pane_pills(monkeypatch, cfg, state, cmux_calls):
+def test_reconcile_clears_removed_pane_pills(
+    monkeypatch, cfg, state, workspaces, cmux_calls
+):
     cfg["per_pane_status"] = True
-    state["workspaces"]["w1"] = {
+    workspaces["w1"] = {
         "label": "",
         "panes": {
             "w1:p1": {"status": "blocked", "agent": "claude", "title": "fix"},
@@ -398,7 +418,7 @@ def test_workspace_focused_marks_notifications_read(cfg, state, cmux_calls):
     assert cmux_calls == [["mark-notification-read", "--workspace", "workspace:1"]]
 
 
-def test_workspace_renamed_updates_label(cfg, state, cmux_calls):
+def test_workspace_renamed_updates_label(cfg, state, workspaces, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
     ch.handle_event(
         cfg,
@@ -412,52 +432,54 @@ def test_workspace_renamed_updates_label(cfg, state, cmux_calls):
             },
         },
     )
-    assert state["workspaces"]["w1"]["label"] == "renamed"
+    assert workspaces["w1"]["label"] == "renamed"
 
 
-def test_unmapped_workspace_skips_cmux(state, cmux_calls):
+def test_unmapped_workspace_skips_cmux(state, workspaces, cmux_calls):
     ch.handle_event({}, state, status_event("w9:p1", "w9", "blocked"))
     assert cmux_calls == []
-    assert state["workspaces"]["w9"]["panes"]["w9:p1"]["status"] == "blocked"
+    assert workspaces["w9"]["panes"]["w9:p1"]["status"] == "blocked"
 
 
-def test_config_mapping_wins_over_env(monkeypatch, state, cmux_calls):
+def test_config_mapping_wins_over_env(monkeypatch, state, bucket, cmux_calls):
     monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:99")
     cfg = {"workspaces": {"w1": "workspace:1"}}
-    ref, _ = ch.resolve_cmux_workspace(cfg, state, "w1")
+    ref, _ = ch.resolve_cmux_workspace(cfg, bucket, "w1")
     assert ref == "workspace:1"
 
 
-def test_env_fallback(monkeypatch, state, cmux_calls):
+def test_env_fallback(monkeypatch, state, bucket, cmux_calls):
     monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace:99")
-    ref, _ = ch.resolve_cmux_workspace({}, state, "w1")
+    ref, _ = ch.resolve_cmux_workspace({}, bucket, "w1")
     assert ref == "workspace:99"
 
 
-def test_cached_session_ref_used_without_detection(monkeypatch, state, cmux_calls):
+def test_cached_session_ref_used_without_detection(
+    monkeypatch, state, bucket, cmux_calls
+):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
-    state["session_ref"] = {"ref": "workspace:7", "at": ch.time.time()}
+    bucket["session_ref"] = {"ref": "workspace:7", "at": ch.time.time()}
 
     def fail_ps(*args, **kwargs):
         raise AssertionError("ps should not run for a fresh cache")
 
     monkeypatch.setattr(ch.subprocess, "run", fail_ps)
-    ref, _ = ch.resolve_cmux_workspace({}, state, "w1")
+    ref, _ = ch.resolve_cmux_workspace({}, bucket, "w1")
     assert ref == "workspace:7"
 
 
-def test_label_match_fallback(monkeypatch, state, cmux_calls):
+def test_label_match_fallback(monkeypatch, state, bucket, cmux_calls):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     monkeypatch.setattr(ch, "herdr_session_pids", lambda: [])
     monkeypatch.setattr(ch, "workspace_label", lambda ws_id: "My Project")
     monkeypatch.setattr(
         ch, "cmux_workspaces_by_title", lambda cfg: {"my project": "workspace:5"}
     )
-    ref, label = ch.resolve_cmux_workspace({}, state, "w1")
+    ref, label = ch.resolve_cmux_workspace({}, bucket, "w1")
     assert (ref, label) == ("workspace:5", "My Project")
 
 
-def test_detect_via_cmux_top(monkeypatch, state):
+def test_detect_via_cmux_top(monkeypatch, state, bucket):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
     monkeypatch.setattr(ch, "herdr_session_pids", lambda: [123])
     top = {
@@ -478,16 +500,16 @@ def test_detect_via_cmux_top(monkeypatch, state):
         return SimpleNamespace(returncode=0, stdout=json.dumps(top), stderr="")
 
     monkeypatch.setattr(ch, "run", fake_run)
-    ref = ch.detect_session_workspace({}, state)
+    ref = ch.detect_session_workspace({}, bucket)
     assert ref == "workspace:3"
-    assert state["session_ref"]["ref"] == "workspace:3"
+    assert bucket["session_ref"]["ref"] == "workspace:3"
 
 
-def test_stale_cache_survives_failed_detection(monkeypatch, state):
+def test_stale_cache_survives_failed_detection(monkeypatch, state, bucket):
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
-    state["session_ref"] = {"ref": "workspace:7", "at": 0}
+    bucket["session_ref"] = {"ref": "workspace:7", "at": 0}
     monkeypatch.setattr(ch, "herdr_session_pids", lambda: [])
-    assert ch.detect_session_workspace({}, state) == "workspace:7"
+    assert ch.detect_session_workspace({}, bucket) == "workspace:7"
 
 
 def test_herdr_session_pids_filters(monkeypatch):
@@ -574,8 +596,8 @@ def test_run_scrubs_cmux_caller_identity_env(monkeypatch):
     assert env["CMUX_SOCKET_CAPABILITY"] == "cap-token"
 
 
-def test_reconcile_rebuilds_state(monkeypatch, cfg, state, cmux_calls):
-    state["workspaces"]["stale"] = {
+def test_reconcile_rebuilds_state(monkeypatch, cfg, state, workspaces, cmux_calls):
+    workspaces["stale"] = {
         "label": "",
         "panes": {"stale:p1": {"status": "working"}},
     }
@@ -611,15 +633,17 @@ def test_reconcile_rebuilds_state(monkeypatch, cfg, state, cmux_calls):
 
     ch.reconcile(cfg, state)
 
-    assert "stale" not in state["workspaces"]
-    assert state["workspaces"]["w1"]["panes"]["w1:p1"]["status"] == "blocked"
-    assert list(state["workspaces"]["w2"]["panes"]) == ["w2:p1"]
+    assert "stale" not in workspaces
+    assert workspaces["w1"]["panes"]["w1:p1"]["status"] == "blocked"
+    assert list(workspaces["w2"]["panes"]) == ["w2:p1"]
     pills = [c for c in cmux_calls if c[0] == "set-status"]
     assert len(pills) == 2
 
 
-def test_reconcile_clears_stale_workspace(monkeypatch, cfg, state, cmux_calls):
-    state["workspaces"]["w1"] = {
+def test_reconcile_clears_stale_workspace(
+    monkeypatch, cfg, state, workspaces, cmux_calls
+):
+    workspaces["w1"] = {
         "label": "",
         "panes": {
             "w1:p1": {"status": "blocked", "agent": "claude", "title": "fix"},
@@ -629,7 +653,7 @@ def test_reconcile_clears_stale_workspace(monkeypatch, cfg, state, cmux_calls):
 
     ch.reconcile(cfg, state)
 
-    assert "w1" not in state["workspaces"]
+    assert "w1" not in workspaces
     clear = [c for c in cmux_calls if c[0] == "clear-status"]
     assert clear == [["clear-status", "herdr.w1", "--workspace", "workspace:1"]]
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
@@ -733,12 +757,129 @@ def test_reconcile_keeps_notifications_while_attention(monkeypatch, cfg, state):
     assert [c for c in calls if c[0] == "mark-notification-read"] == []
 
 
+def test_same_workspace_id_in_two_sessions_stays_isolated(
+    monkeypatch, cfg, state, cmux_calls
+):
+    # Workspace ids are only unique within a herdr session; two sessions may
+    # both have a "w1" and must not share panes.
+    monkeypatch.setenv("HERDR_SESSION", "coten")
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
+    monkeypatch.setenv("HERDR_SESSION", "gutenberg")
+    ch.handle_event(cfg, state, status_event("w1:p9", "w1", "blocked"))
+
+    sessions = state["sessions"]
+    assert list(sessions["coten"]["workspaces"]["w1"]["panes"]) == ["w1:p1"]
+    assert list(sessions["gutenberg"]["workspaces"]["w1"]["panes"]) == ["w1:p9"]
+
+
+def test_reconcile_preserves_other_sessions(monkeypatch, cfg, state):
+    # Regression: refresh in one herdr session rebuilt the whole flat state
+    # from its own agent list and cleared every other session's pills.
+    monkeypatch.setenv("HERDR_SESSION", "coten")
+    state["sessions"]["gutenberg"] = {
+        "workspaces": {
+            "w6": {
+                "label": "gutenberg",
+                "panes": {
+                    "w6:p1": {"status": "working", "agent": "claude", "title": "t"},
+                },
+            }
+        }
+    }
+    calls = reconcile_run(
+        monkeypatch,
+        {
+            "session": json.dumps(
+                {
+                    "sessions": [
+                        {"name": "coten", "running": True},
+                        {"name": "gutenberg", "running": True},
+                    ]
+                }
+            ),
+            "list-workspaces": "workspace:1  hd:coten\nworkspace:2  hd:gutenberg\n",
+            ("list-status", "workspace:2"): (
+                "herdr.w6=1 working color=#0a84ff priority=10\n"
+            ),
+        },
+        agents=[],
+    )
+
+    ch.reconcile(cfg, state)
+
+    assert state["sessions"]["gutenberg"]["workspaces"]["w6"]["panes"]
+    assert [c for c in calls if c[0] == "clear-status"] == []
+
+
+def test_reconcile_prunes_ended_sessions(monkeypatch, cfg, state):
+    # A session that ended and never restarted would otherwise keep its
+    # pills forever, since no hook ever runs for it again.
+    monkeypatch.setenv("HERDR_SESSION", "coten")
+    cfg["workspaces"]["w5"] = "workspace:5"
+    state["sessions"]["ghost"] = {
+        "workspaces": {
+            "w5": {
+                "label": "ghost",
+                "panes": {
+                    "w5:p1": {"status": "blocked", "agent": "claude", "title": ""},
+                },
+            }
+        }
+    }
+    calls = reconcile_run(
+        monkeypatch,
+        {"session": json.dumps({"sessions": [{"name": "coten", "running": True}]})},
+        agents=[],
+    )
+
+    ch.reconcile(cfg, state)
+
+    assert "ghost" not in state["sessions"]
+    assert ["clear-status", "herdr.w5", "--workspace", "workspace:5"] in calls
+    assert ["mark-notification-read", "--workspace", "workspace:5"] in calls
+
+
+def test_reconcile_keeps_sessions_when_liveness_unknown(monkeypatch, cfg, state):
+    monkeypatch.setenv("HERDR_SESSION", "coten")
+    state["sessions"]["ghost"] = {
+        "workspaces": {
+            "w5": {
+                "label": "ghost",
+                "panes": {
+                    "w5:p1": {"status": "working", "agent": "claude", "title": ""},
+                },
+            }
+        }
+    }
+    # no "session" response: session list fails and pruning must be skipped
+    reconcile_run(monkeypatch, {}, agents=[])
+
+    ch.reconcile(cfg, state)
+
+    assert "ghost" in state["sessions"]
+
+
 def test_state_roundtrip(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
-    assert ch.load_state() == {"workspaces": {}}
-    ch.save_state({"workspaces": {"w1": {"label": "x", "panes": {}}}})
-    assert ch.load_state()["workspaces"]["w1"]["label"] == "x"
+    assert ch.load_state() == {"sessions": {}}
+    bucket = {"workspaces": {"w1": {"label": "x", "panes": {}}}}
+    ch.save_state({"sessions": {"tom": bucket}})
+    assert ch.load_state()["sessions"]["tom"]["workspaces"]["w1"]["label"] == "x"
+
+
+def test_load_state_drops_legacy_flat_format(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "workspaces": {"w1": {"label": "x", "panes": {}}},
+                "session_ref": {"ref": "workspace:1", "at": 0},
+            }
+        )
+    )
+    assert ch.load_state() == {"sessions": {}}
 
 
 def test_load_config(monkeypatch, tmp_path):
@@ -772,7 +913,8 @@ def test_main_event_mode(monkeypatch, tmp_path, cfg):
     assert ch.main() == 0
     assert any(c[0] == "notify" for c in calls)
     saved = json.loads((tmp_path / "state.json").read_text())
-    assert saved["workspaces"]["w1"]["panes"]["w1:p1"]["status"] == "blocked"
+    panes = saved["sessions"][""]["workspaces"]["w1"]["panes"]
+    assert panes["w1:p1"]["status"] == "blocked"
 
 
 def test_main_rejects_unknown_mode(monkeypatch, capsys):

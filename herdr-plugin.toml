@@ -1,6 +1,6 @@
 id = "cmux-herdr"
 name = "cmux-herdr"
-version = "0.4.0"
+version = "0.4.1"
 min_herdr_version = "0.8.0"
 description = "Propagate herdr agent status to the cmux sidebar"
 platforms = ["macos"]
