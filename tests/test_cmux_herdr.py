@@ -859,6 +859,40 @@ def test_reconcile_keeps_sessions_when_liveness_unknown(monkeypatch, cfg, state)
     assert "ghost" in state["sessions"]
 
 
+def test_event_tolerates_workspace_entry_without_panes(
+    cfg, state, workspaces, cmux_calls
+):
+    # workspace entries written by older plugin versions may lack "panes"
+    workspaces["w1"] = {"label": "old-format"}
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
+    assert workspaces["w1"]["panes"]["w1:p1"]["status"] == "working"
+
+
+def test_concurrent_save_state_does_not_race_tmp(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    # simulate separate hook processes sharing one state file
+    monkeypatch.setattr(ch.os, "getpid", threading.get_native_id)
+    errors = []
+
+    def save(i):
+        try:
+            for _ in range(30):
+                ch.save_state({"sessions": {str(i): {"workspaces": {}}}})
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=save, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert json.loads((tmp_path / "state.json").read_text())["sessions"]
+
+
 def test_state_roundtrip(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")

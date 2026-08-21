@@ -100,9 +100,30 @@ def load_state():
 
 def save_state(state):
     state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".tmp")
+    # Per-process tmp name: concurrent hooks from different sessions share
+    # this file and must not move each other's tmp away mid-save.
+    tmp = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_PATH)
+
+
+class state_lock:
+    """Serialize load/modify/save of state.json across concurrent hooks.
+
+    Hooks from every herdr session share one state file; without an
+    exclusive lock a later save silently drops another hook's concurrent
+    update.
+    """
+
+    def __enter__(self):
+        state_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = open(state_dir / "state.lock", "w")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.close()
+        return False
 
 
 def current_session():
@@ -592,7 +613,9 @@ def sweep_notifications(cfg, state):
 
 
 def get_workspace(bucket, ws_id):
-    return bucket["workspaces"].setdefault(ws_id, {"label": "", "panes": {}})
+    ws = bucket["workspaces"].setdefault(ws_id, {"label": "", "panes": {}})
+    ws.setdefault("panes", {})  # entries from older versions may lack it
+    return ws
 
 
 def on_agent_status_changed(cfg, bucket, data):
@@ -657,7 +680,7 @@ def on_pane_closed(cfg, bucket, data):
     ws = bucket["workspaces"].get(ws_id)
     if not ws:
         return
-    pane = ws["panes"].pop(pane_id, None)
+    pane = ws.setdefault("panes", {}).pop(pane_id, None)
     if pane is None:
         return
     if per_pane_enabled(cfg):
@@ -738,7 +761,7 @@ def running_sessions():
     binary = os.environ.get("HERDR_BIN_PATH", "herdr")
     try:
         proc = run([binary, "session", "list", "--json"])
-    except subprocess.TimeoutExpired:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
@@ -1715,31 +1738,31 @@ def main():
         return 2
     mode = sys.argv[1]
     cfg = load_config()
-    state = load_state()
     try:
         if mode == "remote":
             return remote_daemon(cfg)
-        if mode == "event":
-            raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
-            if not raw:
-                return 0
-            handle_event(cfg, state, json.loads(raw))
-        elif mode == "reconcile":
-            reconcile(cfg, state)
-        else:
-            bucket = session_bucket(state)
-            bucket.pop("session_ref", None)
-            ref = detect_session_workspace(cfg, bucket)
-            print(
-                json.dumps(
-                    {
-                        "cmux_workspace": ref,
-                        "herdr_session": os.environ.get("HERDR_SESSION"),
-                        "candidate_pids": herdr_session_pids(),
-                    }
+        with state_lock():
+            state = load_state()
+            if mode == "event":
+                raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
+                if raw:
+                    handle_event(cfg, state, json.loads(raw))
+            elif mode == "reconcile":
+                reconcile(cfg, state)
+            else:
+                bucket = session_bucket(state)
+                bucket.pop("session_ref", None)
+                ref = detect_session_workspace(cfg, bucket)
+                print(
+                    json.dumps(
+                        {
+                            "cmux_workspace": ref,
+                            "herdr_session": os.environ.get("HERDR_SESSION"),
+                            "candidate_pids": herdr_session_pids(),
+                        }
+                    )
                 )
-            )
-        save_state(state)
+            save_state(state)
     except Exception as e:
         log(f"unhandled error in {mode}: {e!r}")
         return 1
