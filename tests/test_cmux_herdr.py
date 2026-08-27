@@ -393,9 +393,7 @@ def test_reconcile_clears_legacy_sidebar_log_once(monkeypatch, cfg, state):
     assert [c for c in calls if c[0] == "clear-log"] == []
 
 
-def test_reconcile_defers_log_migration_when_cmux_unreachable(
-    monkeypatch, cfg, state
-):
+def test_reconcile_defers_log_migration_when_cmux_unreachable(monkeypatch, cfg, state):
     calls = reconcile_run(monkeypatch, {}, agents=[])
 
     ch.reconcile(cfg, state)
