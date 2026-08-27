@@ -80,11 +80,10 @@ def test_blocked_notifies_and_sets_waiting_pill(cfg, state, cmux_calls):
     assert "claude: waiting for input" in notify[0]
     assert "workspace:1" in notify[0]
 
-    pill = [c for c in cmux_calls if c[0] == "set-status"]
-    assert len(pill) == 1
-    assert pill[0][1] == "herdr.w1"
-    assert pill[0][2] == "1 waiting"
-    assert "#ff9500" in pill[0]
+    pills = [c for c in cmux_calls if c[0] == "set-status"]
+    assert [c[1] for c in pills] == ["herdr.w1", "herdr.w1.w1_p1"]
+    assert pills[0][2] == "1 waiting"
+    assert "#ff9500" in pills[0]
 
 
 def test_done_notifies_finished(cfg, state, cmux_calls):
@@ -95,23 +94,50 @@ def test_done_notifies_finished(cfg, state, cmux_calls):
     assert "claude: finished" in notify[0]
 
 
+def test_done_sets_finished_pill(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+
+    pills = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pills[0][1] == "herdr.w1"
+    assert pills[0][2] == "1 finished"
+    assert "#30d158" in pills[0]
+    assert pills[0][-2:] == ["--icon", "checkmark.circle"]
+    pane_pill = next(c for c in pills if c[1] == "herdr.w1.w1_p1")
+    assert pane_pill[2] == "claude: finished"
+    assert "#30d158" in pane_pill
+
+
+def test_viewing_finished_pane_clears_its_entries(cfg, state, cmux_calls):
+    # herdr flips done to idle when the user views the pane; the finished
+    # signal is read and must disappear from the sidebar.
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    cmux_calls.clear()
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "idle"))
+
+    clears = [c for c in cmux_calls if c[0] == "clear-status"]
+    assert ["clear-status", "herdr.w1.w1_p1", "--workspace", "workspace:1"] in clears
+    assert ["clear-status", "herdr.w1", "--workspace", "workspace:1"] in clears
+    read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
+    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+
+
 def test_working_sets_pill_without_notification(cfg, state, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
 
     assert [c for c in cmux_calls if c[0] == "notify"] == []
-    pill = [c for c in cmux_calls if c[0] == "set-status"]
-    assert len(pill) == 1
-    assert pill[0][2] == "1 working"
-    assert "#0a84ff" in pill[0]
+    pills = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pills[0][2] == "1 working"
+    assert "#0a84ff" in pills[0]
 
 
 def test_aggregates_across_panes(cfg, state, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    ch.handle_event(cfg, state, status_event("w1:p2", "w1", "done", agent="codex"))
     cmux_calls.clear()
-    ch.handle_event(cfg, state, status_event("w1:p2", "w1", "working"))
+    ch.handle_event(cfg, state, status_event("w1:p3", "w1", "working", agent="pi"))
 
-    pill = [c for c in cmux_calls if c[0] == "set-status"]
-    assert pill[0][2] == "1 waiting · 1 working"
+    pills = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pills[0][2] == "1 waiting · 1 finished · 1 working"
 
 
 def test_idle_removes_pane_and_clears_pill(cfg, state, workspaces, cmux_calls):
@@ -121,9 +147,8 @@ def test_idle_removes_pane_and_clears_pill(cfg, state, workspaces, cmux_calls):
 
     assert workspaces["w1"]["panes"] == {}
     assert [c for c in cmux_calls if c[0] == "notify"] == []
-    clear = [c for c in cmux_calls if c[0] == "clear-status"]
-    assert len(clear) == 1
-    assert clear[0][1] == "herdr.w1"
+    clears = [c for c in cmux_calls if c[0] == "clear-status"]
+    assert [c[1] for c in clears] == ["herdr.w1.w1_p1", "herdr.w1"]
 
 
 def test_pane_closed_updates_pill(cfg, state, cmux_calls):
@@ -217,8 +242,8 @@ def test_workspace_closed_clears_status(cfg, state, workspaces, cmux_calls):
     )
 
     assert "w1" not in workspaces
-    clear = [c for c in cmux_calls if c[0] == "clear-status"]
-    assert len(clear) == 1
+    clears = [c for c in cmux_calls if c[0] == "clear-status"]
+    assert [c[1] for c in clears] == ["herdr.w1", "herdr.w1.w1_p1"]
 
 
 def test_pill_includes_icon(cfg, state, cmux_calls):
@@ -232,54 +257,7 @@ def test_pill_includes_icon(cfg, state, cmux_calls):
     assert pill[0][-2:] == ["--icon", "bolt"]
 
 
-def test_blocked_logs_to_sidebar_log(cfg, state, cmux_calls):
-    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
-    logs = [c for c in cmux_calls if c[0] == "log"]
-    assert logs == [
-        [
-            "log",
-            "--level",
-            "warning",
-            "--source",
-            "claude",
-            "--workspace",
-            "workspace:1",
-            "--",
-            "waiting for input · task",
-        ]
-    ]
-
-
-def test_done_logs_success(cfg, state, cmux_calls):
-    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
-    logs = [c for c in cmux_calls if c[0] == "log"]
-    assert logs[0][2] == "success"
-    assert logs[0][-1] == "finished · task"
-
-
-def test_working_not_logged_by_default(cfg, state, cmux_calls):
-    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
-    assert [c for c in cmux_calls if c[0] == "log"] == []
-
-
-def test_working_logged_when_enabled(cfg, state, cmux_calls):
-    cfg["sidebar_log_working"] = True
-    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
-    logs = [c for c in cmux_calls if c[0] == "log"]
-    assert logs[0][2] == "progress"
-    assert logs[0][-1] == "working · task"
-
-
-def test_sidebar_log_can_be_disabled(cfg, state, cmux_calls):
-    cfg["sidebar_log"] = False
-    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
-    assert [c for c in cmux_calls if c[0] == "log"] == []
-    # notifications are unaffected
-    assert len([c for c in cmux_calls if c[0] == "notify"]) == 1
-
-
 def test_per_pane_pill_set(cfg, state, cmux_calls):
-    cfg["per_pane_status"] = True
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
     pills = [c for c in cmux_calls if c[0] == "set-status"]
     assert len(pills) == 2
@@ -290,7 +268,6 @@ def test_per_pane_pill_set(cfg, state, cmux_calls):
 
 
 def test_per_pane_pill_cleared_on_idle(cfg, state, cmux_calls):
-    cfg["per_pane_status"] = True
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
     cmux_calls.clear()
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "idle"))
@@ -301,7 +278,6 @@ def test_per_pane_pill_cleared_on_idle(cfg, state, cmux_calls):
 
 
 def test_per_pane_pill_cleared_on_pane_closed(cfg, state, cmux_calls):
-    cfg["per_pane_status"] = True
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
     cmux_calls.clear()
     ch.handle_event(
@@ -317,7 +293,6 @@ def test_per_pane_pill_cleared_on_pane_closed(cfg, state, cmux_calls):
 
 
 def test_per_pane_pills_cleared_on_workspace_closed(cfg, state, cmux_calls):
-    cfg["per_pane_status"] = True
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
     ch.handle_event(cfg, state, status_event("w1:p2", "w1", "working", agent="codex"))
     cmux_calls.clear()
@@ -339,16 +314,9 @@ def test_per_pane_pills_cleared_on_workspace_closed(cfg, state, cmux_calls):
     assert ["clear-status", "herdr.w1.w1_p2", "--workspace", "workspace:1"] in clears
 
 
-def test_per_pane_pills_off_by_default(cfg, state, cmux_calls):
-    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
-    pills = [c for c in cmux_calls if c[0] == "set-status"]
-    assert [c[1] for c in pills] == ["herdr.w1"]
-
-
 def test_reconcile_clears_removed_pane_pills(
     monkeypatch, cfg, state, workspaces, cmux_calls
 ):
-    cfg["per_pane_status"] = True
     workspaces["w1"] = {
         "label": "",
         "panes": {
@@ -379,7 +347,7 @@ def test_reconcile_clears_removed_pane_pills(
     assert clears == [["clear-status", "herdr.w1.w1_p2", "--workspace", "workspace:1"]]
 
 
-def test_sweep_keeps_per_pane_keys_only_when_enabled(monkeypatch, cfg, state):
+def test_sweep_keeps_active_per_pane_keys(monkeypatch, cfg, state):
     agent = {
         "pane_id": "w1:p1",
         "workspace_id": "w1",
@@ -395,14 +363,43 @@ def test_sweep_keeps_per_pane_keys_only_when_enabled(monkeypatch, cfg, state):
         ),
     }
 
-    cfg["per_pane_status"] = True
     calls = reconcile_run(monkeypatch, responses, agents=[agent])
     ch.reconcile(cfg, state)
     assert [c for c in calls if c[0] == "clear-status"] == []
 
-    calls = reconcile_run(monkeypatch, responses, agents=[agent])
-    ch.reconcile({"workspaces": cfg["workspaces"]}, state)
-    assert ["clear-status", "herdr.w1.w1_p1", "--workspace", "workspace:1"] in calls
+
+def test_reconcile_clears_legacy_sidebar_log_once(monkeypatch, cfg, state):
+    # Workspaces this plugin wrote to (status keys, or a mapping from state)
+    # get one clear-log; the migration never repeats.
+    ch.session_bucket(state)["workspaces"]["w2"] = {"label": "other", "panes": {}}
+    responses = {
+        "list-workspaces": "workspace:1  hd:tom\nworkspace:2  other\nworkspace:3  x\n",
+        ("list-status", "workspace:1"): "herdr.w1=1 waiting color=#ff9500\n",
+        ("list-status", "workspace:2"): "",
+        ("list-status", "workspace:3"): "",
+    }
+    calls = reconcile_run(monkeypatch, responses, agents=[])
+
+    ch.reconcile(cfg, state)
+    clears = [c for c in calls if c[0] == "clear-log"]
+    assert clears == [
+        ["clear-log", "--workspace", "workspace:1"],
+        ["clear-log", "--workspace", "workspace:2"],
+    ]
+    assert state["legacy_log_cleared"] is True
+
+    calls.clear()
+    ch.reconcile(cfg, state)
+    assert [c for c in calls if c[0] == "clear-log"] == []
+
+
+def test_reconcile_defers_log_migration_when_cmux_unreachable(monkeypatch, cfg, state):
+    calls = reconcile_run(monkeypatch, {}, agents=[])
+
+    ch.reconcile(cfg, state)
+
+    assert [c for c in calls if c[0] == "clear-log"] == []
+    assert "legacy_log_cleared" not in state
 
 
 def test_workspace_focused_marks_notifications_read(cfg, state, cmux_calls):
@@ -637,7 +634,12 @@ def test_reconcile_rebuilds_state(monkeypatch, cfg, state, workspaces, cmux_call
     assert workspaces["w1"]["panes"]["w1:p1"]["status"] == "blocked"
     assert list(workspaces["w2"]["panes"]) == ["w2:p1"]
     pills = [c for c in cmux_calls if c[0] == "set-status"]
-    assert len(pills) == 2
+    assert {c[1] for c in pills} == {
+        "herdr.w1",
+        "herdr.w1.w1_p1",
+        "herdr.w2",
+        "herdr.w2.w2_p1",
+    }
 
 
 def test_reconcile_clears_stale_workspace(
@@ -655,7 +657,10 @@ def test_reconcile_clears_stale_workspace(
 
     assert "w1" not in workspaces
     clear = [c for c in cmux_calls if c[0] == "clear-status"]
-    assert clear == [["clear-status", "herdr.w1", "--workspace", "workspace:1"]]
+    assert clear == [
+        ["clear-status", "herdr.w1.w1_p1", "--workspace", "workspace:1"],
+        ["clear-status", "herdr.w1", "--workspace", "workspace:1"],
+    ]
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
     assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
 
@@ -1019,7 +1024,6 @@ def test_remote_blocked_notifies_and_sets_pill(cmux_calls, remote_title_map):
     assert "maguro:hd:tom · task" in notify[0]
 
     pill = [c for c in cmux_calls if c[0] == "set-status"]
-    assert len(pill) == 1
     assert pill[0][1] == "herdr.remote.tom"
     assert pill[0][2] == "1 waiting"
     assert "#ff9500" in pill[0]
@@ -1046,39 +1050,17 @@ def test_remote_working_pill_without_notification(cmux_calls, remote_title_map):
     assert "#0a84ff" in pill[0]
 
 
-def test_remote_blocked_logs_to_sidebar(cmux_calls, remote_title_map):
+def test_remote_per_pane_pills(cmux_calls, remote_title_map):
     rstate = {"remotes": {}}
     ch.apply_remote_snapshot(
         {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
-    )
-    logs = [c for c in cmux_calls if c[0] == "log"]
-    assert logs == [
-        [
-            "log",
-            "--level",
-            "warning",
-            "--source",
-            "claude",
-            "--workspace",
-            "workspace:9",
-            "--",
-            "waiting for input · task",
-        ]
-    ]
-
-
-def test_remote_per_pane_pills(cmux_calls, remote_title_map):
-    cfg = {"per_pane_status": True}
-    rstate = {"remotes": {}}
-    ch.apply_remote_snapshot(
-        cfg, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
     )
     pills = [c for c in cmux_calls if c[0] == "set-status"]
     pane_pill = next(c for c in pills if c[1] == "herdr.remote.tom.w1_p1")
     assert pane_pill[2] == "claude: waiting"
 
     cmux_calls.clear()
-    ch.apply_remote_snapshot(cfg, rstate, "tom", REMOTE_CFG, [], {})
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, [], {})
     clears = [c for c in cmux_calls if c[0] == "clear-status"]
     assert [
         "clear-status",
@@ -1102,7 +1084,7 @@ def test_retire_remote_clears_per_pane_pills(
             }
         }
     }
-    ch.retire_remote({"per_pane_status": True}, rstate, "tom", {}, {})
+    ch.retire_remote({}, rstate, "tom", {}, {})
 
     clears = [c for c in cmux_calls if c[0] == "clear-status"]
     assert [
@@ -1152,7 +1134,10 @@ def test_remote_all_idle_clears_pill(cmux_calls, remote_title_map):
     )
 
     clear = [c for c in cmux_calls if c[0] == "clear-status"]
-    assert clear == [["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"]]
+    assert clear == [
+        ["clear-status", "herdr.remote.tom.w1_p1", "--workspace", "workspace:9"],
+        ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"],
+    ]
 
 
 def test_remote_aggregates_across_workspaces(cmux_calls, remote_title_map):
@@ -1192,7 +1177,8 @@ def test_remote_title_change_reroutes_pill(cmux_calls, remote_title_map):
     # the pill and unread notifications on the previous workspace are cleared
     clears = [c for c in cmux_calls if c[0] == "clear-status"]
     assert clears == [
-        ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"]
+        ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"],
+        ["clear-status", "herdr.remote.tom.w1_p1", "--workspace", "workspace:9"],
     ]
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
     assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
@@ -1215,7 +1201,6 @@ def test_remote_title_change_publishes_to_new_workspace(monkeypatch, cmux_calls)
     ch.apply_remote_snapshot({}, rstate, "tom", rcfg, agents, {})
 
     pill = [c for c in cmux_calls if c[0] == "set-status"]
-    assert len(pill) == 1
     assert pill[0][1] == "herdr.remote.tom"
     assert "workspace:10" in pill[0]
 
@@ -1337,10 +1322,9 @@ def test_remote_republishes_pill_once_workspace_appears(monkeypatch, cmux_calls)
     titles["maguro:hd:tom"] = "workspace:9"
     changed = ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
     assert changed is False  # snapshot unchanged, but the pill is retried
-    pill = [c for c in cmux_calls if c[0] == "set-status"]
-    assert len(pill) == 1
-    assert pill[0][1] == "herdr.remote.tom"
-    assert "workspace:9" in pill[0]
+    pills = [c for c in cmux_calls if c[0] == "set-status"]
+    assert pills[0][1] == "herdr.remote.tom"
+    assert "workspace:9" in pills[0]
 
 
 def test_remote_name_defaults_to_target_and_session():
