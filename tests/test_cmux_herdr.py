@@ -1491,3 +1491,164 @@ def test_socket_rpc_error_raises():
     with pytest.raises(ch.SocketError, match="nope"):
         ch.socket_rpc(sock_path, "ping", {})
     t.join(5)
+
+
+# --- Watch subscriber --------------------------------------------------------
+
+
+@pytest.fixture
+def watch_state(monkeypatch, tmp_path):
+    """State on disk, since the subscriber loads and saves it under the lock."""
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    return tmp_path / "state.json"
+
+
+def seed_state(path, panes, label="proj"):
+    path.write_text(
+        json.dumps(
+            {"sessions": {"": {"workspaces": {"w1": {"label": label, "panes": panes}}}}}
+        )
+    )
+
+
+def done_pane(agent="claude"):
+    return {"status": "done", "agent": agent, "title": "task"}
+
+
+def socket_event(pane_id, ws_id, status):
+    return {"pane_id": pane_id, "workspace_id": ws_id, "agent_status": status}
+
+
+def test_watch_clears_pane_herdr_no_longer_tracks(
+    monkeypatch, cfg, cmux_calls, watch_state
+):
+    seed_state(watch_state, {"w1:p1": done_pane()})
+    monkeypatch.setattr(ch, "pane_is_tracked", lambda sock, pane_id: False)
+
+    ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p1", "w1", "idle"))
+
+    assert ["clear-status", "herdr.w1", "--workspace", "workspace:1"] in cmux_calls
+    saved = json.loads(watch_state.read_text())
+    assert saved["sessions"][""]["workspaces"]["w1"]["panes"] == {}
+
+
+def test_watch_marks_notifications_read_when_attention_drains(
+    monkeypatch, cfg, cmux_calls, watch_state
+):
+    seed_state(watch_state, {"w1:p1": done_pane()})
+    monkeypatch.setattr(ch, "pane_is_tracked", lambda sock, pane_id: False)
+
+    ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p1", "w1", "idle"))
+
+    assert any(c[0] == "mark-notification-read" for c in cmux_calls)
+
+
+def test_watch_ignores_tracked_status(monkeypatch, cfg, cmux_calls, watch_state):
+    seed_state(watch_state, {"w1:p1": done_pane()})
+    monkeypatch.setattr(
+        ch, "pane_is_tracked", lambda sock, pane_id: pytest.fail("must not confirm")
+    )
+
+    for status in sorted(ch.TRACKED_STATUSES):
+        ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p1", "w1", status))
+
+    assert cmux_calls == []
+
+
+def test_watch_keeps_pane_a_newer_transition_reclaimed(
+    monkeypatch, cfg, cmux_calls, watch_state
+):
+    # The hook wrote `working` between the event and the lock; the in-lock
+    # confirmation sees it and the stale idle event must not remove the pane.
+    seed_state(watch_state, {"w1:p1": {**done_pane(), "status": "working"}})
+    monkeypatch.setattr(ch, "pane_is_tracked", lambda sock, pane_id: True)
+
+    ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p1", "w1", "idle"))
+
+    assert cmux_calls == []
+    saved = json.loads(watch_state.read_text())
+    assert "w1:p1" in saved["sessions"][""]["workspaces"]["w1"]["panes"]
+
+
+def test_watch_ignores_pane_the_plugin_does_not_track(
+    monkeypatch, cfg, cmux_calls, watch_state
+):
+    seed_state(watch_state, {"w1:p1": done_pane()})
+    monkeypatch.setattr(
+        ch, "pane_is_tracked", lambda sock, pane_id: pytest.fail("must not confirm")
+    )
+
+    ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p9", "w1", "idle"))
+
+    assert cmux_calls == []
+
+
+def test_watch_keeps_pane_when_confirmation_fails(cfg, cmux_calls, watch_state):
+    seed_state(watch_state, {"w1:p1": done_pane()})
+
+    # pane_is_tracked fails safe: an unreachable server must not drop pills.
+    ch.handle_watch_event(cfg, "/nonexistent.sock", socket_event("w1:p1", "w1", "idle"))
+
+    assert cmux_calls == []
+    saved = json.loads(watch_state.read_text())
+    assert "w1:p1" in saved["sessions"][""]["workspaces"]["w1"]["panes"]
+
+
+def test_watch_clears_per_pane_pill(monkeypatch, cfg, cmux_calls, watch_state):
+    seed_state(watch_state, {"w1:p1": done_pane()})
+    monkeypatch.setattr(ch, "pane_is_tracked", lambda sock, pane_id: False)
+
+    ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p1", "w1", "idle"))
+
+    assert [
+        "clear-status",
+        "herdr.w1.w1_p1",
+        "--workspace",
+        "workspace:1",
+    ] in cmux_calls
+
+
+def test_watch_subscriptions_cover_panes_and_lifecycle():
+    subs = ch.watch_subscriptions(["w1:p1", "w2:p3"])
+
+    status = [s for s in subs if s["type"] == "pane.agent_status_changed"]
+    assert [s["pane_id"] for s in status] == ["w1:p1", "w2:p3"]
+    wildcards = {s["type"] for s in subs if "pane_id" not in s}
+    assert wildcards == {"pane.created", "pane.closed"}
+
+
+def test_pane_is_tracked_reads_current_status(monkeypatch):
+    agents = [{"pane_id": "w1:p1", "agent_status": "working"}]
+    monkeypatch.setattr(ch, "socket_rpc", lambda *a, **k: {"agents": agents})
+
+    assert ch.pane_is_tracked("/tmp/x.sock", "w1:p1") is True
+    assert ch.pane_is_tracked("/tmp/x.sock", "w1:p2") is False
+
+
+def test_pane_is_tracked_fails_safe(monkeypatch):
+    def boom(*a, **k):
+        raise ch.SocketError("gone")
+
+    monkeypatch.setattr(ch, "socket_rpc", boom)
+
+    # Unverified means "leave it alone", never "remove it".
+    assert ch.pane_is_tracked("/tmp/x.sock", "w1:p1") is True
+
+
+def test_pid_is_daemon_distinguishes_modes(monkeypatch):
+    def fake_ps(cmd, capture_output, text, timeout):
+        return SimpleNamespace(stdout="python3 /plugin/cmux_herdr.py watch\n")
+
+    monkeypatch.setattr(ch.subprocess, "run", fake_ps)
+
+    assert ch.pid_is_daemon(123, "watch") is True
+    assert ch.pid_is_daemon(123, "remote") is False
+
+
+def test_watch_pid_path_is_per_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+
+    assert ch.watch_pid_path("tom") != ch.watch_pid_path("coten")
+    # Session names reach the filesystem; keep them to safe characters.
+    assert "/" not in ch.watch_pid_path("a/b").name
