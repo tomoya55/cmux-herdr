@@ -160,6 +160,12 @@ The state directory is shared by every herdr session on the machine, but workspa
 
 Remote sessions are handled separately by a long-lived `cmux_herdr.py remote` daemon (spawned by the startup hook, single instance guarded by a pidfile). It keeps its own `remote-state.json`, so it never races the event-hook writes to `state.json`, and its `herdr.remote.*` pills are excluded from the local orphan sweep.
 
+### Why there is also a `watch` daemon
+
+herdr does not run plugin hooks for the `done` -> `idle` transition — the one that fires when you open a finished pane and that is supposed to retire its `finished` entry. Without help, the green entry would survive until the agent was next used. The transition *is* published on the herdr API socket, so `cmux_herdr.py watch` (one per session, spawned by the startup hook and the refresh action, single instance guarded by a `watch-<session>.pid` pidfile) subscribes there and retires the pane the hook never heard about. Measured against herdr 0.9.0; `working` -> `idle` is dispatched normally, only `done` -> `idle` is dropped.
+
+The subscriber only ever *removes* panes, and only after re-reading the pane's current status from herdr while holding the state lock. Hooks stay the sole writer for everything herdr does deliver, so the two cannot race and no notification is ever raised twice.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/):

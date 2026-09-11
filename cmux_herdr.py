@@ -625,6 +625,25 @@ def get_workspace(bucket, ws_id):
     return ws
 
 
+def forget_pane(cfg, bucket, ws_id, pane_id):
+    """Retire a pane that left the tracked statuses.
+
+    Shared by the status hook and the socket subscriber, so a pane leaves the
+    sidebar the same way whichever of the two observed it going away.
+    """
+    panes = bucket["workspaces"].get(ws_id, {}).get("panes", {})
+    removed = panes.pop(pane_id, None)
+    if removed is None:
+        return False
+    if removed["status"] in ATTENTION_STATUSES and not has_attention_panes(panes):
+        # Leaving blocked/done means the prompt was answered or the finished
+        # pane was viewed; the notifications for this workspace are actioned.
+        mark_read(cfg, bucket, ws_id)
+    clear_pane_pill(cfg, bucket, ws_id, pane_id)
+    update_pill(cfg, bucket, ws_id)
+    return True
+
+
 def on_agent_status_changed(cfg, bucket, data):
     ws_id = data["workspace_id"]
     pane_id = data["pane_id"]
@@ -633,15 +652,17 @@ def on_agent_status_changed(cfg, bucket, data):
     panes = ws["panes"]
     was_attention = panes.get(pane_id, {}).get("status") in ATTENTION_STATUSES
 
-    removed = None
-    if status in TRACKED_STATUSES:
-        panes[pane_id] = {
-            "status": status,
-            "agent": data.get("display_agent") or data.get("agent") or "agent",
-            "title": data.get("title") or "",
-        }
-    else:
-        removed = panes.pop(pane_id, None)
+    if status not in TRACKED_STATUSES:
+        # forget_pane republishes the pill itself when it removes something.
+        if not forget_pane(cfg, bucket, ws_id, pane_id):
+            update_pill(cfg, bucket, ws_id)
+        return
+
+    panes[pane_id] = {
+        "status": status,
+        "agent": data.get("display_agent") or data.get("agent") or "agent",
+        "title": data.get("title") or "",
+    }
 
     if status in ATTENTION_STATUSES:
         pane = panes[pane_id]
@@ -664,12 +685,10 @@ def on_agent_status_changed(cfg, bucket, data):
                 f"{label} · {pane['title'] or pane_id}",
             )
     elif was_attention and not has_attention_panes(panes):
-        # Leaving blocked/done means the prompt was answered or the finished
-        # pane was viewed; the notifications for this workspace are actioned.
+        # Answering the prompt retires the notification just as viewing the
+        # finished pane does; forget_pane covers the leaving-tracked case.
         mark_read(cfg, bucket, ws_id)
 
-    if removed is not None:
-        clear_pane_pill(cfg, bucket, ws_id, pane_id)
     update_pill(cfg, bucket, ws_id)
 
 
@@ -1365,8 +1384,12 @@ def read_pidfile(pid_path):
     return data if isinstance(data, dict) else {}
 
 
-def pid_is_remote_daemon(pid):
-    """Guard against signaling an unrelated process after PID reuse."""
+def pid_is_daemon(pid, mode):
+    """Guard against signaling an unrelated process after PID reuse.
+
+    `mode` keeps the daemons apart: a live watcher must not read as a stale
+    remote daemon, which would let a second one start.
+    """
     try:
         proc = subprocess.run(
             ["ps", "-p", str(pid), "-o", "args="],
@@ -1377,10 +1400,10 @@ def pid_is_remote_daemon(pid):
     except subprocess.TimeoutExpired:
         return False
     parts = proc.stdout.strip().split()
-    return any(p.endswith("cmux_herdr.py") for p in parts) and "remote" in parts
+    return any(p.endswith("cmux_herdr.py") for p in parts) and mode in parts
 
 
-def live_daemon_pid(pid_path):
+def live_daemon_pid(pid_path, mode):
     """PID of the running remote daemon, or None (stale/absent pidfile)."""
     if not pid_path.exists():
         return None
@@ -1394,24 +1417,24 @@ def live_daemon_pid(pid_path):
         os.kill(pid, 0)
     except OSError:
         return None
-    if not pid_is_remote_daemon(pid):
-        log(f"ignoring stale pidfile: pid {pid} is not a cmux-herdr daemon")
+    if not pid_is_daemon(pid, mode):
+        log(f"ignoring stale pidfile: pid {pid} is not a cmux-herdr {mode} daemon")
         return None
     return pid
 
 
-def take_over_daemon(pid_path):
-    """Ensure this is the only (and latest-code) remote daemon running."""
-    old_pid = live_daemon_pid(pid_path)
+def take_over_daemon(pid_path, mode):
+    """Ensure this is the only (and latest-code) daemon of `mode` running."""
+    old_pid = live_daemon_pid(pid_path, mode)
     if old_pid is None:
         return
     info = read_pidfile(pid_path)
     self = daemon_self_info()
     if info.get("script") == self["script"] and info.get("mtime") == self["mtime"]:
-        log(f"remote daemon already running (pid {old_pid})")
+        log(f"{mode} daemon already running (pid {old_pid})")
         raise SystemExit(0)
     # The plugin was reinstalled or edited since the old daemon started.
-    log(f"replacing outdated remote daemon (pid {old_pid})")
+    log(f"replacing outdated {mode} daemon (pid {old_pid})")
     os.kill(old_pid, signal.SIGTERM)
     # Must exceed the old daemon's worst-case shutdown (worker quiesce).
     deadline = time.time() + 15
@@ -1423,7 +1446,7 @@ def take_over_daemon(pid_path):
         time.sleep(0.1)
     # The old daemon refuses to die; starting another one would fight over
     # forwarded sockets and state. Retry on the next startup/refresh.
-    log(f"outdated remote daemon (pid {old_pid}) did not exit; aborting")
+    log(f"outdated {mode} daemon (pid {old_pid}) did not exit; aborting")
     raise SystemExit(1)
 
 
@@ -1494,11 +1517,11 @@ def remote_daemon(cfg):
         # A new daemon is spawned by each startup hook and refresh action.
         with open(state_dir / "remote.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if live_daemon_pid(pid_path) is not None:
+            if live_daemon_pid(pid_path, "remote") is not None:
                 # A current daemon hot-reloads the empty config and retires
                 # its remotes itself (this raises SystemExit in that case);
                 # an outdated one is replaced so upgrades still take effect.
-                take_over_daemon(pid_path)
+                take_over_daemon(pid_path, "remote")
                 log("replaced outdated remote daemon before cleanup")
             rstate = load_remote_state()
             for name in list(rstate.get("remotes", {})):
@@ -1511,7 +1534,7 @@ def remote_daemon(cfg):
     # may take over and write the pidfile.
     with open(state_dir / "remote.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        take_over_daemon(pid_path)
+        take_over_daemon(pid_path, "remote")
         pid_path.write_text(json.dumps(daemon_self_info()))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     rstate = load_remote_state()
@@ -1703,20 +1726,207 @@ def remote_daemon(cfg):
     return 0
 
 
+# --- Watch subscriber (recovers transitions herdr never dispatches) ---------
+
+# herdr does not run plugin hooks for the `done` -> `idle` transition, the one
+# that is supposed to retire a "finished" pill once the user has looked at the
+# pane. The same transition *is* published on the API socket, so a subscriber
+# consumes it there and retires the pane the hook never heard about.
+
+WATCH_BACKOFF_SECONDS = 2.0
+WATCH_MAX_BACKOFF_SECONDS = 60.0
+
+
+def watch_pid_path(session):
+    return state_dir / f"watch-{sanitize_key(session or 'default')}.pid"
+
+
+def watch_subscriptions(pane_ids):
+    """One agent-status subscription per pane, plus the lifecycle wildcards.
+
+    pane.agent_status_changed takes no wildcard, so the set has to be rebuilt
+    whenever a pane appears or vanishes; pane.created and pane.closed are what
+    tell the subscriber to do that.
+    """
+    subs = [
+        {"type": "pane.agent_status_changed", "pane_id": pane_id}
+        for pane_id in pane_ids
+    ]
+    subs.append({"type": "pane.created"})
+    subs.append({"type": "pane.closed"})
+    return subs
+
+
+def pane_is_tracked(sock_path, pane_id):
+    """Whether herdr reports the pane in a status the sidebar shows.
+
+    Answers True when the server cannot be asked: an unverified event must
+    never retire a pill.
+    """
+    try:
+        agents = socket_rpc(sock_path, "agent.list", {}).get("agents", [])
+    except (SocketError, OSError, ValueError) as e:
+        log(f"watch: agent list failed: {e}")
+        return True
+    for agent in agents:
+        if agent.get("pane_id") == pane_id:
+            return agent.get("agent_status") in TRACKED_STATUSES
+    return False
+
+
+def handle_watch_event(cfg, sock_path, data):
+    """Apply one status transition the plugin's event hook never received."""
+    if data.get("agent_status") in TRACKED_STATUSES:
+        # Delivered to hooks correctly; they own every addition, notification
+        # and log entry, so acting here would duplicate them.
+        return
+    ws_id, pane_id = data.get("workspace_id"), data.get("pane_id")
+    if not ws_id or not pane_id:
+        return
+    with state_lock():
+        state = load_state()
+        bucket = session_bucket(state)
+        if pane_id not in bucket["workspaces"].get(ws_id, {}).get("panes", {}):
+            return  # a hook already retired it, or it was never tracked
+        # Confirm inside the lock. A hook may have written a newer status
+        # between this event and here, and that newer status must win.
+        if pane_is_tracked(sock_path, pane_id):
+            return
+        forget_pane(cfg, bucket, ws_id, pane_id)
+        save_state(state)
+
+
+def session_socket_path():
+    """API socket of the herdr session this process was spawned from."""
+    name = current_session()
+    binary = os.environ.get("HERDR_BIN_PATH", "herdr")
+    try:
+        proc = run([binary, "session", "list", "--json"])
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"watch: session list failed: {e}")
+        return None
+    if proc.returncode != 0:
+        log(f"watch: session list failed: {proc.stderr.strip()}")
+        return None
+    try:
+        sessions = json.loads(proc.stdout).get("sessions", [])
+    except ValueError as e:
+        log(f"watch: session list unreadable: {e}")
+        return None
+    for session in sessions:
+        if session.get("name") == name or (not name and session.get("default")):
+            return session.get("socket_path")
+    log(f"watch: no API socket for herdr session {name!r}")
+    return None
+
+
+def open_subscription(sock_path, subscriptions):
+    """Connected socket streaming the subscribed events as NDJSON."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.connect(str(sock_path))
+    conn.sendall(
+        json.dumps(
+            {
+                "id": "watch",
+                "method": "events.subscribe",
+                "params": {"subscriptions": subscriptions},
+            }
+        ).encode()
+        + b"\n"
+    )
+    return conn
+
+
+def list_pane_ids(sock_path):
+    panes = socket_rpc(sock_path, "pane.list", {}).get("panes", [])
+    return [p["pane_id"] for p in panes if p.get("pane_id")]
+
+
+def watch_connection(cfg, sock_path):
+    """Subscribe to every pane and dispatch until the pane set goes stale."""
+    pane_ids = list_pane_ids(sock_path)
+    conn = open_subscription(sock_path, watch_subscriptions(pane_ids))
+    try:
+        # herdr 0.9 starts a subscription with live events instead of replaying
+        # history, so a pane created between the listing and the subscribe would
+        # be invisible. Re-listing after subscribing catches exactly that.
+        if list_pane_ids(sock_path) != pane_ids:
+            return
+        for line in conn.makefile("rb"):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            # herdr spells event names with dots in some streams and
+            # underscores in others.
+            event = str(msg.get("event") or "").replace(".", "_")
+            if event in ("pane_created", "pane_closed"):
+                return  # the subscription set is stale; rebuild it
+            if event == "pane_agent_status_changed":
+                handle_watch_event(cfg, sock_path, msg.get("data") or {})
+    finally:
+        conn.close()
+
+
+def watch_loop(cfg):
+    backoff = WATCH_BACKOFF_SECONDS
+    while True:
+        sock_path = session_socket_path()
+        if sock_path:
+            try:
+                watch_connection(cfg, sock_path)
+                backoff = WATCH_BACKOFF_SECONDS
+                continue  # a stale pane set reconnects immediately
+            except (SocketError, OSError, ValueError) as e:
+                log(f"watch: connection lost: {e}")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, WATCH_MAX_BACKOFF_SECONDS)
+
+
+def watch_daemon(cfg):
+    session = current_session()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_path = watch_pid_path(session)
+    # Serialize concurrent startup/refresh invocations: only one watcher per
+    # session may take over and write the pidfile.
+    with open(state_dir / f"{pid_path.stem}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        take_over_daemon(pid_path, "watch")
+        pid_path.write_text(json.dumps(daemon_self_info()))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    log(f"watch daemon started (pid {os.getpid()}) for session {session or 'default'}")
+    try:
+        watch_loop(cfg)
+    finally:
+        # Only unlink our own pidfile; a replacement may already own it.
+        try:
+            if read_pidfile(pid_path).get("pid") == os.getpid():
+                pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return 0
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in {
         "event",
         "reconcile",
         "detect",
         "remote",
+        "watch",
     }:
-        print("usage: cmux_herdr.py <event|reconcile|detect|remote>", file=sys.stderr)
+        print(
+            "usage: cmux_herdr.py <event|reconcile|detect|remote|watch>",
+            file=sys.stderr,
+        )
         return 2
     mode = sys.argv[1]
     cfg = load_config()
     try:
         if mode == "remote":
             return remote_daemon(cfg)
+        if mode == "watch":
+            return watch_daemon(cfg)
         with state_lock():
             state = load_state()
             if mode == "event":
