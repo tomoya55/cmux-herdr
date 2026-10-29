@@ -2033,12 +2033,78 @@ def v1_native_surface_ownership(nodes, directories, tty_device, deadline):
     return owners, transports, clients, complete
 
 
+def v1_validate_discovery_tree(payload, deadline):
+    """Validate the entire roster before granting any surface evidence."""
+    seen, surfaces = set(), set()
+    try:
+        if not isinstance(payload.get("windows"), list):
+            return False
+        for window in payload["windows"]:
+            if not isinstance(window.get("workspaces"), list):
+                return False
+            for workspace in window["workspaces"]:
+                workspace_id = workspace["id"]
+                if (
+                    not isinstance(workspace_id, str)
+                    or not workspace_id
+                    or not isinstance(workspace.get("panes"), list)
+                ):
+                    return False
+                for pane in workspace["panes"]:
+                    if not isinstance(pane.get("surfaces"), list):
+                        return False
+                    for surface in pane["surfaces"]:
+                        if time.monotonic() >= deadline:
+                            return False
+                        kind = surface.get("type")
+                        if kind == "browser":
+                            continue
+                        surface_id = surface.get("id")
+                        if (
+                            kind != "terminal"
+                            or not isinstance(surface_id, str)
+                            or not surface_id
+                        ):
+                            return False
+                        key = (workspace_id.casefold(), surface_id.casefold())
+                        if key in surfaces or not isinstance(
+                            surface.get("processes"), list
+                        ):
+                            return False
+                        surfaces.add(key)
+                        stack = list(surface["processes"])
+                        while stack:
+                            if time.monotonic() >= deadline:
+                                return False
+                            process = stack.pop()
+                            if not isinstance(process, dict) or len(seen) >= 16384:
+                                return False
+                            pid, children = process.get("pid"), process.get("children")
+                            if (
+                                type(pid) is not int
+                                or pid <= 0
+                                or pid in seen
+                                or not isinstance(children, list)
+                            ):
+                                return False
+                            seen.add(pid)
+                            stack.extend(children)
+        return True
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
 def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
     """Collect candidates from one tree; recheck them before accepting ownership."""
     clients, seen, surfaces = [], set(), set()
     complete = True
     if deadline is None:
         deadline = time.monotonic() + 20
+    if time.monotonic() >= deadline:
+        return {"clients": [], "complete": False, "surface_complete": {}}
+    if not v1_validate_discovery_tree(payload, deadline):
+        return None
+    surface_complete = {}
     try:
         if not isinstance(payload.get("windows"), list):
             return None
@@ -2076,9 +2142,11 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                         if key in surfaces:
                             return None
                         surfaces.add(key)
+                        surface_complete[key] = True
                         tty_device = v1_tty_device(surface.get("tty"))
                         if tty_device is None:
                             complete = False
+                            surface_complete[key] = False
                             continue
                         if not isinstance(surface.get("processes"), list):
                             return None
@@ -2108,6 +2176,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                             )
                         )
                         complete &= native_complete
+                        surface_complete[key] &= native_complete
                         for pid, process in nodes.items():
                             if time.monotonic() >= deadline:
                                 return {"clients": clients, "complete": False}
@@ -2116,6 +2185,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                                 isinstance(path, str) and path
                             ):
                                 complete = False
+                                surface_complete[key] = False
                                 continue
                             if pid in owners or pid in transports:
                                 continue
@@ -2129,6 +2199,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                             ):
                                 # A remote shell may hide a Herdr client.
                                 complete = False
+                                surface_complete[key] = False
                             if not (
                                 name == "herdr"
                                 or isinstance(path, str)
@@ -2137,6 +2208,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                                 continue
                             if type(process.get("tty_device")) is not int:
                                 complete = False
+                                surface_complete[key] = False
                                 continue
                             if process["tty_device"] != tty_device:
                                 continue
@@ -2165,6 +2237,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                             ]
                             if len(sockets) != 1:
                                 complete = False
+                                surface_complete[key] = False
                                 continue
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
@@ -2174,8 +2247,10 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                             )
                             if not inventory:
                                 complete = False
+                                surface_complete[key] = False
                                 continue
                             complete &= inventory["sources_complete"]
+                            surface_complete[key] &= inventory["sources_complete"]
                             clients.append(
                                 {
                                     "pid": pid,
@@ -2189,6 +2264,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
         return {
             "clients": clients,
             "complete": complete and time.monotonic() < deadline,
+            "surface_complete": surface_complete,
         }
     except (KeyError, TypeError, OSError, ValueError, AttributeError):
         return None
@@ -2397,7 +2473,33 @@ def v1_discover_clients(cfg):
             and len(stable) == len(before["clients"]) == len(after["clients"])
             and time.monotonic() < deadline
         )
-        return {"clients": stable, "complete": complete}
+        result = {"clients": stable, "complete": complete}
+        if "surface_complete" in before and "surface_complete" in after:
+            first, second = before["surface_complete"], after["surface_complete"]
+            surface_complete = {}
+            for key in set(first) | set(second):
+                if time.monotonic() >= deadline:
+                    return None
+                before_group = {
+                    identity(c): c
+                    for c in before["clients"]
+                    if (c["workspace"].casefold(), c["surface"].casefold()) == key
+                }
+                after_group = {
+                    identity(c): c
+                    for c in after["clients"]
+                    if (c["workspace"].casefold(), c["surface"].casefold()) == key
+                }
+                surface_complete[key] = bool(
+                    first.get(key) and second.get(key) and before_group == after_group
+                )
+            result["surface_complete"] = surface_complete
+            result["complete"] = (
+                complete
+                and set(first) == set(second)
+                and all(surface_complete.values())
+            )
+        return result
     except (OSError, ValueError, TypeError, RecursionError, subprocess.TimeoutExpired):
         return None
 
@@ -3402,8 +3504,8 @@ def reconcile_aggregate_notification(
     relevant = [
         item
         for item in notifications
-        if item.get("workspace_id") == workspace_id
-        and item.get("surface_id") == surface_id
+        if str(item.get("workspace_id", "")).casefold() == workspace_id.casefold()
+        and str(item.get("surface_id", "")).casefold() == surface_id.casefold()
     ]
     own = next((item for item in relevant if item.get("id") == notification_id), None)
     if not pending:
@@ -3474,7 +3576,7 @@ def unregister_v1_client(state, client_id):
 
 
 def reconcile_v1_supervised_bindings(
-    state, desired, ready, *, complete, supervisor_pid
+    state, desired, ready, *, complete, supervisor_pid, certified_surfaces=None
 ):
     """Apply prepared bindings without retiring unknown or unready sources.
 
@@ -3514,21 +3616,41 @@ def reconcile_v1_supervised_bindings(
         if existing != record:
             clients[client_id] = record
             changed = True
-    if complete:
+    if complete or certified_surfaces:
         groups = {}
         for key, spec in desired.items():
-            groups.setdefault((spec["workspace"], spec["surface"]), {})[key] = spec
+            groups.setdefault(
+                (spec["workspace"].casefold(), spec["surface"].casefold()), {}
+            )[key] = spec
         for client_id, client in list(clients.items()):
             target = (client.get("workspace"), client.get("surface"))
-            group = groups.get(target, {})
-            target_ready = bool(group) and all(
+            normalized = (
+                tuple(value.casefold() for value in target)
+                if all(isinstance(value, str) for value in target)
+                else None
+            )
+            group = groups.get(normalized, {})
+            target_ready = all(
                 ready.get(key) == spec and clients.get(key, {}).get("supervised")
                 for key, spec in group.items()
+            )
+            certified = (
+                bool(
+                    certified_surfaces
+                    and certified_surfaces.get(
+                        (target[0].casefold(), target[1].casefold()), False
+                    )
+                )
+                if all(isinstance(value, str) for value in target)
+                else False
             )
             if (
                 client.get("supervised")
                 and client_id not in desired
-                and (all_ready or target_ready)
+                and (
+                    (complete and (all_ready or (bool(group) and target_ready)))
+                    or (certified and target_ready)
+                )
             ):
                 del clients[client_id]
                 changed = True
@@ -3550,7 +3672,7 @@ class V1SupervisedLeases:
             self._leader = leader
         return True
 
-    def reconcile(self, desired, ready, *, complete):
+    def reconcile(self, desired, ready, *, complete, certified_surfaces=None):
         if not self.acquire_leader():
             return False
         newly_acquired = set()
@@ -3590,6 +3712,7 @@ class V1SupervisedLeases:
                     available,
                     complete=complete and not blocked,
                     supervisor_pid=os.getpid(),
+                    certified_surfaces=certified_surfaces if not blocked else None,
                 )
                 if changed:
                     save_state(state)
@@ -3830,19 +3953,34 @@ def v1_bindings_match_clients(clients, desired, *, exact=False):
     )
 
 
-def v1_verified_publication_targets(desired, ready):
+def v1_verified_publication_targets(desired, ready, certified=None):
     """Identify surfaces whose complete client membership is prepared."""
     groups = {}
     for client_id, spec in desired.items():
-        groups.setdefault((spec["workspace"], spec["surface"]), {})[client_id] = spec
+        groups.setdefault(
+            (spec["workspace"].casefold(), spec["surface"].casefold()), {}
+        )[client_id] = spec
+    if certified is not None:
+        existing_keys = {(w.casefold(), s.casefold()) for w, s in groups}
+        for target, complete in certified.items():
+            if complete and target not in existing_keys:
+                groups[target] = {}
     with state_lock():
         clients = load_state().get("v1", {}).get("clients", {})
     result = set()
     for target, group in groups.items():
+        if certified is not None and not certified.get(
+            (target[0].casefold(), target[1].casefold()), False
+        ):
+            continue
         existing = {
             key
             for key, client in clients.items()
-            if (client.get("workspace"), client.get("surface")) == target
+            if (
+                str(client.get("workspace", "")).casefold(),
+                str(client.get("surface", "")).casefold(),
+            )
+            == (target[0].casefold(), target[1].casefold())
         }
         if (
             existing == set(group)
@@ -3861,44 +3999,68 @@ class V1PublicationVerification:
         self._lock = threading.RLock()
         self._desired = {}
         self._complete = False
+        self._surfaces = None
 
-    def update(self, desired, *, complete):
+    def update(self, desired, *, complete, surface_complete=None):
         with self._lock:
-            self._desired = copy.deepcopy(desired) if complete else {}
+            self._desired = (
+                copy.deepcopy(desired)
+                if complete or surface_complete is not None
+                else {}
+            )
             self._complete = complete
+            self._surfaces = copy.deepcopy(surface_complete)
 
     def eligible(self):
         with self._lock:
             desired = self._desired
             ready = self._sources.current_ready(desired)
-            return v1_verified_publication_targets(desired, ready)
+            if self._surfaces is None:
+                return v1_verified_publication_targets(desired, ready)
+            return v1_verified_publication_targets(desired, ready, self._surfaces)
 
     def scope(self):
         with self._lock:
-            if not self._complete:
+            if not self._complete and self._surfaces is None:
                 return set()
             ready = self._sources.current_ready(self._desired)
             with state_lock():
                 clients = load_state().get("v1", {}).get("clients", {})
                 if (
-                    ready == self._desired
+                    self._complete
+                    and ready == self._desired
                     and set(clients) == set(self._desired)
                     and v1_bindings_match_clients(clients, self._desired, exact=True)
                 ):
                     return None
-            return v1_verified_publication_targets(self._desired, ready)
+            if self._surfaces is None:
+                return v1_verified_publication_targets(self._desired, ready)
+            return v1_verified_publication_targets(self._desired, ready, self._surfaces)
 
     def workspace_allowed(self, workspace):
         with self._lock:
-            if not self._complete:
+            if not self._complete and self._surfaces is None:
                 return False
             targets = {
-                (spec["workspace"], spec["surface"])
+                (spec["workspace"].casefold(), spec["surface"].casefold())
                 for spec in self._desired.values()
-                if spec["workspace"] == workspace
+                if spec["workspace"].casefold() == workspace.casefold()
             }
+            if self._surfaces is not None:
+                targets.update(
+                    key for key in self._surfaces if key[0] == workspace.casefold()
+                )
             scope = self.scope()
-            return scope is None or bool(targets) and targets.issubset(scope)
+            if self._surfaces is not None and any(
+                key[0] == workspace.casefold() and not complete
+                for key, complete in self._surfaces.items()
+            ):
+                return False
+            return (
+                scope is None
+                or bool(targets)
+                and targets.issubset({(w.casefold(), s.casefold()) for w, s in scope})
+            )
 
 
 def v1_reconcile_supervisor_inventory(inventory, sources, leases):
@@ -3907,7 +4069,10 @@ def v1_reconcile_supervisor_inventory(inventory, sources, leases):
         return False
     desired = v1_discovered_targets(inventory)
     ready = sources.reconcile(desired, complete=False)
-    changed = leases.reconcile(desired, ready, complete=inventory["complete"])
+    options = {"complete": inventory["complete"]}
+    if "surface_complete" in inventory:
+        options["certified_surfaces"] = inventory["surface_complete"]
+    changed = leases.reconcile(desired, ready, **options)
     if (
         inventory["complete"]
         and len(ready) == len(desired)
@@ -4474,7 +4639,11 @@ def v1_run_supervisor(cfg, stop):
                     v1_reconcile_supervisor_inventory(inventory, sources, leases)
                     desired = v1_discovered_targets(inventory)
                     ready = sources.reconcile(desired, complete=False)
-                    publisher_verified.update(desired, complete=inventory["complete"])
+                    publisher_verified.update(
+                        desired,
+                        complete=inventory["complete"],
+                        surface_complete=inventory.get("surface_complete"),
+                    )
                 else:
                     publisher_verified.update({}, complete=False)
                 try:
@@ -4552,8 +4721,8 @@ def find_v1_legacy_notification(state, source_ids, workspace, surface, notificat
         target = client.get("legacy_target") or {}
         if (
             source_id not in source_ids
-            or client.get("workspace") != workspace
-            or client.get("surface") != surface
+            or str(client.get("workspace", "")).casefold() != workspace.casefold()
+            or str(client.get("surface", "")).casefold() != surface.casefold()
             or "session" not in target
         ):
             continue
@@ -4586,8 +4755,8 @@ def find_v1_legacy_notification(state, source_ids, workspace, surface, notificat
     matches = [
         item.get("id")
         for item in notifications
-        if item.get("workspace_id") == workspace
-        and item.get("surface_id") == surface
+        if str(item.get("workspace_id", "")).casefold() == workspace.casefold()
+        and str(item.get("surface_id", "")).casefold() == surface.casefold()
         and item.get("subtitle") == NOTIFICATION_SUBTITLE
         and item.get("title") in expected
         and not item.get("is_read")
@@ -4610,8 +4779,59 @@ def reconcile_v1_destination(
         for pane_id, entry in sources.get(source_id, {}).get("attention", {}).items():
             attention[json.dumps([source_id, pane_id])] = entry
     destinations = v1.setdefault("destinations", {})
+    matching_keys = []
+    for key in destinations:
+        try:
+            w, s = json.loads(key)
+            if (
+                w.casefold() == workspace_id.casefold()
+                and s.casefold() == surface_id.casefold()
+            ):
+                matching_keys.append(key)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if len(matching_keys) > 1:
+        matching_keys.sort()
+        canonical = matching_keys[0]
+        owned_ids = {
+            destinations[key].get("notification_id") for key in matching_keys
+        } - {None, ""}
+        visible = [
+            item
+            for item in notifications
+            if item.get("id") in owned_ids
+            and str(item.get("workspace_id", "")).casefold() == workspace_id.casefold()
+            and str(item.get("surface_id", "")).casefold() == surface_id.casefold()
+        ]
+        chosen = next(
+            (item.get("id") for item in visible if not item.get("is_read")), None
+        )
+        chosen = (
+            chosen
+            or next((item.get("id") for item in visible), None)
+            or next(iter(sorted(owned_ids)), None)
+        )
+        for item in visible:
+            if item.get("id") != chosen and not item.get("is_read"):
+                if not is_current() or not cmux_cli(
+                    cfg, ["mark-notification-read", "--id", item["id"]]
+                ):
+                    return False
+                item["is_read"] = True
+        if not is_current():
+            return False
+        merged = destinations[canonical].copy()
+        if chosen:
+            merged["notification_id"] = chosen
+        for key in matching_keys:
+            destinations.pop(key)
+        destinations[canonical] = merged
+        matching_keys = [canonical]
     destination = destinations.setdefault(
-        v1_destination_key(workspace_id, surface_id), {}
+        matching_keys[0]
+        if matching_keys
+        else v1_destination_key(workspace_id, surface_id),
+        {},
     )
     notification_id = destination.get("notification_id")
     if not notification_id:
@@ -4650,8 +4870,8 @@ def retire_v1_destination(cfg, state, key, *, is_current=lambda: True):
             item
             for item in notifications
             if item.get("id") == destination.get("notification_id")
-            and item.get("workspace_id") == workspace
-            and item.get("surface_id") == surface
+            and str(item.get("workspace_id", "")).casefold() == workspace.casefold()
+            and str(item.get("surface_id", "")).casefold() == surface.casefold()
         ),
         None,
     )
@@ -4714,15 +4934,24 @@ def reconcile_v1_sidebar(cfg, state, workspaces, *, allowed=None, is_current=Non
     v1 = state.setdefault("v1", {})
     sources = v1.setdefault("sources", {})
     tracked = v1.setdefault("sidebar_keys", {})
+    aliases = {}
     for workspace in set(workspaces) | set(tracked):
-        if allowed is not None and workspace not in allowed:
+        aliases.setdefault(workspace.casefold(), set()).add(workspace)
+    for names in aliases.values():
+        workspace = sorted(names & set(tracked) or names)[0]
+        if allowed is not None and workspace.casefold() not in {
+            value.casefold() for value in allowed
+        }:
             continue
         if is_current is not None and not is_current(workspace):
             continue
         desired = set()
-        previous = set(tracked.get(workspace, []))
+        previous = {key for name in names for key in tracked.get(name, [])}
         interrupted = False
-        for source_id in sorted(workspaces.get(workspace, ())):
+        workspace_sources = {
+            source for name in names for source in workspaces.get(name, ())
+        }
+        for source_id in sorted(workspace_sources):
             source = sources.get(source_id, {})
             visible = sidebar_panes(
                 source.get("panes", {}), source.get("attention", {})
@@ -4762,6 +4991,8 @@ def reconcile_v1_sidebar(cfg, state, workspaces, *, allowed=None, is_current=Non
             tracked[workspace] = sorted(desired)
         else:
             tracked.pop(workspace, None)
+        for name in names - {workspace}:
+            tracked.pop(name, None)
 
 
 def v1_destination_inputs_current(snapshot, workspace, surface):
@@ -4772,7 +5003,8 @@ def v1_destination_inputs_current(snapshot, workspace, surface):
         clients = {
             key: value
             for key, value in v1.get("clients", {}).items()
-            if value.get("workspace") == workspace and value.get("surface") == surface
+            if str(value.get("workspace", "")).casefold() == workspace.casefold()
+            and str(value.get("surface", "")).casefold() == surface.casefold()
         }
         sources = {}
         for client in clients.values():
@@ -4787,11 +5019,18 @@ def v1_destination_inputs_current(snapshot, workspace, surface):
                 if isinstance(source, dict)
                 else source
             )
-        return (
-            clients,
-            sources,
-            v1.get("destinations", {}).get(v1_destination_key(workspace, surface)),
-        )
+        destinations = {}
+        for key, value in v1.get("destinations", {}).items():
+            try:
+                w, s = json.loads(key)
+                if (
+                    w.casefold() == workspace.casefold()
+                    and s.casefold() == surface.casefold()
+                ):
+                    destinations[key] = value
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return clients, sources, destinations
 
     with state_lock():
         return relevant(snapshot) == relevant(load_state())
@@ -4835,7 +5074,7 @@ def v1_workspace_inputs_current(snapshot, workspace):
         clients = {
             key: value
             for key, value in clients.items()
-            if value.get("workspace") == workspace
+            if str(value.get("workspace", "")).casefold() == workspace.casefold()
         }
         return clients, {
             client.get("source"): sources.get(client.get("source"))
@@ -4856,30 +5095,45 @@ def publish_v1_clients_once(
     baseline = copy.deepcopy(state.get("v1", {}))
     inputs = v1_publication_inputs(state)
     destinations = {}
+    target_names = {}
     for client in state.get("v1", {}).get("clients", {}).values():
         workspace = client.get("workspace")
         surface = client.get("surface")
         source = client.get("source")
         if workspace and surface and source:
-            destinations.setdefault((workspace, surface), set()).add(source)
+            normalized = (workspace.casefold(), surface.casefold())
+            target = target_names.setdefault(normalized, (workspace, surface))
+            destinations.setdefault(target, set()).add(source)
     workspaces = {}
     for (workspace, _surface), sources in destinations.items():
         workspaces.setdefault(workspace, set()).update(sources)
+
+    def includes(scope, target):
+        return any(
+            w.casefold() == target[0].casefold()
+            and s.casefold() == target[1].casefold()
+            for w, s in scope
+        )
 
     def permitted(target):
         if eligibility_check is None:
             return True
         current_scope = eligibility_check()
-        return current_scope is None or target in current_scope
+        return current_scope is None or includes(current_scope, target)
 
     def workspace_permitted(workspace):
         if workspace_check is not None and not workspace_check(workspace):
             return False
-        targets = [target for target in destinations if target[0] == workspace]
+        targets = [
+            target
+            for target in destinations
+            if target[0].casefold() == workspace.casefold()
+        ]
         if (
             not targets
             and eligibility_check is not None
             and eligibility_check() is not None
+            and workspace_check is None
         ):
             return False
         return all(
@@ -4900,13 +5154,16 @@ def publish_v1_clients_once(
                 )
             reconcile_v1_sidebar(cfg, state, workspaces, is_current=workspace_permitted)
     else:
+        for workspace, _surface in eligible_destinations:
+            if not any(w.casefold() == workspace.casefold() for w in workspaces):
+                workspaces[workspace] = set()
         allowed = {
             workspace
             for workspace in workspaces
             if all(
-                target in eligible_destinations
+                includes(eligible_destinations, target)
                 for target in destinations
-                if target[0] == workspace
+                if target[0].casefold() == workspace.casefold()
             )
         }
         reconcile_v1_sidebar(
@@ -4917,9 +5174,8 @@ def publish_v1_clients_once(
             **({"is_current": workspace_permitted} if eligibility_check else {}),
         )
     for (workspace, surface), sources in destinations.items():
-        if (
-            eligible_destinations is not None
-            and (workspace, surface) not in eligible_destinations
+        if eligible_destinations is not None and not includes(
+            eligible_destinations, (workspace, surface)
         ):
             continue
         reconcile_v1_destination(
@@ -4934,27 +5190,29 @@ def publish_v1_clients_once(
             ),
         )
     active = {
-        v1_destination_key(workspace, surface) for workspace, surface in destinations
+        (workspace.casefold(), surface.casefold())
+        for workspace, surface in destinations
     }
     for key in list(state.get("v1", {}).get("destinations", {})):
-        if (
-            eligible_destinations is None
-            and key not in active
-            and (eligibility_check is None or eligibility_check() is None)
-        ):
-            try:
-                workspace, surface = json.loads(key)
-            except (TypeError, ValueError):
+        try:
+            workspace, surface = json.loads(key)
+            if (workspace.casefold(), surface.casefold()) in active:
                 continue
-            retire_v1_destination(
-                cfg,
-                state,
-                key,
-                is_current=lambda workspace=workspace, surface=surface: (
-                    (eligibility_check is None or eligibility_check() is None)
-                    and v1_destination_inputs_current(state, workspace, surface)
-                ),
-            )
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if eligible_destinations is not None and not includes(
+            eligible_destinations, (workspace, surface)
+        ):
+            continue
+        retire_v1_destination(
+            cfg,
+            state,
+            key,
+            is_current=lambda workspace=workspace, surface=surface: (
+                permitted((workspace, surface))
+                and v1_destination_inputs_current(state, workspace, surface)
+            ),
+        )
     with state_lock():
         current = load_state()
         live_v1 = current.setdefault("v1", {})
