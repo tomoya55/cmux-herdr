@@ -807,6 +807,8 @@ def force_acknowledge_attention(attention, pane_id, episode):
         "provisional",
         "observed_changes",
         "predicted_sequence",
+        "release_provenance_seq",
+        "released_completion_seq",
     ):
         if key in current:
             attention[pane_id][key] = current[key]
@@ -1116,6 +1118,44 @@ def v1_reconcile_absent_agents(
         }
 
 
+def v1_preserve_released_completion(
+    source, pane_id, terminal, sequence, released, boot
+):
+    """Advance a watermark only for an already known, exact released completion."""
+    generation = source.get("cursor_generation")
+    entry = source.get("attention", {}).get(pane_id, {})
+    if (
+        not boot
+        or source.get("server_boot_id") != boot
+        or not isinstance(generation, str)
+        or not generation
+        or not isinstance(terminal, str)
+        or not terminal
+        or type(sequence) is not int
+        or not 0 <= sequence <= 0xFFFFFFFFFFFFFFFF
+        or type(released) is not int
+        or not 0 <= released <= sequence
+        or entry.get("generation") != generation
+        or entry.get("terminal_id") != terminal
+        or type(entry.get("sequence")) is not int
+        or entry["sequence"] > sequence
+    ):
+        return False
+    episode = f"{generation}:{terminal}:{released}"
+    pending = (
+        entry.get("status") == "done" and v1_completion_sequence(entry) == released
+    )
+    acknowledged = entry.get("acknowledged") == episode
+    if not pending and not acknowledged:
+        return False
+    if pending:
+        entry["completion_sequence"] = released
+    entry["release_provenance_seq"] = released
+    entry["sequence"] = sequence
+    source["event_cursor"] = max(source.get("event_cursor", 0), sequence)
+    return True
+
+
 def apply_v1_status_event(state, source_id, data, event_boot=None):
     """Apply a status event in stream order without collapsing quick transitions."""
     source = state.get("v1", {}).get("sources", {}).get(source_id)
@@ -1144,6 +1184,15 @@ def apply_v1_status_event(state, source_id, data, event_boot=None):
             or not source.get("cursor_generation")
         ):
             return False
+        released = data.get("released_completion_seq")
+        if released is not None and status in ("done", "idle", "unknown"):
+            if v1_preserve_released_completion(
+                source, pane_id, terminal, sequence, released, event_boot
+            ):
+                pane["status"] = status
+                return True
+            if data.get("completion_seq") != sequence or released != sequence:
+                return False
         retired = source.get("retired_blocked", {}).get(pane_id, {})
         if (
             status == "blocked"
@@ -1157,6 +1206,41 @@ def apply_v1_status_event(state, source_id, data, event_boot=None):
         if type(watermark) is int and sequence <= watermark:
             generation = source["cursor_generation"]
             episode = f"{generation}:{terminal}:{sequence}"
+            if sequence == watermark and released is None:
+                current.pop("released_completion_seq", None)
+                if (
+                    current.get("status") == "done"
+                    and "release_provenance_seq" in current
+                    and type(v1_completion_sequence(current)) is int
+                    and v1_completion_sequence(current) < watermark
+                ):
+                    attention[pane_id] = current = {
+                        "sequence": watermark,
+                        "generation": generation,
+                        "terminal_id": terminal,
+                    }
+                current.pop("release_provenance_seq", None)
+            if (
+                sequence < watermark
+                and status in ("done", "idle")
+                and data.get("completion_seq") == sequence
+                and current.get("released_completion_seq") == sequence
+                and current.get("generation") == generation
+                and current.get("terminal_id") == terminal
+                and current.get("status") not in ATTENTION_STATUSES
+                and current.get("acknowledged") != episode
+            ):
+                attention[pane_id] = {
+                    "status": "done",
+                    "episode": episode,
+                    "sequence": watermark,
+                    "completion_sequence": sequence,
+                    "release_provenance_seq": sequence,
+                    "generation": generation,
+                    "terminal_id": terminal,
+                    "server_boot_id": event_boot,
+                }
+                return True
             if (
                 sequence == watermark
                 and status in ("idle", "done")
@@ -1182,6 +1266,22 @@ def apply_v1_status_event(state, source_id, data, event_boot=None):
             ):
                 pane["status"] = status
             return True
+        current.pop("released_completion_seq", None)
+        if (
+            released is None
+            and current.get("status") == "done"
+            and "release_provenance_seq" in current
+            and type(v1_completion_sequence(current)) is int
+            and type(watermark) is int
+            and v1_completion_sequence(current) < watermark
+        ):
+            attention[pane_id] = {
+                "sequence": watermark,
+                "generation": source["cursor_generation"],
+                "terminal_id": terminal,
+            }
+        elif released is None:
+            current.pop("release_provenance_seq", None)
         generation = source["cursor_generation"]
         episode = f"{generation}:{terminal}:{sequence}"
         effective_status = (
@@ -1252,6 +1352,17 @@ def apply_v1_ack_event(state, source_id, data):
     token = (pane.get("tokens") or {}).get("cmux_herdr_ack")
     if not source or not isinstance(token, str) or not token:
         return False
+    entry = source.get("attention", {}).get(pane.get("pane_id"), {})
+    released = entry.get("released_completion_seq")
+    if (
+        type(released) is int
+        and entry.get("generation") == source.get("cursor_generation")
+        and entry.get("terminal_id") == pane.get("terminal_id")
+        and token == f"{entry['generation']}:{entry['terminal_id']}:{released}"
+        and entry.get("status") not in ATTENTION_STATUSES
+    ):
+        entry["acknowledged"] = token
+        return True
     return force_acknowledge_attention(
         source.get("attention", {}), pane.get("pane_id"), token
     )
@@ -2088,12 +2199,11 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
             agent.get("agent_status") not in ("done", "idle")
             or agent.get("terminal_id") != terminal
             or type(agent.get("state_change_seq")) is not int
-            or agent["state_change_seq"] != sequence
             or type(observation.get("agent_state_change_seq")) is not int
-            or observation["agent_state_change_seq"] != sequence
+            or observation["agent_state_change_seq"] != agent["state_change_seq"]
         ):
             return None
-    else:
+    if not matches or matches[0]["state_change_seq"] != sequence:
         panes = snapshot.get("panes")
         presented = observation.get("pane_state")
         if not isinstance(panes, list) or any(not isinstance(p, dict) for p in panes):
@@ -2104,8 +2214,8 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
         pane = pane_matches[0]
         release_sequence = pane.get("state_change_seq")
         if (
-            observation.get("agent_state_change_seq") is not None
-            or presented.get("agent_present") is not False
+            (not matches and observation.get("agent_state_change_seq") is not None)
+            or presented.get("agent_present") is not bool(matches)
             or pane.get("terminal_id") != terminal
             or presented.get("terminal_id") != terminal
             or type(release_sequence) is not int
@@ -2114,6 +2224,8 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
             or presented["released_completion_seq"] != sequence
             or type(presented.get("state_change_seq")) is not int
             or presented["state_change_seq"] != release_sequence
+            or (matches and matches[0]["state_change_seq"] != release_sequence)
+            or (matches and pane.get("released_completion_seq") != sequence)
         ):
             return None
     episode = f"{generation}:{terminal}:{sequence}"
@@ -2230,8 +2342,84 @@ def v1_force_read_action():
         return False
 
 
+class V1SnapshotRace(ValueError):
+    """A transient release raced with snapshot collection."""
+
+
+def v1_preserve_stable_snapshot_releases(
+    source, generation, boot, before, panes, after
+):
+    """Preserve release provenance only when all snapshots agree on the same pane."""
+    same_source = (
+        source.get("cursor_generation") == generation
+        and source.get("server_boot_id") == boot
+    )
+    collections = (before.get("panes"), panes, after.get("panes"))
+    indexed = []
+    for items in collections:
+        if not isinstance(items, list):
+            return {}
+        mapping = {}
+        for pane in items:
+            if not isinstance(pane, dict) or not isinstance(pane.get("pane_id"), str):
+                return {}
+            if pane["pane_id"] in mapping:
+                return {}
+            mapping[pane["pane_id"]] = pane
+        indexed.append(mapping)
+    for pane_id in set().union(*(mapping.keys() for mapping in indexed)):
+        records = [mapping.get(pane_id) for mapping in indexed]
+        if any(
+            isinstance(record, dict)
+            and record.get("released_completion_seq") is not None
+            for record in records
+        ):
+            identity = ("terminal_id", "state_change_seq", "released_completion_seq")
+            if any(not isinstance(record, dict) for record in records) or any(
+                any(record.get(key) != records[0].get(key) for key in identity)
+                for record in records[1:]
+            ):
+                raise V1SnapshotRace("Herdr release changed during snapshot")
+    releases = {}
+    for pane_id, pane in indexed[1].items():
+        records = [mapping.get(pane_id) for mapping in indexed]
+        if any(not isinstance(record, dict) for record in records):
+            continue
+        terminal = pane.get("terminal_id")
+        sequence = pane.get("state_change_seq")
+        released = pane.get("released_completion_seq")
+        if (
+            not isinstance(terminal, str)
+            or not terminal
+            or type(sequence) is not int
+            or type(released) is not int
+            or not 0 <= released <= sequence <= 0xFFFFFFFFFFFFFFFF
+        ):
+            continue
+        if any(
+            record.get("terminal_id") != terminal
+            or record.get("state_change_seq") != sequence
+            or record.get("released_completion_seq") != released
+            or record.get("agent_status") not in ("done", "idle", "unknown")
+            for record in records
+        ):
+            continue
+        preserved = same_source and v1_preserve_released_completion(
+            source, pane_id, terminal, sequence, released, boot
+        )
+        releases[pane_id] = (terminal, sequence, released, preserved)
+    return releases
+
+
 def refresh_v1_source(
-    state, source_id, generation, socket_path, *, reconnect=False, expected_boot=None
+    state,
+    source_id,
+    generation,
+    socket_path,
+    *,
+    reconnect=False,
+    expected_boot=None,
+    retry_snapshot_race=False,
 ):
     """Refresh only after both Herdr snapshots have been obtained successfully."""
     try:
@@ -2275,6 +2463,33 @@ def refresh_v1_source(
             if verified_boot
             else generation
         )
+        if verified_boot:
+            source = candidate.get("v1", {}).get("sources", {}).get(source_id, {})
+            releases = v1_preserve_stable_snapshot_releases(
+                source, episode_generation, before_boot, before, panes, after
+            )
+            adjusted = []
+            for agent in agents:
+                release = releases.get(agent.get("pane_id"))
+                if (
+                    release
+                    and not release[3]
+                    and agent.get("terminal_id") == release[0]
+                    and agent.get("state_change_seq") == release[1]
+                    and agent.get("agent_status") == "done"
+                    and agent.get("completion_seq") != release[1]
+                ):
+                    entry = source.get("attention", {}).get(agent["pane_id"], {})
+                    if (
+                        entry.get("generation") == episode_generation
+                        and entry.get("terminal_id") == release[0]
+                        and type(entry.get("sequence")) is int
+                        and entry["sequence"] <= release[1]
+                    ):
+                        source["attention"].pop(agent["pane_id"], None)
+                    agent = {**agent, "agent_status": "idle"}
+                adjusted.append(agent)
+            agents = adjusted
         apply_v1_snapshot(
             candidate,
             source_id,
@@ -2289,6 +2504,97 @@ def refresh_v1_source(
             v1_reconcile_absent_agents(
                 candidate, source_id, episode_generation, before, agents, panes, after
             )
+            source = candidate["v1"]["sources"][source_id]
+            for pane in panes:
+                pane_id = pane["pane_id"]
+                entry = source.get("attention", {}).get(pane_id, {})
+                if (
+                    "released_completion_seq" not in entry
+                    and "release_provenance_seq" not in entry
+                    or pane_id in releases
+                ):
+                    continue
+                records = [
+                    [
+                        item
+                        for item in snapshot.get("panes", [])
+                        if isinstance(item, dict) and item.get("pane_id") == pane_id
+                    ]
+                    for snapshot in (before, after)
+                ]
+                sequence = pane.get("state_change_seq")
+                terminal = pane.get("terminal_id")
+                if (
+                    entry.get("generation") == episode_generation
+                    and entry.get("terminal_id") == terminal
+                    and type(entry.get("sequence")) is int
+                    and type(sequence) is int
+                    and entry["sequence"] <= sequence <= 0xFFFFFFFFFFFFFFFF
+                    and pane.get("released_completion_seq") is None
+                    and all(
+                        len(matches) == 1
+                        and matches[0].get("terminal_id") == terminal
+                        and matches[0].get("state_change_seq") == sequence
+                        and matches[0].get("released_completion_seq") is None
+                        for matches in records
+                    )
+                ):
+                    entry.pop("released_completion_seq", None)
+                    entry.pop("release_provenance_seq", None)
+                    entry["sequence"] = sequence
+                    if (
+                        entry.get("status") == "done"
+                        and type(v1_completion_sequence(entry)) is int
+                        and v1_completion_sequence(entry) < sequence
+                    ):
+                        source["attention"][pane_id] = {
+                            "sequence": sequence,
+                            "generation": episode_generation,
+                            "terminal_id": terminal,
+                        }
+            for pane_id, (terminal, sequence, released, preserved) in releases.items():
+                entry = source.get("attention", {}).get(pane_id, {})
+                tracked = source.get("panes", {}).get(pane_id, {})
+                if (
+                    not preserved
+                    and not entry
+                    and tracked.get("terminal_id") == terminal
+                ):
+                    entry = source.setdefault("attention", {}).setdefault(
+                        pane_id,
+                        {
+                            "generation": episode_generation,
+                            "terminal_id": terminal,
+                            "sequence": sequence,
+                        },
+                    )
+                if (
+                    not preserved
+                    and entry.get("status") == "blocked"
+                    and entry.get("generation") == episode_generation
+                    and entry.get("terminal_id") == terminal
+                    and type(entry.get("sequence")) is int
+                    and entry["sequence"] <= sequence
+                ):
+                    entry = {
+                        "generation": episode_generation,
+                        "terminal_id": terminal,
+                        "sequence": sequence,
+                    }
+                    source["attention"][pane_id] = entry
+                if (
+                    not preserved
+                    and entry.get("generation") == episode_generation
+                    and entry.get("terminal_id") == terminal
+                    and type(entry.get("sequence")) is int
+                    and entry["sequence"] <= sequence
+                    and entry.get("status") not in ATTENTION_STATUSES
+                ):
+                    entry["sequence"] = sequence
+                    entry["released_completion_seq"] = released
+                    entry["release_provenance_seq"] = released
+                    pane = next((p for p in panes if p.get("pane_id") == pane_id), {})
+                    apply_v1_ack_event(candidate, source_id, {"pane": pane})
         if verified_boot:
             candidate["v1"]["sources"][source_id]["server_boot_id"] = before_boot
         else:
@@ -2337,13 +2643,23 @@ def refresh_v1_source(
         state.clear()
         state.update(candidate)
         return True
+    except V1SnapshotRace:
+        if retry_snapshot_race:
+            raise
+        return False
     except (SocketError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         log(f"v1 source refresh failed: {e}")
         return False
 
 
 def sync_v1_source(
-    source_id, generation, socket_path, *, reset_predictions=False, expected_boot=None
+    source_id,
+    generation,
+    socket_path,
+    *,
+    reset_predictions=False,
+    expected_boot=None,
+    retry_snapshot_race=False,
 ):
     """Serialize a successful source refresh with other plugin state updates."""
     with state_lock():
@@ -2361,6 +2677,7 @@ def sync_v1_source(
             socket_path,
             reconnect=reset_predictions,
             expected_boot=expected_boot,
+            retry_snapshot_race=retry_snapshot_race,
         ):
             return False
         save_state(state)
@@ -5467,9 +5784,21 @@ def v1_watch_connection(
         sync_options = (
             {"expected_boot": expected_boot} if expected_boot is not None else {}
         )
-        if not sync_v1_source(
-            source_id, generation, sock_path, reset_predictions=True, **sync_options
-        ):
+
+        def sync_with_retry(**options):
+            while True:
+                try:
+                    return sync_v1_source(
+                        source_id,
+                        generation,
+                        sock_path,
+                        retry_snapshot_race=True,
+                        **options,
+                    )
+                except V1SnapshotRace:
+                    time.sleep(0.05)
+
+        if not sync_with_retry(reset_predictions=True, **sync_options):
             raise SocketError("Herdr snapshot failed after subscription")
         if event_boot and not v1_subscription_matches_source(source_id, event_boot):
             raise SocketError("Herdr subscription server changed")
@@ -5489,9 +5818,7 @@ def v1_watch_connection(
                 data = msg.get("data") or {}
                 updated = persist_v1_status_event(source_id, data, event_boot)
                 if not updated or data.get("agent_status") == "done":
-                    if not sync_v1_source(
-                        source_id, generation, sock_path, **sync_options
-                    ):
+                    if not sync_with_retry(**sync_options):
                         raise SocketError("Herdr snapshot failed after status event")
                     if event_boot and not v1_subscription_matches_source(
                         source_id, event_boot
@@ -5506,7 +5833,7 @@ def v1_watch_connection(
                 ):
                     on_change()
             elif event == "pane_agent_detected":
-                if not sync_v1_source(source_id, generation, sock_path, **sync_options):
+                if not sync_with_retry(**sync_options):
                     raise SocketError(
                         "Herdr snapshot failed after agent lifecycle event"
                     )
