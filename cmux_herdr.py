@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import contextvars
 import copy
 import ctypes
@@ -8,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import pwd
 import re
 import select
 import selectors
@@ -22,7 +24,7 @@ import threading
 import time
 import tomllib
 import uuid
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from pathlib import Path
 
 ATTENTION_STATUSES = {"blocked", "done"}
@@ -61,6 +63,13 @@ REMOTE_ERROR_BACKOFF_SECONDS = 10.0
 # SSH forwards after this point (the main thread is tearing them down).
 DAEMON_SHUTDOWN = threading.Event()
 LEGACY_REPLAY_CONTEXT = contextvars.ContextVar("legacy_replay_context", default=None)
+OWNED_PUBLISHER_DIRECTORY = contextvars.ContextVar(
+    "owned_publisher_directory", default=None
+)
+OWNED_PUBLISHER_IDENTITY = contextvars.ContextVar(
+    "owned_publisher_identity", default=None
+)
+ACTIVATION_DIRECTORY = contextvars.ContextVar("activation_directory", default=None)
 
 state_dir = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", "."))
 config_dir = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "."))
@@ -138,6 +147,487 @@ def save_state(state):
     tmp.replace(STATE_PATH)
 
 
+def v1_publisher_identity(path, store_id, *, create):
+    """Pin a producer to one store; creating an identity must be explicit."""
+    path = Path(path)
+    store_id = str(uuid.UUID(store_id))
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        _v1_check_publisher_directory(info)
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("invalid publisher directory")
+        with _v1_publisher_lock(directory_fd, path.name):
+            return _v1_publisher_identity_at(
+                path, directory_fd, store_id, create=create
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def _v1_check_publisher_directory(info):
+    expected = OWNED_PUBLISHER_DIRECTORY.get()
+    if expected is not None and expected != (info.st_dev, info.st_ino):
+        raise ValueError("publisher lease directory changed")
+
+
+@contextmanager
+def _v1_publisher_lock(directory_fd, name):
+    lock_fd = os.open(
+        f".{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600, dir_fd=directory_fd,
+    )
+    try:
+        info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise ValueError("invalid publisher lock")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(lock_fd)
+
+
+def _v1_publisher_identity_at(path, directory_fd, store_id, *, create):
+    if create:
+        identity = {
+            "store_id": store_id,
+            "producer": str(uuid.uuid4()),
+            "epoch": str(uuid.uuid4()),
+            "capability": base64.b64encode(os.urandom(32)).decode("ascii"),
+            "phase": "bootstrap",
+            "revision": "0",
+            "destinations": [],
+            "pending": None,
+        }
+        temporary = f".publisher-{uuid.uuid4()}"
+        fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=directory_fd,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(identity, file, separators=(",", ":"))
+                file.flush()
+                os.fsync(file.fileno())
+            os.link(
+                temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+            )
+            os.fsync(directory_fd)
+        finally:
+            os.unlink(temporary, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+    fd = os.open(
+        path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+    )
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or info.st_size > 10 * 1024 * 1024
+        ):
+            raise ValueError("invalid publisher identity file")
+        data = os.read(fd, 10 * 1024 * 1024 + 1)
+        if len(data) > 10 * 1024 * 1024:
+            raise ValueError("invalid publisher identity file")
+        identity = json.loads(data)
+    finally:
+        os.close(fd)
+    if not isinstance(identity, dict) or set(identity) != {
+        "store_id", "producer", "epoch", "capability", "phase", "revision",
+        "destinations", "pending"
+    }:
+        raise ValueError("invalid publisher identity")
+    if not all(isinstance(identity[key], str) for key in (
+        "store_id", "producer", "epoch", "capability", "phase", "revision"
+    )):
+        raise ValueError("invalid publisher identity")
+    if identity["phase"] not in {"bootstrap", "active"} or not isinstance(
+        identity["destinations"], list
+    ) or not (identity["pending"] is None or isinstance(identity["pending"], str)):
+        raise ValueError("invalid publisher journal")
+    try:
+        revision = int(identity["revision"])
+    except ValueError as exc:
+        raise ValueError("invalid publisher revision") from exc
+    if str(revision) != identity["revision"] or not 0 <= revision < 2**64:
+        raise ValueError("invalid publisher revision")
+    try:
+        if str(uuid.UUID(identity["store_id"])) != store_id:
+            raise ValueError("publisher store identity changed")
+        uuid.UUID(identity["producer"])
+        uuid.UUID(identity["epoch"])
+        expected_producer = OWNED_PUBLISHER_IDENTITY.get()
+        if expected_producer is not None and (
+            str(uuid.UUID(identity["producer"])) != expected_producer
+        ):
+            raise ValueError("publisher identity changed")
+        if len(base64.b64decode(identity["capability"], validate=True)) != 32:
+            raise ValueError("invalid publisher capability")
+    except (TypeError, KeyError) as exc:
+        raise ValueError("invalid publisher identity") from exc
+    try:
+        v1_owned_set_request(identity, revision, identity["destinations"])
+        if identity["pending"] is not None:
+            if len(identity["pending"].encode("utf-8")) > 3 * 1024 * 1024:
+                raise ValueError("pending request exceeds size limit")
+            saved = json.loads(identity["pending"])
+            if not isinstance(saved, dict):
+                raise ValueError("invalid pending request")
+            if identity["phase"] == "bootstrap":
+                expected = v1_owned_register_request(identity)
+            elif saved.get("action") == "resume":
+                expected = v1_owned_resume_request(identity, saved["request_id"])
+            else:
+                expected = v1_owned_set_request(
+                    identity, revision + 1, saved["destinations"]
+                )
+            if saved != expected:
+                raise ValueError("invalid pending request")
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid publisher journal") from exc
+    os.fsync(directory_fd)
+    pinned = os.fstat(directory_fd)
+    current = os.stat(path.parent, follow_symlinks=False)
+    if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+        raise ValueError("publisher directory changed")
+    return identity
+
+
+def v1_owned_set_request(identity, revision, destinations):
+    """Build a complete producer-owned notification state request."""
+    if type(revision) is not int or not 0 <= revision < 2**64:
+        raise ValueError("invalid notification revision")
+    if not isinstance(destinations, list) or len(destinations) > 256:
+        raise ValueError("invalid notification destinations")
+    seen = set()
+    for destination in destinations:
+        if not isinstance(destination, dict) or set(destination) != {
+            "workspace_id", "surface_id", "title", "body"
+        } or not all(isinstance(value, str) for value in destination.values()):
+            raise ValueError("invalid notification destination")
+        try:
+            key = (
+                uuid.UUID(destination["workspace_id"]),
+                uuid.UUID(destination["surface_id"]),
+            )
+        except ValueError as exc:
+            raise ValueError("invalid notification target") from exc
+        if (
+            key in seen
+            or len(destination["title"].encode()) > 1024
+            or len(destination["body"].encode()) > 8192
+        ):
+            raise ValueError("invalid notification destination")
+        seen.add(key)
+    request = {
+        **{
+            key: str(uuid.UUID(identity[key])) if key != "capability" else identity[key]
+            for key in ("store_id", "producer", "epoch", "capability")
+        },
+        "action": "set",
+        "revision": str(revision),
+        "destinations": copy.deepcopy(destinations),
+    }
+    for destination in request["destinations"]:
+        for key in ("workspace_id", "surface_id"):
+            destination[key] = str(uuid.UUID(destination[key]))
+    encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > 3 * 1024 * 1024:
+        raise ValueError("notification request exceeds size limit")
+    return request
+
+
+def v1_owned_register_request(identity):
+    return {
+        **{
+            key: str(uuid.UUID(identity[key])) if key != "capability" else identity[key]
+            for key in ("store_id", "producer", "epoch", "capability")
+        },
+        "action": "register",
+    }
+
+
+def v1_owned_resume_request(identity, request_id):
+    return {
+        **{
+            key: str(uuid.UUID(identity[key])) if key != "capability" else identity[key]
+            for key in ("store_id", "producer", "capability")
+        },
+        "action": "resume",
+        "expected_epoch": str(uuid.UUID(identity["epoch"])),
+        "request_id": str(uuid.UUID(request_id)),
+    }
+
+
+@contextmanager
+def _v1_locked_publisher_journal(path, store_id):
+    path = Path(path)
+    store_id = str(uuid.UUID(store_id))
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        _v1_check_publisher_directory(info)
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("invalid publisher directory")
+        with _v1_publisher_lock(directory_fd, path.name):
+            journal = _v1_publisher_identity_at(
+                path, directory_fd, store_id, create=False
+            )
+            yield path, directory_fd, info, journal
+    finally:
+        os.close(directory_fd)
+
+
+def v1_publisher_prepare_register(path, store_id):
+    """Persist registration before the first network attempt."""
+    with _v1_locked_publisher_journal(path, store_id) as (path, fd, info, journal):
+        if journal["phase"] != "bootstrap":
+            raise ValueError("publisher is already registered")
+        if journal["pending"] is not None:
+            return journal["pending"].encode("utf-8")
+        pending = json.dumps(
+            v1_owned_register_request(journal), separators=(",", ":")
+        ).encode("utf-8")
+        journal["pending"] = pending.decode("utf-8")
+        _v1_write_publisher_journal(path, fd, info, journal)
+        return pending
+
+
+def v1_publisher_ack_register(path, store_id, pending):
+    with _v1_locked_publisher_journal(path, store_id) as (path, fd, info, journal):
+        if (
+            journal["phase"] != "bootstrap" or journal["pending"] is None
+            or journal["pending"].encode("utf-8") != pending
+        ):
+            raise ValueError("pending publisher request changed")
+        journal["phase"] = "active"
+        journal["pending"] = None
+        _v1_write_publisher_journal(path, fd, info, journal)
+
+
+def v1_publisher_prepare_resume(path, store_id, *, expected_epoch, rejected_set=None):
+    """Durably record the takeover request ID before contacting cmux."""
+    with _v1_locked_publisher_journal(path, store_id) as (path, fd, info, journal):
+        if journal["phase"] != "active":
+            raise ValueError("publisher is not active")
+        if str(uuid.UUID(expected_epoch)) != str(uuid.UUID(journal["epoch"])):
+            raise ValueError("publisher writer epoch changed")
+        if journal["pending"] is not None:
+            pending = journal["pending"].encode("utf-8")
+            action = json.loads(pending).get("action")
+            if action == "resume":
+                return pending
+            if action != "set" or pending != rejected_set:
+                raise ValueError("another publisher request is pending")
+        pending = json.dumps(
+            v1_owned_resume_request(journal, str(uuid.uuid4())), separators=(",", ":")
+        ).encode("utf-8")
+        journal["pending"] = pending.decode("utf-8")
+        _v1_write_publisher_journal(path, fd, info, journal)
+        return pending
+
+
+def _v1_validate_resumed_state(journal, state):
+    if not isinstance(state, dict) or set(state) != {
+        "epoch", "revision", "destinations"
+    }:
+        raise ValueError("invalid resumed state")
+    try:
+        new_epoch = str(uuid.UUID(state["epoch"]))
+        revision = int(state["revision"])
+        if (
+            not isinstance(state["revision"], str)
+            or str(revision) != state["revision"]
+            or revision != 0
+        ):
+            raise ValueError("invalid resumed revision")
+        v1_owned_set_request(journal, revision, state["destinations"])
+        if new_epoch == str(uuid.UUID(journal["epoch"])):
+            raise ValueError("writer epoch did not change")
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        raise ValueError("invalid resumed state") from exc
+    return {"epoch": new_epoch, "revision": str(revision),
+            "destinations": copy.deepcopy(state["destinations"])}
+
+
+def v1_publisher_ack_resume(path, store_id, pending, state):
+    """Persist the fenced writer epoch and acknowledged state together."""
+    with _v1_locked_publisher_journal(path, store_id) as (path, fd, info, journal):
+        if (
+            journal["phase"] != "active" or journal["pending"] is None
+            or journal["pending"].encode("utf-8") != pending
+            or json.loads(pending).get("action") != "resume"
+        ):
+            raise ValueError("pending publisher request changed")
+        journal.update(_v1_validate_resumed_state(journal, state))
+        journal["pending"] = None
+        _v1_write_publisher_journal(path, fd, info, journal)
+
+
+def v1_publisher_prepare_set(path, store_id, destinations, *, expected_epoch):
+    """Persist one exact request before returning bytes that may be transmitted."""
+    path = Path(path)
+    store_id = str(uuid.UUID(store_id))
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        _v1_check_publisher_directory(info)
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("invalid publisher directory")
+        lock_fd = os.open(
+            f".{path.name}.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            lock_info = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != os.getuid()
+                or lock_info.st_mode & 0o077
+            ):
+                raise ValueError("invalid publisher lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            journal = _v1_publisher_identity_at(
+                path, directory_fd, store_id, create=False
+            )
+            if journal["phase"] != "active":
+                raise ValueError("publisher is not active")
+            if str(uuid.UUID(expected_epoch)) != str(uuid.UUID(journal["epoch"])):
+                raise ValueError("publisher writer epoch changed")
+            if journal["pending"] is not None:
+                pending = journal["pending"].encode("utf-8")
+                saved = json.loads(pending)
+                if saved.get("action") != "set":
+                    raise ValueError("another publisher request is pending")
+                expected = v1_owned_set_request(
+                    journal, int(journal["revision"]) + 1, saved["destinations"]
+                )
+                if saved != expected or len(pending) > 3 * 1024 * 1024:
+                    raise ValueError("invalid pending publisher request")
+                return pending
+            request = v1_owned_set_request(
+                journal, int(journal["revision"]) + 1, destinations
+            )
+            pending = json.dumps(request, separators=(",", ":")).encode("utf-8")
+            journal["pending"] = pending.decode("utf-8")
+            _v1_write_publisher_journal(path, directory_fd, info, journal)
+            return pending
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _v1_write_publisher_journal(path, directory_fd, info, journal):
+    encoded = json.dumps(journal, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > 10 * 1024 * 1024:
+        raise ValueError("publisher journal exceeds size limit")
+    temporary = f".publisher-{uuid.uuid4()}"
+    fd = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600, dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(encoded)
+            file.flush()
+            os.fsync(file.fileno())
+        current = os.stat(path.parent, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("publisher directory changed")
+        os.replace(
+            temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+        )
+        os.fsync(directory_fd)
+        current = os.stat(path.parent, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("publisher directory changed")
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
+
+
+def v1_publisher_ack_set(path, store_id, pending):
+    """Commit an acknowledged set only if it is still the pending request."""
+    path = Path(path)
+    store_id = str(uuid.UUID(store_id))
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        _v1_check_publisher_directory(info)
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("invalid publisher directory")
+        with _v1_publisher_lock(directory_fd, path.name):
+            journal = _v1_publisher_identity_at(
+                path, directory_fd, store_id, create=False
+            )
+            if (
+                journal["pending"] is None
+                or journal["pending"].encode("utf-8") != pending
+            ):
+                raise ValueError("pending publisher request changed")
+            request = json.loads(pending)
+            journal["revision"] = request["revision"]
+            journal["destinations"] = request["destinations"]
+            journal["pending"] = None
+            _v1_write_publisher_journal(path, directory_fd, info, journal)
+    finally:
+        os.close(directory_fd)
+
+
+def v1_publisher_recover(path, store_id, send):
+    """Recover while the caller holds the exclusive publisher lifetime lease."""
+    journal = v1_publisher_identity(path, store_id, create=False)
+    if journal["phase"] == "bootstrap":
+        pending = v1_publisher_prepare_register(path, store_id)
+        result = send(pending)
+        if result != {"state": None}:
+            raise ValueError("invalid registration response")
+        v1_publisher_ack_register(path, store_id, pending)
+        return journal["epoch"]
+
+    expected_epoch = journal["epoch"]
+    pending = journal["pending"]
+    if pending is not None:
+        pending = pending.encode("utf-8")
+        action = json.loads(pending)["action"]
+        if action == "set":
+            # An uncertain old update must not be replayed before fresh source
+            # verification. Fence its epoch and recover the committed state;
+            # later publication derives a new update from verified state.
+            pending = v1_publisher_prepare_resume(
+                path, store_id, expected_epoch=expected_epoch,
+                rejected_set=pending,
+            )
+            result = send(pending)
+            if not isinstance(result, dict) or set(result) != {"state"}:
+                raise ValueError("invalid resume response")
+            v1_publisher_ack_resume(path, store_id, pending, result["state"])
+            return v1_publisher_identity(path, store_id, create=False)["epoch"]
+        elif action == "resume":
+            result = send(pending)
+            if not isinstance(result, dict) or set(result) != {"state"}:
+                raise ValueError("invalid resume response")
+            v1_publisher_ack_resume(path, store_id, pending, result["state"])
+            return v1_publisher_identity(path, store_id, create=False)["epoch"]
+        else:
+            raise ValueError("invalid pending publisher request")
+    pending = v1_publisher_prepare_resume(path, store_id, expected_epoch=expected_epoch)
+    result = send(pending)
+    if not isinstance(result, dict) or set(result) != {"state"}:
+        raise ValueError("invalid resume response")
+    v1_publisher_ack_resume(path, store_id, pending, result["state"])
+    return v1_publisher_identity(path, store_id, create=False)["epoch"]
+
+
 class state_lock:
     """Serialize load/modify/save of state.json across concurrent hooks.
 
@@ -183,6 +673,310 @@ class v1_source_leader:
         if self._lock is not None:
             self._lock.close()
         return False
+
+
+class V1OwnedPublisher:
+    """One publisher bound to the epoch established under its lifetime lease."""
+
+    def __init__(self, path, store_id, send, epoch, send_guarded=None):
+        self.path = path
+        self.store_id = store_id
+        self.send = send
+        self.send_guarded = send_guarded
+        self.epoch = epoch
+        self.active = True
+        self.directory_identity = OWNED_PUBLISHER_DIRECTORY.get()
+        self._publication_lock = threading.Lock()
+        self._resume_ack = None
+
+    def publish(self, destinations, *, send_guard=None, force=False):
+        if send_guard is not None and self.send_guarded is None:
+            raise ValueError("guarded publisher transport is unavailable")
+        if not self._publication_lock.acquire(blocking=False):
+            raise ValueError("publisher is already publishing")
+        try:
+            return self._publish(destinations, send_guard=send_guard, force=force)
+        finally:
+            self._publication_lock.release()
+
+    def publish_verified(self, prepare, *, force=False, receipt=False):
+        """Serialize the baseline read with preparation and publication."""
+        if receipt and not force:
+            raise ValueError("publication receipt requires a forced update")
+        if self.send_guarded is None:
+            raise ValueError("guarded publisher transport is unavailable")
+        if not self._publication_lock.acquire(blocking=False):
+            raise ValueError("publisher is already publishing")
+        try:
+            self._recover_pending()
+            plan = prepare()
+            if plan is None:
+                return False
+            destinations, send_guard = plan
+            self._publish(destinations, send_guard=send_guard, force=force)
+            if receipt:
+                journal = v1_publisher_identity(self.path, self.store_id, create=False)
+                if (
+                    journal["pending"] is not None
+                    or journal["phase"] != "active"
+                    or journal["epoch"] != self.epoch
+                ):
+                    raise ValueError("publication receipt is unavailable")
+                return {
+                    key: copy.deepcopy(journal[key])
+                    for key in (
+                        "store_id", "producer", "epoch", "revision", "destinations"
+                    )
+                }
+            return True
+        finally:
+            self._publication_lock.release()
+
+    def current_destinations(self):
+        if (
+            not self.active
+            or OWNED_PUBLISHER_DIRECTORY.get() != self.directory_identity
+        ):
+            raise ValueError("publisher lease is closed")
+        journal = v1_publisher_identity(self.path, self.store_id, create=False)
+        if str(uuid.UUID(journal["epoch"])) != str(uuid.UUID(self.epoch)):
+            raise ValueError("publisher writer epoch changed")
+        if journal["pending"] is not None:
+            raise ValueError("publisher request is pending")
+        return copy.deepcopy(journal["destinations"])
+
+    @contextmanager
+    def validated_receipt(self, receipt):
+        """Hold publisher serialization while validating a publication receipt."""
+        if not self._publication_lock.acquire(blocking=False):
+            raise ValueError("publisher is already publishing")
+        try:
+            if (
+                not self.active
+                or OWNED_PUBLISHER_DIRECTORY.get() != self.directory_identity
+            ):
+                raise ValueError("publisher lease is closed")
+            journal = v1_publisher_identity(self.path, self.store_id, create=False)
+            keys = ("store_id", "producer", "epoch", "revision", "destinations")
+            yield (
+                journal["phase"] == "active"
+                and journal["pending"] is None
+                and journal["epoch"] == self.epoch
+                and isinstance(receipt, dict)
+                and receipt == {key: journal[key] for key in keys}
+            )
+        finally:
+            self._publication_lock.release()
+
+    def receipt_is_current(self, receipt):
+        with self.validated_receipt(receipt) as current:
+            return current
+
+    def _send_set(self, pending, send_guard=None):
+        try:
+            result = (
+                self.send_guarded(pending, send_guard)
+                if send_guard is not None else self.send(pending)
+            )
+            if result != {"state": None}:
+                raise ValueError("invalid update response")
+        except OwnedSocketError as error:
+            if error.code != "target_denied":
+                raise
+            resume = v1_publisher_prepare_resume(
+                self.path, self.store_id, expected_epoch=self.epoch,
+                rejected_set=pending,
+            )
+            self._finish_resume(resume)
+            raise
+
+    def _finish_resume(self, pending):
+        result = self.send(pending)
+        if not isinstance(result, dict) or set(result) != {"state"}:
+            raise ValueError("invalid resume response")
+        journal = v1_publisher_identity(self.path, self.store_id, create=False)
+        state = _v1_validate_resumed_state(journal, result["state"])
+        self._resume_ack = (pending, state)
+        v1_publisher_ack_resume(self.path, self.store_id, pending, state)
+        self.epoch = state["epoch"]
+        self._resume_ack = None
+
+    def _recover_pending(self):
+        if (
+            not self.active
+            or OWNED_PUBLISHER_DIRECTORY.get() != self.directory_identity
+        ):
+            raise ValueError("publisher lease is closed")
+        if self._resume_ack is not None:
+            pending, state = self._resume_ack
+            with _v1_locked_publisher_journal(self.path, self.store_id) as (
+                _path, fd, _info, saved
+            ):
+                already_saved = (
+                    isinstance(state, dict)
+                    and set(state) == {"epoch", "revision", "destinations"}
+                    and saved["pending"] is None
+                    and saved["epoch"] == state["epoch"]
+                    and saved["revision"] == state["revision"]
+                    and saved["destinations"] == state["destinations"]
+                )
+                if already_saved:
+                    os.fsync(fd)
+            if not already_saved:
+                v1_publisher_ack_resume(self.path, self.store_id, pending, state)
+            self.epoch = state["epoch"]
+            self._resume_ack = None
+        journal = v1_publisher_identity(self.path, self.store_id, create=False)
+        if str(uuid.UUID(journal["epoch"])) != str(uuid.UUID(self.epoch)):
+            raise ValueError("publisher writer epoch changed")
+        if journal["pending"] is not None and (
+            json.loads(journal["pending"]).get("action") == "resume"
+        ):
+            self._finish_resume(journal["pending"].encode("utf-8"))
+            journal = v1_publisher_identity(self.path, self.store_id, create=False)
+        if journal["pending"] is not None:
+            pending = v1_publisher_prepare_resume(
+                self.path, self.store_id, expected_epoch=self.epoch,
+                rejected_set=journal["pending"].encode("utf-8"),
+            )
+            self._finish_resume(pending)
+            journal = v1_publisher_identity(self.path, self.store_id, create=False)
+        return journal
+
+    def _publish(self, destinations, *, send_guard=None, force=False):
+        journal = self._recover_pending()
+        desired = v1_owned_set_request(journal, 0, destinations)["destinations"]
+        current = v1_owned_set_request(
+            journal, 0, journal["destinations"]
+        )["destinations"]
+
+        def order(item):
+            return item["workspace_id"], item["surface_id"]
+        if not force and sorted(desired, key=order) == sorted(current, key=order):
+            return False
+        pending = v1_publisher_prepare_set(
+            self.path, self.store_id, desired, expected_epoch=self.epoch
+        )
+        self._send_set(pending, send_guard)
+        v1_publisher_ack_set(self.path, self.store_id, pending)
+        return True
+
+
+def _v1_publisher_lease_home():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+@contextmanager
+def v1_owned_publisher(path, store_id, send, *, send_guarded=None):
+    """Use a stable lease independent of the replaceable journal directory."""
+    store_id = str(uuid.UUID(store_id))
+    absolute_path = os.path.abspath(path)
+    resolved_path = os.path.realpath(path)
+    token = OWNED_PUBLISHER_DIRECTORY.set(None)
+    identity_token = OWNED_PUBLISHER_IDENTITY.set(None)
+    try:
+        identity = v1_publisher_identity(resolved_path, store_id, create=False)
+    finally:
+        OWNED_PUBLISHER_IDENTITY.reset(identity_token)
+        OWNED_PUBLISHER_DIRECTORY.reset(token)
+    producer = str(uuid.UUID(identity["producer"]))
+    digests = sorted({
+        hashlib.sha256(value.encode()).hexdigest()
+        for value in (absolute_path, resolved_path)
+    } | {hashlib.sha256(f"producer:{store_id}:{producer}".encode()).hexdigest()})
+    home = os.path.realpath(_v1_publisher_lease_home())
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        home_info = os.fstat(home_fd)
+        if home_info.st_uid != os.getuid() or home_info.st_mode & 0o022:
+            raise ValueError("invalid publisher lease home")
+        with suppress(FileExistsError):
+            os.mkdir(".cmux-herdr-publisher-locks", 0o700, dir_fd=home_fd)
+        directory_fd = os.open(
+            ".cmux-herdr-publisher-locks",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=home_fd,
+        )
+    finally:
+        os.close(home_fd)
+    try:
+        info = os.fstat(directory_fd)
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("invalid publisher lease directory")
+        with ExitStack() as locks:
+            for digest in digests:
+                lock_fd = os.open(
+                    f"cmux-herdr-owned-{os.getuid()}-{digest}.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    0o600, dir_fd=directory_fd,
+                )
+                locks.callback(os.close, lock_fd)
+                lock_info = os.fstat(lock_fd)
+                if (
+                    not stat.S_ISREG(lock_info.st_mode)
+                    or lock_info.st_uid != os.getuid()
+                    or lock_info.st_mode & 0o077
+                ):
+                    raise ValueError("invalid publisher stable lock")
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    yield None
+                    return
+            with _v1_owned_publisher_locked(
+                resolved_path, store_id, send, producer, send_guarded
+            ) as publisher:
+                yield publisher
+    finally:
+        os.close(directory_fd)
+
+
+@contextmanager
+def _v1_owned_publisher_locked(path, store_id, send, expected_producer, send_guarded):
+    """Hold publisher leadership for recovery and every subsequent update."""
+    path = Path(path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("invalid publisher directory")
+        lock_fd = os.open(
+            f".{path.name}.leader.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600, dir_fd=directory_fd,
+        )
+        try:
+            lock_info = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != os.getuid()
+                or lock_info.st_mode & 0o077
+            ):
+                raise ValueError("invalid publisher leader lock")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield None
+                return
+            token = OWNED_PUBLISHER_DIRECTORY.set((info.st_dev, info.st_ino))
+            identity_token = OWNED_PUBLISHER_IDENTITY.set(expected_producer)
+            try:
+                identity = v1_publisher_identity(path, store_id, create=False)
+                if str(uuid.UUID(identity["producer"])) != expected_producer:
+                    raise ValueError("publisher identity changed")
+                epoch = v1_publisher_recover(path, store_id, send)
+                publisher = V1OwnedPublisher(path, store_id, send, epoch, send_guarded)
+                try:
+                    yield publisher
+                finally:
+                    publisher.active = False
+            finally:
+                OWNED_PUBLISHER_IDENTITY.reset(identity_token)
+                OWNED_PUBLISHER_DIRECTORY.reset(token)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def current_session():
@@ -3492,6 +4286,180 @@ def sidebar_panes(panes, attention):
     return result
 
 
+def v1_attention_title(attention):
+    pending = [
+        entry
+        for entry in attention.values()
+        if entry.get("status") in ATTENTION_STATUSES
+    ]
+    if not pending:
+        return None
+    waiting = sum(entry["status"] == "blocked" for entry in pending)
+    done = len(pending) - waiting
+    parts = [
+        f"{count} {label}"
+        for count, label in ((waiting, "waiting"), (done, "finished"))
+        if count
+    ]
+    return "herdr: " + " · ".join(parts)
+
+
+def v1_owned_destinations(state):
+    """Build a complete projection from an already verified global snapshot."""
+    v1 = state.get("v1", {})
+    clients, sources = v1.get("clients", {}), v1.get("sources", {})
+    groups = {}
+    for client in clients.values():
+        workspace = str(uuid.UUID(client["workspace"]))
+        surface = str(uuid.UUID(client["surface"]))
+        source = client["source"]
+        if source not in sources or not isinstance(
+            sources[source].get("attention"), dict
+        ):
+            raise ValueError("incomplete publisher source snapshot")
+        groups.setdefault((workspace, surface), set()).add(source)
+    result = []
+    for (workspace, surface), source_ids in sorted(groups.items()):
+        attention = {
+            (source_id, pane): entry
+            for source_id in source_ids
+            for pane, entry in sources[source_id]["attention"].items()
+        }
+        if any(
+            not isinstance(entry, dict)
+            or ("status" in entry and entry["status"] not in ATTENTION_STATUSES)
+            for entry in attention.values()
+        ):
+            raise ValueError("invalid publisher attention state")
+        title = v1_attention_title(attention)
+        if title is not None:
+            result.append({"workspace_id": workspace, "surface_id": surface,
+                           "title": title, "body": ""})
+    return result
+
+
+@contextmanager
+def _v1_owned_publication_snapshot(verification, previous, *, require_complete=False):
+    """Hold source and state locks while validating a publication snapshot."""
+    verification_lock = getattr(verification, "_lock", nullcontext())
+    sources = getattr(verification, "_sources", None)
+    source_lock = getattr(sources, "_lock", nullcontext())
+    with verification_lock, source_lock:
+        scope = verification.scope()
+        if scope is not None and (require_complete or not scope):
+            yield None
+            return
+        with state_lock():
+            state = v1_load_legacy_journal_state()
+            v1 = state.get("v1")
+            if v1 is None and "v1" not in state and scope is None:
+                v1 = {"clients": {}, "sources": {}}
+                state["v1"] = v1
+            if (
+                not isinstance(v1, dict)
+                or not isinstance(v1.get("clients"), dict)
+                or not isinstance(v1.get("sources"), dict)
+            ):
+                raise ValueError("incomplete publisher state")
+            if isinstance(verification, V1PublicationVerification):
+                desired = verification._desired
+                ready = sources.current_ready(desired)
+                if scope is None:
+                    if (
+                        not verification._complete
+                        or ready != desired
+                        or set(v1["clients"]) != set(desired)
+                        or not v1_bindings_match_clients(
+                            v1["clients"], desired, exact=True
+                        )
+                    ):
+                        yield None
+                        return
+                else:
+                    for target in scope:
+                        expected = {
+                            key: spec for key, spec in desired.items()
+                            if (
+                                spec["workspace"].casefold(),
+                                spec["surface"].casefold(),
+                            ) == target
+                        }
+                        actual = {
+                            key for key, client in v1["clients"].items()
+                            if (str(client.get("workspace", "")).casefold(),
+                                str(client.get("surface", "")).casefold()) == target
+                        }
+                        if (
+                            actual != set(expected)
+                            or any(
+                                ready.get(key) != spec for key, spec in expected.items()
+                            )
+                            or not v1_bindings_match_clients(v1["clients"], expected)
+                        ):
+                            yield None
+                            return
+            if scope is None:
+                destinations = v1_owned_destinations(state)
+            else:
+                clients = {
+                    key: client for key, client in v1["clients"].items()
+                    if (client["workspace"].casefold(), client["surface"].casefold())
+                    in scope
+                }
+                destinations = v1_owned_destinations({"v1": {
+                    "clients": clients, "sources": v1["sources"]
+                }})
+                destinations.extend(
+                    item for item in previous()
+                    if (item["workspace_id"].casefold(), item["surface_id"].casefold())
+                    not in scope
+                )
+            yield destinations
+
+
+def v1_publish_owned_once(
+    publisher, verification, *, require_complete=False, force=False, receipt=False
+):
+    """Publish a verified snapshot without holding shared locks over I/O."""
+    if receipt and (not force or getattr(publisher, "send_guarded", None) is None):
+        raise ValueError("publication receipt requires a guarded forced update")
+    if getattr(publisher, "send_guarded", None) is None:
+        with _v1_owned_publication_snapshot(
+            verification, getattr(publisher, "current_destinations", lambda: []),
+            require_complete=require_complete,
+        ) as destinations:
+            if destinations is None:
+                return False
+            if force:
+                publisher.publish(destinations, force=True)
+            else:
+                publisher.publish(destinations)
+            return True
+
+    def prepare():
+        previous = publisher.current_destinations()
+        with _v1_owned_publication_snapshot(
+            verification, lambda: previous, require_complete=require_complete
+        ) as destinations:
+            if destinations is None:
+                return None
+
+        @contextmanager
+        def send_guard():
+            with _v1_owned_publication_snapshot(
+                verification, lambda: previous, require_complete=require_complete
+            ) as current:
+                if current != destinations:
+                    raise ValueError("stale publication snapshot")
+                yield
+
+        return destinations, send_guard
+
+    if force:
+        return publisher.publish_verified(prepare, force=True, receipt=receipt)
+    return publisher.publish_verified(prepare)
+
+
 def reconcile_aggregate_notification(
     cfg, workspace_id, surface_id, attention, notifications, notification_id=None
 ):
@@ -3517,14 +4485,7 @@ def reconcile_aggregate_notification(
         for item in relevant
     ):
         return
-    waiting = sum(entry["status"] == "blocked" for entry in pending)
-    done = len(pending) - waiting
-    parts = [
-        f"{count} {label}"
-        for count, label in ((waiting, "waiting"), (done, "finished"))
-        if count
-    ]
-    title = "herdr: " + " · ".join(parts)
+    title = v1_attention_title(attention)
     if own and not own.get("is_read") and own.get("title") == title:
         return notification_id
     payload = {
@@ -4137,9 +5098,70 @@ def v1_replay_pane_status(sock_path, pane_id):
     )
 
 
-def v1_rollback_legacy_events_and_marker():
-    """Replay pending hooks before letting new legacy hooks run."""
-    marker = state_dir / "v1-enabled"
+def _v1_check_activation_directory():
+    expected = ACTIVATION_DIRECTORY.get()
+    if expected is None:
+        raise ValueError("activation lock is not held")
+    current = os.stat(state_dir, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != expected:
+        raise ValueError("activation directory changed")
+
+
+@contextmanager
+def v1_activation_lock():
+    """Pin the directory containing the activation lock for its lifetime."""
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        directory = os.fstat(directory_fd)
+        if directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+            raise ValueError("invalid activation directory")
+        lock_fd = os.open(
+            "v1-activation.lock",
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600, dir_fd=directory_fd,
+        )
+        try:
+            lock_info = os.fstat(lock_fd)
+            if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
+                    or lock_info.st_mode & 0o022):
+                raise ValueError("invalid activation lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            token = ACTIVATION_DIRECTORY.set((directory.st_dev, directory.st_ino))
+            try:
+                _v1_check_activation_directory()
+                yield
+            finally:
+                ACTIVATION_DIRECTORY.reset(token)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def v1_remove_activation_marker():
+    """Make rollback durable before allowing legacy writers to restart."""
+    _v1_check_activation_directory()
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        directory = os.fstat(directory_fd)
+        if (directory.st_dev, directory.st_ino) != ACTIVATION_DIRECTORY.get():
+            raise ValueError("activation directory changed")
+        with suppress(FileNotFoundError):
+            os.unlink("v1-enabled", dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        _v1_check_activation_directory()
+    finally:
+        os.close(directory_fd)
+
+
+def _v1_rollback_legacy_events_and_marker_locked():
+    """Replay pending hooks while the caller holds the activation lock."""
+    _v1_check_activation_directory()
+    try:
+        if v1_notification_backend() != "ordinary":
+            return False
+    except (OSError, UnicodeError, ValueError):
+        return False
     with state_lock():
         state = v1_load_legacy_journal_state()
         pending = state.get("v1_pending_legacy_events", [])
@@ -4238,37 +5260,87 @@ def v1_rollback_legacy_events_and_marker():
                 save_state(state)
         else:
             state.pop("v1_pending_watch_barriers", None)
-        marker.unlink(missing_ok=True)
+        v1_remove_activation_marker()
         return True
+
+
+def v1_write_activation_marker(value):
+    """Durably replace the legacy handoff marker under the activation lock."""
+    if value not in {"pending", "enabled"}:
+        raise ValueError("invalid activation marker")
+    if ACTIVATION_DIRECTORY.get() is not None:
+        _v1_check_activation_directory()
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        if ACTIVATION_DIRECTORY.get() is not None and (
+            info.st_dev, info.st_ino
+        ) != ACTIVATION_DIRECTORY.get():
+            raise ValueError("activation directory changed")
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("invalid activation directory")
+        temporary = f".activation-{uuid.uuid4()}"
+        fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=directory_fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as file:
+                file.write(value.encode("ascii"))
+                file.flush()
+                os.fsync(file.fileno())
+            current = os.stat(state_dir, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("activation directory changed")
+            os.replace(temporary, "v1-enabled", src_dir_fd=directory_fd,
+                       dst_dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            current = os.stat(state_dir, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("activation directory changed")
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def v1_recover_legacy_handoff():
     """Retry restoration even if a prior recovery already removed the marker."""
     state_dir.mkdir(parents=True, exist_ok=True)
     marker = state_dir / "v1-enabled"
-    with open(state_dir / "v1-activation.lock", "w") as activation:
-        fcntl.flock(activation, fcntl.LOCK_EX)
+    with v1_activation_lock():
         try:
             marker_value = marker.read_text()
         except FileNotFoundError:
             marker_value = None
         if marker_value == "enabled":
             return True
-        if marker_value is not None and not v1_rollback_legacy_events_and_marker():
+        try:
+            if v1_notification_backend() != "ordinary":
+                return False
+        except (OSError, UnicodeError, ValueError):
             return False
+        if (
+            marker_value is not None
+            and not _v1_rollback_legacy_events_and_marker_locked()
+        ):
+            return False
+        if marker_value is None:
+            v1_remove_activation_marker()
         plan = pending_v1_legacy_restores()
         if plan:
+            _v1_check_activation_directory()
             restart_legacy_daemons(plan)
             return False
         return True
 
 
-def v1_try_supervisor_handoff(cfg, sources, stop):
+def v1_try_supervisor_handoff(cfg, sources, stop, *, final_check=None):
     """Fence legacy writers and commit only after repeated complete coverage."""
     state_dir.mkdir(parents=True, exist_ok=True)
     marker = state_dir / "v1-enabled"
-    with open(state_dir / "v1-activation.lock", "w") as activation:
-        fcntl.flock(activation, fcntl.LOCK_EX)
+    with v1_activation_lock():  # noqa: SIM117 - retain lock ordering
         with open(state_dir / "remote-transition.lock", "w") as transition:
             fcntl.flock(transition, fcntl.LOCK_EX)
             try:
@@ -4278,8 +5350,9 @@ def v1_try_supervisor_handoff(cfg, sources, stop):
             if marker_value == "enabled":
                 return True
             if marker_value is not None:
-                if not v1_rollback_legacy_events_and_marker():
+                if not _v1_rollback_legacy_events_and_marker_locked():
                     return False
+                _v1_check_activation_directory()
                 restart_legacy_daemons(pending_v1_legacy_restores())
                 return False
             inventory = v1_discover_clients(cfg)
@@ -4296,9 +5369,7 @@ def v1_try_supervisor_handoff(cfg, sources, stop):
             committed = False
             try:
                 with state_lock():
-                    tmp = marker.with_suffix(f".{os.getpid()}.tmp")
-                    tmp.write_text("pending")
-                    tmp.replace(marker)
+                    v1_write_activation_marker("pending")
                 for before_retirement in (True, False):
                     if stop.is_set():
                         return False
@@ -4318,17 +5389,18 @@ def v1_try_supervisor_handoff(cfg, sources, stop):
                         return False
                     if before_retirement and not retire_v1_legacy_daemons(restore_plan):
                         return False
+                if final_check is not None and not final_check():
+                    return False
                 with state_lock():
                     if v1_load_legacy_journal_state().get("v1_pending_legacy_events"):
                         return False
-                    tmp = marker.with_suffix(f".{os.getpid()}.tmp")
-                    tmp.write_text("enabled")
-                    tmp.replace(marker)
+                    v1_write_activation_marker("enabled")
                 committed = True
                 update_v1_legacy_restores(lambda entries: [])
                 return True
             finally:
-                if not committed and v1_rollback_legacy_events_and_marker():
+                if not committed and _v1_rollback_legacy_events_and_marker_locked():
+                    _v1_check_activation_directory()
                     restart_legacy_daemons(pending_v1_legacy_restores())
 
 
@@ -4433,6 +5505,27 @@ def v1_remove_confirmed_dead_pidfile(path):
         return v1_remove_confirmed_dead_pidfile_locked(path)
 
 
+def _v1_sync_absent_activation_marker(activation):
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        directory = os.fstat(directory_fd)
+        locked = os.fstat(activation.fileno())
+        current_lock = os.stat(
+            "v1-activation.lock", dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (locked.st_dev, locked.st_ino) != (current_lock.st_dev, current_lock.st_ino):
+            raise ValueError("activation lock changed")
+        try:
+            os.stat("v1-enabled", dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.fsync(directory_fd)
+        current = os.stat(state_dir, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (directory.st_dev, directory.st_ino):
+            raise ValueError("activation directory changed")
+    finally:
+        os.close(directory_fd)
+
+
 @contextmanager
 def v1_daemon_startup_lock(pid_path):
     """Do not hold the global handoff lock while a daemon lock is busy."""
@@ -4447,6 +5540,7 @@ def v1_daemon_startup_lock(pid_path):
             except BlockingIOError:
                 pass
             else:
+                _v1_sync_absent_activation_marker(activation)
                 yield activation
                 return
         time.sleep(0.05)
@@ -4583,6 +5677,7 @@ def v1_supervised_publish_loop(cfg, stop, verified):
                         cfg,
                         eligibility_check=verified.scope,
                         workspace_check=verified.workspace_allowed,
+                        notifications=False,
                     )
                 elif scope:
                     publish_v1_clients(
@@ -4590,6 +5685,7 @@ def v1_supervised_publish_loop(cfg, stop, verified):
                         eligible_destinations=scope,
                         eligibility_check=verified.scope,
                         workspace_check=verified.workspace_allowed,
+                        notifications=False,
                     )
         except FileNotFoundError:
             pass
@@ -4602,6 +5698,77 @@ def v1_supervised_publish_loop(cfg, stop, verified):
         ) as error:
             log(f"v1 supervisor publication failed: {error}")
         stop.wait(1)
+
+
+def v1_supervised_owned_publish_loop(stop, verified, environment):
+    """Keep one cmux connection and publisher lease while v1 is enabled."""
+    identity_path = state_dir / "v1-owned-publisher.json"
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    while not stop.is_set():
+        try:
+            if (state_dir / "v1-enabled").read_text() != "enabled":
+                stop.wait(1)
+                continue
+            with v1_owned_socket_transport(
+                identity_path, environment, account_home
+            ) as (session, publisher):
+                while publisher is not None and not stop.is_set():
+                    if (state_dir / "v1-enabled").read_text() != "enabled":
+                        break
+                    backend = v1_notification_backend()
+                    if backend == "owned":
+                        v1_publish_owned_once(publisher, verified)
+                    elif backend in {"ordinary", "preparing-owned"}:
+                        # Serve verified destinations while migration waits for
+                        # complete discovery or unresolved legacy notices.
+                        v1_publish_owned_once(publisher, verified)
+                        v1_transition_owned_backend(session, publisher, verified)
+                    else:
+                        raise ValueError("invalid notification backend")
+                    stop.wait(1)
+        except FileNotFoundError:
+            pass
+        except (OSError, SocketError, ValueError, KeyError, TypeError) as error:
+            log(f"v1 owned publication failed: {error}")
+        stop.wait(1)
+
+
+def v1_maybe_supervisor_handoff(cfg, sources, stop, verified, environment):
+    """Attempt handoff only after discovery and cmux capability checks."""
+    if verified.scope() is not None or v1_notification_backend() != "ordinary":
+        return False
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    path = environment.get("CMUX_SOCKET_PATH")
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        with V1OwnedSocketSession(
+            path,
+            password=v1_cmux_socket_password(environment, account_home),
+            capability=environment.get("CMUX_SOCKET_CAPABILITY") or None,
+        ) as session:
+            store_id = session.store_identity()
+            uuid.UUID(store_id)
+            def ready_for_handoff():
+                with state_lock():
+                    try:
+                        state = json.loads(STATE_PATH.read_text())
+                    except FileNotFoundError:
+                        state = {}
+                visible = session.list_notifications()
+                resolved = v1_resolved_unproven_destinations(state, visible)
+                v1_ordinary_cleanup_inventory(
+                    state, store_id, resolved_unproven=resolved
+                )
+                return v1_owned_backend_is_clear(session, store_id)
+
+            if not ready_for_handoff():
+                return False
+            return v1_try_supervisor_handoff(
+                cfg, sources, stop, final_check=ready_for_handoff,
+            )
+    except (OSError, SocketError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def v1_run_supervisor(cfg, stop):
@@ -4617,7 +5784,9 @@ def v1_run_supervisor(cfg, stop):
     sources = V1SupervisedSources(start_source)
     publisher_stop = threading.Event()
     publisher_verified = V1PublicationVerification(sources)
+    environment = os.environ.copy()
     publisher = None
+    owned_publisher = None
     try:
         leases.reconcile({}, {}, complete=False)
         publisher = threading.Thread(
@@ -4626,11 +5795,18 @@ def v1_run_supervisor(cfg, stop):
             daemon=True,
         )
         publisher.start()
+        owned_publisher = threading.Thread(
+            target=v1_supervised_owned_publish_loop,
+            args=(publisher_stop, publisher_verified, environment),
+            daemon=True,
+        )
+        owned_publisher.start()
         next_recovery = 0
+        recovery_ready = False
         while not stop.is_set():
             try:
                 if time.monotonic() >= next_recovery:
-                    v1_recover_legacy_handoff()
+                    recovery_ready = v1_recover_legacy_handoff()
                     next_recovery = time.monotonic() + 5
                 inventory = v1_discover_clients(cfg)
                 desired = ready = None
@@ -4650,6 +5826,13 @@ def v1_run_supervisor(cfg, stop):
                     enabled = (state_dir / "v1-enabled").read_text() == "enabled"
                 except FileNotFoundError:
                     enabled = False
+                if not enabled and desired and recovery_ready:
+                    enabled = v1_maybe_supervisor_handoff(
+                        cfg, sources, stop, publisher_verified, environment
+                    )
+                    if enabled:
+                        publisher_verified.update({}, complete=False)
+                        continue
                 if enabled and desired is not None:
                     v1_supervisor_focus_tick(cfg, desired, ready)
             except (
@@ -4666,6 +5849,8 @@ def v1_run_supervisor(cfg, stop):
         publisher_stop.set()
         if publisher is not None:
             publisher.join()
+        if owned_publisher is not None:
+            owned_publisher.join()
         try:
             sources.close()
         finally:
@@ -4853,6 +6038,221 @@ def reconcile_v1_destination(
     return True
 
 
+def v1_resolved_unproven_destinations(state, visible):
+    """Treat old IDs as resolved only when this store has no unread row for them."""
+    if not isinstance(visible, list):
+        raise ValueError("invalid notification list")
+    unread = set()
+    seen = set()
+    for item in visible:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or not item["id"]
+            or type(item.get("is_read")) is not bool
+            or item["id"] in seen
+        ):
+            raise ValueError("invalid notification list")
+        seen.add(item["id"])
+        if not item["is_read"]:
+            unread.add(item["id"])
+    if not isinstance(state, dict) or not isinstance(state.get("v1", {}), dict):
+        raise ValueError("invalid ordinary notification state")
+    destinations = state.get("v1", {}).get("destinations", {})
+    if not isinstance(destinations, dict):
+        raise ValueError("invalid ordinary notification state")
+    return {
+        entry["notification_id"] for entry in destinations.values()
+        if isinstance(entry, dict) and isinstance(entry.get("notification_id"), str)
+        and not entry.get("store_id") and entry["notification_id"] not in unread
+    }
+
+
+def v1_ordinary_cleanup_inventory(state, store_id, *, resolved_unproven=frozenset()):
+    """Capture only tracked ordinary IDs, pinned to the current cmux store."""
+    store = str(uuid.UUID(store_id))
+    v1 = state.get("v1", {}) if isinstance(state, dict) else None
+    if not isinstance(v1, dict):
+        raise ValueError("invalid ordinary notification state")
+    destinations = v1.get("destinations", {})
+    if not isinstance(destinations, dict):
+        raise ValueError("invalid ordinary notification state")
+    items = {}
+    for key, entry in destinations.items():
+        if entry == {}:
+            continue
+        if not isinstance(entry, dict) or not isinstance(
+            entry.get("notification_id"), str
+        ) or not entry["notification_id"]:
+            raise ValueError("unidentified notification")
+        if not entry.get("store_id") and entry["notification_id"] in resolved_unproven:
+            continue
+        try:
+            if str(uuid.UUID(entry["store_id"])) != store:
+                raise ValueError("unproven notification store")
+        except (KeyError, ValueError, TypeError, AttributeError) as error:
+            raise ValueError("unproven notification store") from error
+        try:
+            pair = json.loads(key)
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ValueError("invalid notification target")
+            workspace, surface = pair
+            target = (str(uuid.UUID(workspace)), str(uuid.UUID(surface)))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ValueError("invalid notification target") from error
+        notification_id = entry["notification_id"]
+        if notification_id in items and items[notification_id] != target:
+            raise ValueError("conflicting notification target")
+        items[notification_id] = target
+    return {"store_id": store, "items": [
+        {"workspace_id": target[0], "surface_id": target[1], "id": notice_id}
+        for notice_id, target in sorted(items.items())
+    ]}
+
+
+def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False):
+    """Persist an immutable cleanup obligation before changing notifications."""
+    path = Path(path)
+    encoded = (
+        json.dumps(inventory, separators=(",", ":")).encode("utf-8")
+        if inventory is not None else None
+    )
+    if encoded is not None and len(encoded) > 10 * 1024 * 1024:
+        raise ValueError("cleanup inventory exceeds size limit")
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        directory = os.fstat(directory_fd)
+        if directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+            raise ValueError("invalid cleanup inventory directory")
+        with _v1_publisher_lock(directory_fd, path.name):
+            if encoded is not None:
+                temporary = f".cleanup-{uuid.uuid4()}"
+                fd = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=directory_fd,
+                )
+                try:
+                    with os.fdopen(fd, "wb") as file:
+                        file.write(encoded)
+                        file.flush()
+                        os.fsync(file.fileno())
+                    with suppress(FileExistsError):
+                        os.link(
+                            temporary, path.name,
+                            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                        )
+                    os.fsync(directory_fd)
+                finally:
+                    os.unlink(temporary, dir_fd=directory_fd)
+            fd = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_size > 10 * 1024 * 1024
+                ):
+                    raise ValueError("invalid cleanup inventory file")
+                with os.fdopen(fd, "rb", closefd=False) as file:
+                    saved = json.load(file)
+                os.fsync(fd)
+                current_file = os.stat(
+                    path.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (current_file.st_dev, current_file.st_ino) != (
+                    info.st_dev, info.st_ino
+                ):
+                    raise ValueError("cleanup inventory file changed")
+                os.fsync(directory_fd)
+            finally:
+                os.close(fd)
+            current = os.stat(path.parent, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (directory.st_dev, directory.st_ino):
+                raise ValueError("cleanup inventory directory changed")
+            if inventory is not None and saved != inventory:
+                if not replace_unfenced:
+                    raise ValueError("cleanup inventory changed")
+                _v1_write_publisher_journal(path, directory_fd, directory, inventory)
+                saved = inventory
+            return saved
+    finally:
+        os.close(directory_fd)
+
+
+def v1_validate_ordinary_cleanup(inventory, store_id):
+    if not isinstance(inventory, dict) or not isinstance(inventory.get("items"), list):
+        raise ValueError("invalid cleanup inventory")
+    try:
+        expected_store = str(uuid.UUID(inventory["store_id"]))
+    except (KeyError, ValueError, TypeError, AttributeError) as error:
+        raise ValueError("invalid cleanup inventory") from error
+    if expected_store != store_id:
+        raise ValueError("notification store identity changed")
+    items = inventory["items"]
+    if not isinstance(items, list):
+        raise ValueError("invalid cleanup inventory")
+    targets = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("invalid cleanup inventory")
+        notice_id = item.get("id")
+        if not isinstance(notice_id, str) or not notice_id or notice_id in targets:
+            raise ValueError("invalid cleanup notification identity")
+        try:
+            targets[notice_id] = (
+                str(uuid.UUID(item["workspace_id"])),
+                str(uuid.UUID(item["surface_id"])),
+            )
+        except (KeyError, ValueError, TypeError, AttributeError) as error:
+            raise ValueError("invalid cleanup inventory") from error
+    return targets
+
+
+def v1_drain_ordinary_cleanup(session, inventory):
+    """Drain tracked rows over the same connection used to verify the store."""
+    targets = v1_validate_ordinary_cleanup(inventory, session.store_identity())
+
+    def unread():
+        notifications = session.list_notifications()
+        if notifications is None:
+            return None
+        pending = []
+        seen = set()
+        for item in notifications:
+            if not isinstance(item, dict):
+                return None
+            notice_id = item.get("id")
+            if not isinstance(notice_id, str):
+                return None
+            if notice_id not in targets:
+                continue
+            if notice_id in seen or type(item.get("is_read")) is not bool:
+                return None
+            seen.add(notice_id)
+            try:
+                target = (
+                    str(uuid.UUID(item["workspace_id"])),
+                    str(uuid.UUID(item["surface_id"])),
+                )
+            except (KeyError, ValueError, TypeError, AttributeError):
+                return None
+            if target != targets[notice_id]:
+                return None
+            if not item["is_read"]:
+                pending.append(notice_id)
+        return pending
+
+    pending = unread()
+    if pending is None:
+        return False
+    for notice_id in pending:
+        if not session.mark_notification_read(notice_id):
+            return False
+    return unread() == []
+
+
 def retire_v1_destination(cfg, state, key, *, is_current=lambda: True):
     destinations = state.get("v1", {}).get("destinations", {})
     destination = destinations.get(key)
@@ -5036,6 +6436,364 @@ def v1_destination_inputs_current(snapshot, workspace, surface):
         return relevant(snapshot) == relevant(load_state())
 
 
+@contextmanager
+def _v1_backend_preparation_lock():
+    """Serialize backend preparation with handoff and ordinary publication."""
+    with open(state_dir / "v1-activation.lock", "w") as activation:
+        fcntl.flock(activation, fcntl.LOCK_EX)
+        with v1_source_leader("publication", blocking=True) as leader:
+            yield leader
+
+
+def v1_prepare_owned_backend(*, preflight=None):
+    """Fence ordinary publishers durably before beginning owned cutover."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with _v1_backend_preparation_lock() as leader:
+        if not leader:
+            return False
+        try:
+            if (state_dir / "v1-enabled").read_text() != "enabled":
+                return False
+        except (OSError, UnicodeError):
+            return False
+        if preflight is not None:
+            preflight()
+        directory_fd = os.open(
+            state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        try:
+            info = os.fstat(directory_fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise ValueError("invalid notification backend directory")
+            name = "v1-notification-backend"
+            temporary = f".backend-{uuid.uuid4()}"
+            fd = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=directory_fd,
+            )
+            try:
+                with os.fdopen(fd, "wb") as file:
+                    file.write(b"preparing-owned")
+                    file.flush()
+                    os.fsync(file.fileno())
+                with suppress(FileExistsError):
+                    os.link(temporary, name, src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd)
+            finally:
+                os.unlink(temporary, dir_fd=directory_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory_fd)
+            try:
+                marker = os.fstat(fd)
+                if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.getuid()
+                        or marker.st_mode & 0o077 or marker.st_size > 32):
+                    raise ValueError("invalid notification backend file")
+                value = os.read(fd, 33).decode("utf-8")
+                os.fsync(fd)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (marker.st_dev, marker.st_ino):
+                    raise ValueError("notification backend file changed")
+                os.fsync(directory_fd)
+                current_dir = os.stat(state_dir, follow_symlinks=False)
+                if (current_dir.st_dev, current_dir.st_ino) != (
+                    info.st_dev, info.st_ino
+                ):
+                    raise ValueError("notification backend directory changed")
+                if value == "owned":
+                    return False
+                if value == "ordinary":
+                    temporary = f".backend-{uuid.uuid4()}"
+                    replacement = os.open(
+                        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600, dir_fd=directory_fd,
+                    )
+                    try:
+                        with os.fdopen(replacement, "wb") as file:
+                            file.write(b"preparing-owned")
+                            file.flush()
+                            os.fsync(file.fileno())
+                        current = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                        if (current.st_dev, current.st_ino) != (
+                            marker.st_dev, marker.st_ino
+                        ):
+                            raise ValueError("notification backend file changed")
+                        os.replace(temporary, name, src_dir_fd=directory_fd,
+                                   dst_dir_fd=directory_fd)
+                        os.fsync(directory_fd)
+                        current_dir = os.stat(state_dir, follow_symlinks=False)
+                        if (current_dir.st_dev, current_dir.st_ino) != (
+                            info.st_dev, info.st_ino
+                        ):
+                            raise ValueError("notification backend directory changed")
+                    finally:
+                        with suppress(FileNotFoundError):
+                            os.unlink(temporary, dir_fd=directory_fd)
+                    return True
+                if value != "preparing-owned":
+                    raise ValueError("invalid notification backend")
+                return True
+            finally:
+                os.close(fd)
+        finally:
+            os.close(directory_fd)
+
+
+def v1_notification_backend():
+    """Read the backend marker without following links or blocking on a FIFO."""
+    try:
+        fd = os.open(
+            state_dir / "v1-notification-backend",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except FileNotFoundError:
+        return "ordinary"
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > 32):
+            raise ValueError("invalid notification backend file")
+        return os.read(fd, 33).decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def v1_prepare_ordinary_cleanup_stage(session, *, producer=None):
+    """Fence ordinary publication and persist the tracked cleanup inventory."""
+    store_id = session.store_identity()
+    producer_id = uuid.UUID(producer) if producer is not None else None
+    prepared = []
+
+    def preflight():
+        backend = v1_notification_backend()
+        if backend not in {"ordinary", "preparing-owned"}:
+            raise ValueError("owned backend preparation is unavailable")
+        visible = session.list_notifications()
+        if backend == "preparing-owned":
+            inventory = v1_prepare_ordinary_cleanup(
+                state_dir / "v1-ordinary-cleanup.json"
+            )
+            v1_validate_ordinary_cleanup(inventory, store_id)
+        elif backend == "ordinary":
+            with state_lock():
+                try:
+                    state = json.loads(STATE_PATH.read_text())
+                except FileNotFoundError as error:
+                    raise ValueError("missing cleanup source state") from error
+                if (
+                    not isinstance(state, dict)
+                    or not isinstance(state.get("v1"), dict)
+                    or not isinstance(state["v1"].get("destinations", {}), dict)
+                ):
+                    raise ValueError("incomplete cleanup source state")
+                resolved = v1_resolved_unproven_destinations(state, visible)
+                inventory = v1_ordinary_cleanup_inventory(
+                    state, store_id, resolved_unproven=resolved
+                )
+            try:
+                previous = v1_prepare_ordinary_cleanup(
+                    state_dir / "v1-ordinary-cleanup.json"
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                old_targets = v1_validate_ordinary_cleanup(previous, store_id)
+                new_targets = v1_validate_ordinary_cleanup(inventory, store_id)
+                if any(
+                    key in new_targets and new_targets[key] != target
+                    for key, target in old_targets.items()
+                ):
+                    raise ValueError("conflicting cleanup notification target")
+                combined = {**old_targets, **new_targets}
+                inventory = {"store_id": store_id, "items": [
+                    {"id": key, "workspace_id": target[0], "surface_id": target[1]}
+                    for key, target in sorted(combined.items())
+                ]}
+        else:
+            raise ValueError("owned backend preparation is unavailable")
+        tracked = {item["id"] for item in inventory["items"]}
+        for item in visible:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or type(item.get("is_read")) is not bool
+            ):
+                raise ValueError("invalid notification list")
+            owner = item.get("owned_producer_id")
+            if owner is not None:
+                try:
+                    owner = uuid.UUID(owner)
+                except (TypeError, ValueError, AttributeError) as error:
+                    raise ValueError("invalid notification owner") from error
+                if producer_id is not None and owner == producer_id:
+                    continue
+            if (
+                not item["is_read"] and is_our_notification(item)
+                and item.get("id") not in tracked
+            ):
+                raise ValueError("unidentified legacy notification")
+        prepared.append(v1_prepare_ordinary_cleanup(
+            state_dir / "v1-ordinary-cleanup.json", inventory,
+            replace_unfenced=backend == "ordinary",
+        ))
+
+    if not v1_prepare_owned_backend(preflight=preflight):
+        raise ValueError("owned backend preparation is unavailable")
+    with open(state_dir / "v1-activation.lock", "w") as activation:
+        fcntl.flock(activation, fcntl.LOCK_EX)
+        if (state_dir / "v1-enabled").read_text() != "enabled":
+            raise ValueError("legacy handoff changed")
+        if v1_notification_backend() != "preparing-owned":
+            raise ValueError("notification backend changed")
+        if session.store_identity() != store_id:
+            raise ValueError("notification store identity changed")
+        return v1_prepare_ordinary_cleanup(
+            state_dir / "v1-ordinary-cleanup.json", prepared[0]
+        )
+
+
+def v1_drain_ordinary_cleanup_stage(session, *, producer=None):
+    """Drain the persisted obligations while the handoff remains fenced."""
+    inventory = v1_prepare_ordinary_cleanup_stage(session, producer=producer)
+    with open(state_dir / "v1-activation.lock", "w") as activation:
+        fcntl.flock(activation, fcntl.LOCK_EX)
+        if (state_dir / "v1-enabled").read_text() != "enabled":
+            raise ValueError("legacy handoff changed")
+        if v1_notification_backend() != "preparing-owned":
+            raise ValueError("notification backend changed")
+        return v1_drain_ordinary_cleanup(session, inventory)
+
+
+def v1_commit_owned_backend(session, publisher, receipt):
+    """Commit the backend only after cleanup and an acknowledged owned set."""
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        pinned = os.fstat(directory_fd)
+        if pinned.st_uid != os.getuid() or pinned.st_mode & 0o022:
+            raise ValueError("invalid notification backend directory")
+        return _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned)
+    finally:
+        os.close(directory_fd)
+
+
+def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
+    if getattr(publisher, "transport_session", None) is not session:
+        raise ValueError("publisher transport changed")
+    with _v1_backend_preparation_lock() as leader:
+        current_dir = os.stat(state_dir, follow_symlinks=False)
+        if (current_dir.st_dev, current_dir.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise ValueError("notification backend directory changed")
+        if not leader or (state_dir / "v1-enabled").read_text() != "enabled":
+            raise ValueError("legacy handoff changed")
+        with publisher.validated_receipt(receipt) as current:
+            if not current:
+                raise ValueError("publication receipt changed")
+            store_id = session.store_identity()
+            if not isinstance(receipt, dict) or receipt.get("store_id") != store_id:
+                raise ValueError("publication receipt store changed")
+            inventory = v1_prepare_ordinary_cleanup(
+                state_dir / "v1-ordinary-cleanup.json"
+            )
+            v1_validate_ordinary_cleanup(inventory, store_id)
+            backend = v1_notification_backend()
+            if backend not in {"preparing-owned", "owned"}:
+                raise ValueError("notification backend changed")
+            if backend == "preparing-owned" and not v1_drain_ordinary_cleanup(
+                session, inventory
+            ):
+                return False
+            directory_fd = os.open(
+                state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                directory = os.fstat(directory_fd)
+                if (directory.st_dev, directory.st_ino) != (
+                    pinned.st_dev, pinned.st_ino
+                ):
+                    raise ValueError("notification backend directory changed")
+                name = "v1-notification-backend"
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory_fd)
+                try:
+                    marker = os.fstat(fd)
+                    if (not stat.S_ISREG(marker.st_mode)
+                            or marker.st_uid != os.getuid()
+                            or marker.st_mode & 0o077 or marker.st_size > 32
+                            or os.read(fd, 33).decode("utf-8") != backend):
+                        raise ValueError("invalid notification backend file")
+                    os.fsync(fd)
+                    current_marker = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (marker.st_dev, marker.st_ino) != (
+                        current_marker.st_dev, current_marker.st_ino
+                    ):
+                        raise ValueError("notification backend file changed")
+                    if backend == "preparing-owned":
+                        temporary = f".backend-{uuid.uuid4()}"
+                        replacement = os.open(
+                            temporary,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600, dir_fd=directory_fd,
+                        )
+                        try:
+                            with os.fdopen(replacement, "wb") as file:
+                                file.write(b"owned")
+                                file.flush()
+                                os.fsync(file.fileno())
+                                installed = os.fstat(file.fileno())
+                            current_marker = os.stat(
+                                name, dir_fd=directory_fd, follow_symlinks=False
+                            )
+                            if (marker.st_dev, marker.st_ino) != (
+                                current_marker.st_dev, current_marker.st_ino
+                            ):
+                                raise ValueError("notification backend file changed")
+                            os.replace(temporary, name, src_dir_fd=directory_fd,
+                                       dst_dir_fd=directory_fd)
+                            current_marker = os.stat(
+                                name, dir_fd=directory_fd, follow_symlinks=False
+                            )
+                            if (installed.st_dev, installed.st_ino) != (
+                                current_marker.st_dev, current_marker.st_ino
+                            ):
+                                raise ValueError("notification backend file changed")
+                        finally:
+                            with suppress(FileNotFoundError):
+                                os.unlink(temporary, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(fd)
+                current_dir = os.stat(state_dir, follow_symlinks=False)
+                if (current_dir.st_dev, current_dir.st_ino) != (
+                    directory.st_dev, directory.st_ino
+                ):
+                    raise ValueError("notification backend directory changed")
+                return True
+            finally:
+                os.close(directory_fd)
+
+
+def v1_transition_owned_backend(session, publisher, verification):
+    """Publish verified replacement before draining and committing old rows."""
+    if getattr(publisher, "transport_session", None) is not session:
+        raise ValueError("publisher transport changed")
+    if verification.scope() is not None:
+        return False
+    identity = v1_publisher_identity(publisher.path, publisher.store_id, create=False)
+    producer = str(uuid.UUID(identity["producer"]))
+    v1_prepare_ordinary_cleanup_stage(session, producer=producer)
+    receipt = v1_publish_owned_once(
+        publisher, verification, require_complete=True, force=True, receipt=True
+    )
+    if not receipt:
+        return False
+    if not v1_drain_ordinary_cleanup_stage(session, producer=producer):
+        return False
+    return v1_commit_owned_backend(session, publisher, receipt)
+
+
 def publish_v1_clients(
     cfg,
     *,
@@ -5043,17 +6801,27 @@ def publish_v1_clients(
     eligible_destinations=None,
     eligibility_check=None,
     workspace_check=None,
+    notifications=True,
 ):
     """Reconcile each registered surface once using all of its sources."""
     with v1_source_leader("publication", blocking=wait) as leader:
         if not leader or not retire_v1_legacy_daemons():
             return
+        try:
+            backend = v1_notification_backend()
+        except (OSError, UnicodeError, ValueError) as error:
+            log(f"notification backend unavailable: {error}")
+            backend = "unavailable"
+        if backend not in {"ordinary", "preparing-owned", "owned"}:
+            log("invalid notification backend; ordinary notifications disabled")
+        notifications = notifications and backend == "ordinary"
         for _ in range(3):
             if not publish_v1_clients_once(
                 cfg,
                 eligible_destinations=eligible_destinations,
                 eligibility_check=eligibility_check,
                 workspace_check=workspace_check,
+                notifications=notifications,
             ):
                 break
 
@@ -5086,7 +6854,8 @@ def v1_workspace_inputs_current(snapshot, workspace):
 
 
 def publish_v1_clients_once(
-    cfg, *, eligible_destinations=None, eligibility_check=None, workspace_check=None
+    cfg, *, eligible_destinations=None, eligibility_check=None, workspace_check=None,
+    notifications=True,
 ):
     with state_lock():
         state = load_state()
@@ -5173,7 +6942,8 @@ def publish_v1_clients_once(
             allowed=allowed,
             **({"is_current": workspace_permitted} if eligibility_check else {}),
         )
-    for (workspace, surface), sources in destinations.items():
+    notice_targets = destinations.items() if notifications else ()
+    for (workspace, surface), sources in notice_targets:
         if eligible_destinations is not None and not includes(
             eligible_destinations, (workspace, surface)
         ):
@@ -5193,7 +6963,8 @@ def publish_v1_clients_once(
         (workspace.casefold(), surface.casefold())
         for workspace, surface in destinations
     }
-    for key in list(state.get("v1", {}).get("destinations", {})):
+    retired_targets = list(state.get("v1", {}).get("destinations", {}))
+    for key in retired_targets if notifications else ():
         try:
             workspace, surface = json.loads(key)
             if (workspace.casefold(), surface.casefold()) in active:
@@ -5218,7 +6989,10 @@ def publish_v1_clients_once(
         live_v1 = current.setdefault("v1", {})
         planned_v1 = state.get("v1", {})
         missing = object()
-        for field in ("sidebar_keys", "destinations"):
+        fields = ("sidebar_keys",)
+        if notifications:
+            fields += ("destinations",)
+        for field in fields:
             before = baseline.get(field, {})
             after = planned_v1.get(field, {})
             live = live_v1.setdefault(field, {})
@@ -5582,6 +7356,272 @@ def reconcile(cfg, state):
 
 class SocketError(Exception):
     pass
+
+
+class OwnedSocketError(SocketError):
+    def __init__(self, code):
+        super().__init__(f"cmux rejected the owned notification request: {code}")
+        self.code = code
+
+
+def v1_cmux_socket_password(environment, account_home):
+    """Resolve the common cmux CLI password sources without exposing the value."""
+    newline_characters = "\n\r\x0b\x0c\x85\u2028\u2029"
+    value = environment.get("CMUX_SOCKET_PASSWORD")
+    if value is not None:
+        value = value.strip(newline_characters)
+        if value:
+            return value
+    path = Path(account_home) / ".local/state/cmux/socket-control-password"
+    try:
+        value = path.read_text(encoding="utf-8").strip(newline_characters)
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _v1_owned_socket_frame(pending, method="notification.state.command"):
+    if not isinstance(pending, bytes) or len(pending) > 3 * 1024 * 1024:
+        raise ValueError("invalid owned notification request size")
+    if (
+        b"\n" in pending or b"\r" in pending
+        or not isinstance(json.loads(pending), dict)
+    ):
+        raise ValueError("invalid owned notification request")
+    request_id = str(uuid.uuid4())
+    request = (
+        b'{"id":' + json.dumps(request_id).encode("ascii")
+        + b',"method":' + json.dumps(method).encode("ascii")
+        + b',"params":' + pending + b"}\n"
+    )
+    return request_id, request
+
+
+class V1OwnedSocketSession:
+    """One authenticated socket for the lifetime of an owned publisher."""
+
+    def __init__(self, sock_path, *, password=None, capability=None, timeout=10):
+        if password is not None and (
+            not isinstance(password, str) or "\n" in password or "\r" in password
+        ):
+            raise ValueError("invalid socket password")
+        if capability is not None and (
+            not isinstance(capability, str)
+            or not capability
+            or any(character.isspace() for character in capability)
+        ):
+            raise ValueError("invalid socket capability")
+        self.path, self.password, self.timeout = sock_path, password, timeout
+        self.capability = capability
+        self.conn = None
+        self.buffer = b""
+        self.lock = threading.Lock()
+        self.started = False
+
+    def __enter__(self):
+        if self.started:
+            raise SocketError("cmux session cannot be reopened")
+        self.started = True
+        self.conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        deadline = time.monotonic() + self.timeout
+        self.initial_deadline = deadline
+        try:
+            self._timeout(deadline)
+            self.conn.connect(str(self.path))
+            if self.password is not None:
+                self._timeout(deadline)
+                self.conn.sendall(self._wrap(
+                    b"auth " + self.password.encode("utf-8") + b"\n"
+                ))
+                if not self._read_line(deadline).startswith(b"OK"):
+                    raise SocketError("cmux authentication failed")
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *_exc):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    def _timeout(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("cmux request deadline exceeded")
+        self.conn.settimeout(remaining)
+
+    def _read_line(self, deadline):
+        while b"\n" not in self.buffer:
+            self._timeout(deadline)
+            chunk = self.conn.recv(65536)
+            if not chunk:
+                raise SocketError("cmux closed the connection")
+            self.buffer += chunk
+            if len(self.buffer) > 4 * 1024 * 1024:
+                raise SocketError("cmux response exceeds size limit")
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        return line
+
+    def _wrap(self, request):
+        if self.capability is not None:
+            request = (
+                b"_cmux_capability_v1 " + self.capability.encode("utf-8")
+                + b" " + request
+            )
+        return request
+
+    def request(self, pending, *, _deadline=None):
+        return self._send(pending, "notification.state.command", _deadline)
+
+    def request_with_send_guard(self, pending, guard):
+        """Hold a caller's validation guard only while transmitting the frame."""
+        return self._send(pending, "notification.state.command", None, guard=guard)
+
+    def store_identity(self):
+        result = self._send(b"{}", "notification.state.info", None)
+        try:
+            if set(result) != {"store_id"}:
+                raise ValueError("invalid store identity response")
+            return str(uuid.UUID(result["store_id"]))
+        except (TypeError, ValueError, AttributeError) as error:
+            self.__exit__(None, None, None)
+            raise SocketError("invalid store identity response") from error
+
+    def list_notifications(self):
+        result = self._send(b"{}", "notification.list", None)
+        notifications = result.get("notifications")
+        if not isinstance(notifications, list):
+            raise SocketError("invalid notification list response")
+        return notifications
+
+    def mark_notification_read(self, notice_id):
+        params = json.dumps({"id": str(uuid.UUID(notice_id))}).encode("utf-8")
+        result = self._send(params, "notification.mark_read", None)
+        return type(result.get("marked_read")) is int and result["marked_read"] >= 0
+
+    def _send(self, pending, method, deadline, *, guard=None):
+        request_id, request = _v1_owned_socket_frame(pending, method)
+        request = self._wrap(request)
+        if not self.lock.acquire(blocking=False):
+            raise SocketError("cmux session is already in use")
+        try:
+            if self.conn is None:
+                raise SocketError("cmux session is closed")
+            return self._request(request_id, request, deadline, guard=guard)
+        except OwnedSocketError:
+            raise
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        finally:
+            self.lock.release()
+
+    def _request(self, request_id, request, deadline, *, guard=None):
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
+        with guard() if guard is not None else nullcontext():
+            send_deadline = deadline
+            if guard is not None:
+                send_deadline = min(deadline, time.monotonic() + 0.02)
+            self._timeout(send_deadline)
+            self.conn.sendall(request)
+        try:
+            response = json.loads(self._read_line(deadline))
+        except (RecursionError, UnicodeError, ValueError) as exc:
+            raise SocketError("invalid cmux response") from exc
+        if time.monotonic() >= deadline:
+            raise TimeoutError("cmux request deadline exceeded")
+        if not isinstance(response, dict) or response.get("id") != request_id:
+            raise SocketError("invalid cmux response identity")
+        if response.get("ok") is False:
+            error = response.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", code):
+                raise SocketError("invalid cmux error response")
+            raise OwnedSocketError(code)
+        if response.get("ok") is not True:
+            raise SocketError("invalid cmux response status")
+        if not isinstance(response.get("result"), dict):
+            raise SocketError("invalid cmux response result")
+        return response["result"]
+
+
+def v1_owned_socket_request(sock_path, pending, *, password=None, timeout=10):
+    """Send one owned notification request over a short-lived connection."""
+    with V1OwnedSocketSession(sock_path, password=password, timeout=timeout) as session:
+        return session.request(pending, _deadline=session.initial_deadline)
+
+
+def v1_owned_backend_is_clear(session, store_id):
+    """Verify the same store remains free of unidentified unread notices."""
+    if session.store_identity() != store_id:
+        return False
+    for item in session.list_notifications():
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or type(item.get("is_read")) is not bool
+        ):
+            return False
+        if not item["is_read"] and is_our_notification(item):
+            return False
+    return True
+
+
+def v1_probe_owned_backend(environment, account_home):
+    """Check support and authentication before retiring any legacy writer."""
+    path = environment.get("CMUX_SOCKET_PATH")
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        with V1OwnedSocketSession(
+            path,
+            password=v1_cmux_socket_password(environment, account_home),
+            capability=environment.get("CMUX_SOCKET_CAPABILITY") or None,
+        ) as session:
+            store_id = session.store_identity()
+            uuid.UUID(store_id)
+            return v1_owned_backend_is_clear(session, store_id)
+    except (OSError, SocketError, ValueError, TypeError, AttributeError):
+        return False
+
+
+@contextmanager
+def v1_owned_socket_transport(path, environment, account_home):
+    """Keep cleanup and publishing on one authenticated, store-pinned socket."""
+    sock_path = environment.get("CMUX_SOCKET_PATH")
+    if not isinstance(sock_path, str) or not sock_path:
+        raise ValueError("cmux socket path is unavailable")
+    password = v1_cmux_socket_password(environment, account_home)
+    capability = environment.get("CMUX_SOCKET_CAPABILITY") or None
+    with V1OwnedSocketSession(
+        sock_path, password=password, capability=capability
+    ) as session:
+        store_id = session.store_identity()
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            try:
+                v1_publisher_identity(path, store_id, create=True)
+            except FileExistsError:
+                v1_publisher_identity(path, store_id, create=False)
+        else:
+            v1_publisher_identity(path, store_id, create=False)
+        with v1_owned_publisher(
+            path, store_id, session.request,
+            send_guarded=session.request_with_send_guard,
+        ) as publisher:
+            if publisher is not None:
+                publisher.transport_session = session
+            yield session, publisher
+
+
+@contextmanager
+def v1_owned_socket_publisher(path, environment, account_home):
+    """Open an authenticated publisher without exposing its transport."""
+    with v1_owned_socket_transport(path, environment, account_home) as (_, publisher):
+        yield publisher
 
 
 def socket_rpc(sock_path, method, params, timeout=10):
@@ -6334,6 +8374,7 @@ def take_over_daemon(pid_path, mode, activation=None):
     finally:
         if activation is not None:
             fcntl.flock(activation, fcntl.LOCK_EX)
+            _v1_sync_absent_activation_marker(activation)
     # The old daemon refuses to die; starting another one would fight over
     # forwarded sockets and state. Retry on the next startup/refresh.
     log(f"outdated {mode} daemon (pid {old_pid}) did not exit; aborting")
@@ -7409,23 +9450,40 @@ def restart_legacy_daemons(plan):
 def activate_v1_client(
     client_id, source_id, workspace_id, surface_id, legacy_target, stop
 ):
+    """Retry cutover without holding activation while startup locks are busy."""
+    while True:
+        if _activate_v1_client_once(
+            client_id, source_id, workspace_id, surface_id, legacy_target, stop
+        ):
+            return True
+        if stop.is_set():
+            return False
+        stop.wait(1)
+
+
+def _activate_v1_client_once(
+    client_id, source_id, workspace_id, surface_id, legacy_target, stop
+):
     """Serialize cutover and roll back a new marker if startup is interrupted."""
     state_dir.mkdir(parents=True, exist_ok=True)
-    with open(state_dir / "v1-activation.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with v1_activation_lock():
         marker = state_dir / "v1-enabled"
         try:
-            already_enabled = marker.read_text() != "pending"
+            marker_value = marker.read_text()
         except FileNotFoundError:
-            already_enabled = False
+            marker_value = None
+        if marker_value == "pending":
+            if _v1_rollback_legacy_events_and_marker_locked():
+                _v1_check_activation_directory()
+                restart_legacy_daemons(pending_v1_legacy_restores())
+            return False
+        already_enabled = marker_value is not None
         restore_plan = pending_v1_legacy_restores() if not already_enabled else []
         registered = False
         try:
             with state_lock():
                 if not already_enabled:
-                    tmp = marker.with_suffix(f".{os.getpid()}.tmp")
-                    tmp.write_text("pending")
-                    tmp.replace(marker)
+                    v1_write_activation_marker("pending")
             while not stop.is_set():
                 if retire_v1_legacy_daemons(None if already_enabled else restore_plan):
                     persist_v1_client(
@@ -7437,18 +9495,20 @@ def activate_v1_client(
                         legacy_target,
                     )
                     if not already_enabled:
-                        tmp = marker.with_suffix(f".{os.getpid()}.tmp")
-                        tmp.write_text("enabled")
-                        tmp.replace(marker)
+                        v1_write_activation_marker("enabled")
                     registered = True
                     update_v1_legacy_restores(lambda entries: [])
                     return True
-                stop.wait(1)
+                # A takeover can hold the daemon lock while waiting for
+                # activation; leave this attempt to release activation.
+                return False
             return False
         finally:
-            if not registered and not already_enabled:
-                with state_lock():
-                    marker.unlink(missing_ok=True)
+            if (
+                not registered and not already_enabled
+                and _v1_rollback_legacy_events_and_marker_locked()
+            ):
+                _v1_check_activation_directory()
                 restart_legacy_daemons(pending_v1_legacy_restores())
 
 

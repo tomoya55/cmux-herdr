@@ -1,17 +1,1834 @@
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-from contextlib import suppress
+import uuid
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import cmux_herdr as ch
+
+
+def _publisher_prepare_set(path, store_id, destinations):
+    epoch = ch.v1_publisher_identity(path, store_id, create=False)["epoch"]
+    return ch.v1_publisher_prepare_set(
+        path, store_id, destinations, expected_epoch=epoch
+    )
+
+
+def test_v1_publisher_identity_is_pinned_and_requires_explicit_creation(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    with pytest.raises(FileNotFoundError):
+        ch.v1_publisher_identity(path, store_id, create=False)
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    assert identity["phase"] == "bootstrap"
+    assert identity["revision"] == "0"
+    assert identity["destinations"] == []
+    assert identity["pending"] is None
+    assert ch.v1_publisher_identity(path, store_id, create=False) == identity
+    assert path.stat().st_mode & 0o077 == 0
+    with pytest.raises(ValueError, match="store"):
+        ch.v1_publisher_identity(path, str(uuid.uuid4()), create=False)
+    assert ch.v1_publisher_identity(path, store_id, create=False) == identity
+
+
+def test_v1_publisher_identity_rejects_insecure_and_symlinked_files(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="identity file"):
+        ch.v1_publisher_identity(path, store_id, create=False)
+    path.chmod(0o600)
+    link = tmp_path / "link.json"
+    link.symlink_to(path)
+    with pytest.raises(OSError):
+        ch.v1_publisher_identity(link, store_id, create=False)
+
+
+def test_v1_publisher_identity_rejects_fifo_without_waiting(tmp_path):
+    path = tmp_path / "fifo"
+    os.mkfifo(path, 0o600)
+    script = (
+        "import cmux_herdr as c, sys; "
+        "c.v1_publisher_identity(sys.argv[1], sys.argv[2], create=False)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path), str(uuid.uuid4())],
+        capture_output=True,
+        timeout=2,
+    )
+    assert result.returncode != 0
+    assert b"invalid publisher identity file" in result.stderr
+
+
+def test_v1_publisher_identity_rejects_invalid_field_types(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    identity["producer"] = 123
+    path.write_text(json.dumps(identity))
+    with pytest.raises(ValueError, match="identity"):
+        ch.v1_publisher_identity(path, store_id, create=False)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("destinations", [42]), ("pending", "not JSON")]
+)
+def test_v1_publisher_identity_rejects_corrupt_journal(tmp_path, field, value):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    identity[field] = value
+    path.write_text(json.dumps(identity))
+    with pytest.raises(ValueError):
+        ch.v1_publisher_identity(path, store_id, create=False)
+
+
+def test_v1_publisher_identity_rejects_oversized_pending_bytes(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    registration = ch.v1_publisher_prepare_register(path, store_id)
+    ch.v1_publisher_ack_register(path, store_id, registration)
+    pending = _publisher_prepare_set(path, store_id, [])
+    identity = ch.v1_publisher_identity(path, store_id, create=False)
+    identity["pending"] = pending.decode() + " " * (3 * 1024 * 1024)
+    path.write_text(json.dumps(identity))
+    with pytest.raises(ValueError, match="journal"):
+        ch.v1_publisher_identity(path, store_id, create=False)
+
+
+def test_v1_publisher_identity_synchronizes_directory_on_read(tmp_path, monkeypatch):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    original = os.fsync
+    synced_directory = []
+
+    def record_sync(fd):
+        if os.fstat(fd).st_ino == tmp_path.stat().st_ino:
+            synced_directory.append(True)
+        return original(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", record_sync)
+    ch.v1_publisher_identity(path, store_id, create=False)
+    assert synced_directory
+
+
+def test_v1_publisher_identity_rejects_replaced_parent(tmp_path, monkeypatch):
+    parent = tmp_path / "publisher"
+    parent.mkdir()
+    path = parent / "identity.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    original_read = os.read
+    moved = tmp_path / "moved"
+
+    def swap_parent(fd, size):
+        data = original_read(fd, size)
+        parent.rename(moved)
+        parent.mkdir()
+        return data
+
+    monkeypatch.setattr(ch.os, "read", swap_parent)
+    with pytest.raises((ValueError, OSError)):
+        ch.v1_publisher_identity(path, store_id, create=False)
+
+
+def test_v1_publisher_identity_survives_a_new_process(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    original = ch.v1_publisher_identity(path, store_id, create=True)
+    script = (
+        "import cmux_herdr as c, json, sys; "
+        "print(json.dumps(c.v1_publisher_identity(sys.argv[1], sys.argv[2], "
+        "create=False)))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path), store_id],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    assert json.loads(result.stdout) == original
+
+
+def test_v1_publisher_identity_interrupted_before_publication(tmp_path, monkeypatch):
+    path = tmp_path / "publisher.json"
+
+    def fail_link(*args, **kwargs):
+        raise OSError("injected publication failure")
+
+    monkeypatch.setattr(ch.os, "link", fail_link)
+    with pytest.raises(OSError, match="injected"):
+        ch.v1_publisher_identity(path, str(uuid.uuid4()), create=True)
+    assert not path.exists()
+    assert not list(tmp_path.glob(".publisher-*"))
+
+
+def test_v1_publisher_identity_never_overwrites_existing_file(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    original = ch.v1_publisher_identity(path, store_id, create=True)
+    with pytest.raises(FileExistsError):
+        ch.v1_publisher_identity(path, store_id, create=True)
+    assert ch.v1_publisher_identity(path, store_id, create=False) == original
+
+
+def test_v1_publisher_identity_concurrent_creation_has_one_winner(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    script = (
+        "import cmux_herdr as c, json, sys; "
+        "print(json.dumps(c.v1_publisher_identity(sys.argv[1], sys.argv[2], "
+        "create=True)))"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(path), store_id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    try:
+        results = [process.communicate(timeout=5) for process in processes]
+        assert sorted(process.returncode == 0 for process in processes) == [False, True]
+        winner = next(
+            out
+            for process, (out, _) in zip(processes, results, strict=True)
+            if process.returncode == 0
+        )
+        assert json.loads(winner) == ch.v1_publisher_identity(
+            path, store_id, create=False
+        )
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_v1_owned_request_uses_pinned_identity_and_decimal_revision(tmp_path):
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(
+        tmp_path / "publisher.json", store_id, create=True
+    )
+    destination = {
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "One agent needs input",
+    }
+    request = ch.v1_owned_set_request(identity, 2**64 - 1, [destination])
+    assert request == {
+        **{
+            key: identity[key]
+            for key in ("store_id", "producer", "epoch", "capability")
+        },
+        "action": "set",
+        "revision": "18446744073709551615",
+        "destinations": [destination],
+    }
+    with pytest.raises(ValueError):
+        ch.v1_owned_set_request(identity, 2**64, [destination])
+
+
+def test_v1_owned_request_rejects_duplicate_and_oversized_destinations(tmp_path):
+    identity = ch.v1_publisher_identity(
+        tmp_path / "publisher.json", str(uuid.uuid4()), create=True
+    )
+    destination = {
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
+    }
+    duplicate = {**destination, "workspace_id": destination["workspace_id"].upper()}
+    with pytest.raises(ValueError):
+        ch.v1_owned_set_request(identity, 1, [destination, duplicate])
+    with pytest.raises(ValueError):
+        ch.v1_owned_set_request(identity, 1, [{**destination, "body": "x" * 8193}])
+    request = ch.v1_owned_set_request(identity, 1, [destination])
+    destination["body"] = "changed"
+    assert request["destinations"][0]["body"] == ""
+
+
+def test_v1_owned_request_normalizes_uuid_and_limits_encoded_size(tmp_path):
+    identity = ch.v1_publisher_identity(
+        tmp_path / "publisher.json", str(uuid.uuid4()), create=True
+    )
+    workspace = uuid.uuid4()
+    surface = uuid.uuid4()
+    destination = {
+        "workspace_id": workspace.hex,
+        "surface_id": surface.hex,
+        "title": "Waiting",
+        "body": "",
+    }
+    request = ch.v1_owned_set_request(identity, 1, [destination])
+    assert request["destinations"][0]["workspace_id"] == str(workspace)
+    assert request["destinations"][0]["surface_id"] == str(surface)
+    large = [
+        {**destination, "surface_id": str(uuid.uuid4()), "body": "\0" * 8192}
+        for _ in range(100)
+    ]
+    with pytest.raises(ValueError, match="size"):
+        ch.v1_owned_set_request(identity, 1, large)
+
+
+def test_v1_publisher_replays_persisted_request_before_new_state(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    identity["phase"] = "active"
+    path.write_text(json.dumps(identity))
+    destination = {
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "one",
+    }
+    pending = _publisher_prepare_set(path, store_id, [destination])
+    destination["body"] = "two"
+    retry = _publisher_prepare_set(path, store_id, [destination])
+    assert retry == pending
+    assert json.loads(retry)["destinations"][0]["body"] == "one"
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["revision"] == "0"
+    assert journal["pending"].encode("utf-8") == pending
+
+
+def test_v1_publisher_replays_pending_request_after_process_restart(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    registration = ch.v1_publisher_prepare_register(path, store_id)
+    ch.v1_publisher_ack_register(path, store_id, registration)
+    destination = {
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "before restart",
+    }
+    pending = _publisher_prepare_set(path, store_id, [destination])
+    script = (
+        "import cmux_herdr as c, sys; "
+        "sys.stdout.buffer.write(c.v1_publisher_prepare_set(sys.argv[1], "
+        "sys.argv[2], [], expected_epoch=sys.argv[3]))"
+    )
+    epoch = ch.v1_publisher_identity(path, store_id, create=False)["epoch"]
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path), store_id, epoch],
+        capture_output=True,
+        check=True,
+        timeout=5,
+    )
+    assert result.stdout == pending
+
+
+def test_v1_publisher_acknowledges_only_the_exact_pending_request(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    identity["phase"] = "active"
+    path.write_text(json.dumps(identity))
+    destination = {
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "one",
+    }
+    pending = _publisher_prepare_set(path, store_id, [destination])
+    with pytest.raises(ValueError, match="pending"):
+        ch.v1_publisher_ack_set(path, store_id, b"different")
+    assert ch.v1_publisher_identity(path, store_id, create=False)["pending"] is not None
+    ch.v1_publisher_ack_set(path, store_id, pending)
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["revision"] == "1"
+    assert journal["destinations"] == [destination]
+    assert journal["pending"] is None
+    next_request = _publisher_prepare_set(path, store_id, [])
+    assert json.loads(next_request)["revision"] == "2"
+
+
+def test_v1_publisher_bootstrap_retries_registration_before_activation(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    pending = ch.v1_publisher_prepare_register(path, store_id)
+    assert json.loads(pending)["action"] == "register"
+    assert ch.v1_publisher_prepare_register(path, store_id) == pending
+    with pytest.raises(ValueError, match="pending"):
+        ch.v1_publisher_ack_register(path, store_id, b"different")
+    ch.v1_publisher_ack_register(path, store_id, pending)
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["phase"] == "active"
+    assert journal["pending"] is None
+    first_update = _publisher_prepare_set(path, store_id, [])
+    assert json.loads(first_update)["revision"] == "1"
+
+
+def test_v1_publisher_resume_retries_same_request_and_persists_new_epoch(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    registration = ch.v1_publisher_prepare_register(path, store_id)
+    ch.v1_publisher_ack_register(path, store_id, registration)
+    pending = ch.v1_publisher_prepare_resume(
+        path, store_id, expected_epoch=identity["epoch"]
+    )
+    assert ch.v1_publisher_prepare_resume(
+        path, store_id, expected_epoch=identity["epoch"]
+    ) == pending
+    assert json.loads(pending)["expected_epoch"] == identity["epoch"]
+    new_epoch = str(uuid.uuid4())
+    with pytest.raises(ValueError, match="resumed state"):
+        ch.v1_publisher_ack_resume(
+            path, store_id, pending,
+            {"epoch": new_epoch, "revision": "1", "destinations": []},
+        )
+    assert ch.v1_publisher_identity(path, store_id, create=False)["pending"] is not None
+    ch.v1_publisher_ack_resume(
+        path, store_id, pending,
+        {"epoch": new_epoch, "revision": "0", "destinations": []},
+    )
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["epoch"] == new_epoch
+    assert journal["revision"] == "0"
+    assert journal["pending"] is None
+    with pytest.raises(ValueError, match="writer epoch"):
+        ch.v1_publisher_prepare_set(
+            path, store_id, [], expected_epoch=identity["epoch"]
+        )
+    with pytest.raises(ValueError, match="writer epoch"):
+        ch.v1_publisher_prepare_resume(path, store_id, expected_epoch=identity["epoch"])
+
+
+def test_v1_publisher_fences_pending_set_before_writer_takeover(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    registration = ch.v1_publisher_prepare_register(path, store_id)
+    ch.v1_publisher_ack_register(path, store_id, registration)
+    saved_set = ch.v1_publisher_prepare_set(
+        path, store_id, [], expected_epoch=identity["epoch"]
+    )
+    sent = []
+    new_epoch = str(uuid.uuid4())
+
+    def send(request):
+        sent.append(request)
+        if json.loads(request)["action"] == "set":
+            return {"state": None}
+        return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+
+    assert ch.v1_publisher_recover(path, store_id, send) == new_epoch
+    assert saved_set not in sent
+    assert [json.loads(item)["action"] for item in sent] == ["resume"]
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["epoch"] == new_epoch
+    assert journal["pending"] is None
+
+
+def test_v1_publisher_fences_rejected_pending_set_before_recovery(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    registration = ch.v1_publisher_prepare_register(path, store_id)
+    ch.v1_publisher_ack_register(path, store_id, registration)
+    ch.v1_publisher_prepare_set(
+        path, store_id, [], expected_epoch=identity["epoch"]
+    )
+    new_epoch = str(uuid.uuid4())
+    sent = []
+
+    def send(request):
+        sent.append(request)
+        if json.loads(request)["action"] == "set":
+            raise ch.OwnedSocketError("target_denied")
+        return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+
+    assert ch.v1_publisher_recover(path, store_id, send) == new_epoch
+    assert [json.loads(item)["action"] for item in sent] == ["resume"]
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["epoch"] == new_epoch
+    assert journal["pending"] is None
+
+
+def test_v1_publisher_retries_fence_after_lost_response(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    ch.v1_publisher_ack_register(
+        path, store_id, ch.v1_publisher_prepare_register(path, store_id)
+    )
+    ch.v1_publisher_prepare_set(path, store_id, [], expected_epoch=identity["epoch"])
+    sent = []
+
+    def interrupted(request):
+        sent.append(request)
+        if json.loads(request)["action"] == "set":
+            raise ch.OwnedSocketError("target_denied")
+        raise TimeoutError("response lost")
+
+    with pytest.raises(TimeoutError):
+        ch.v1_publisher_recover(path, store_id, interrupted)
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert journal["pending"].encode() == sent[0]
+    new_epoch = str(uuid.uuid4())
+
+    def retry(request):
+        assert request == sent[0]
+        return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+
+    assert ch.v1_publisher_recover(path, store_id, retry) == new_epoch
+
+
+def test_v1_publisher_recovery_keeps_request_after_lost_response(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+
+    def lost_response(_request):
+        raise TimeoutError("response lost")
+
+    with pytest.raises(TimeoutError):
+        ch.v1_publisher_recover(path, store_id, lost_response)
+    journal = ch.v1_publisher_identity(path, store_id, create=False)
+    assert json.loads(journal["pending"])["action"] == "register"
+    sent = []
+
+    def retry(request):
+        sent.append(request)
+        return {"state": None}
+
+    assert ch.v1_publisher_recover(path, store_id, retry) == journal["epoch"]
+    assert sent == [journal["pending"].encode()]
+
+
+def test_v1_owned_publisher_holds_lease_and_skips_unchanged_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    sent = []
+
+    def send(data):
+        sent.append(data)
+        return {"state": None}
+
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "one",
+    }
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        assert publisher is not None
+        other_state = tmp_path / "other-state"
+        other_state.mkdir()
+        monkeypatch.setattr(ch, "state_dir", other_state)
+        with ch.v1_owned_publisher(path, store_id, send) as competing:
+            assert competing is None
+        assert publisher.publish([destination])
+        assert not publisher.publish([destination])
+    assert [json.loads(data)["action"] for data in sent] == ["register", "set"]
+    with pytest.raises(ValueError, match="lease is closed"):
+        publisher.publish([destination])
+
+
+def test_v1_owned_publisher_rejects_directory_change_during_recovery(tmp_path):
+    parent = tmp_path / "publisher"
+    parent.mkdir()
+    path = parent / "identity.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+
+    def send(_request):
+        parent.rename(tmp_path / "moved")
+        parent.mkdir()
+        return {"state": None}
+
+    with (
+        pytest.raises(ValueError, match="lease directory changed"),
+        ch.v1_owned_publisher(path, store_id, send),
+    ):
+        pass
+
+
+def test_v1_owned_publisher_lease_survives_directory_replacement(tmp_path):
+    parent = tmp_path / "publisher"
+    parent.mkdir()
+    path = parent / "identity.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}) as first:
+        assert first is not None
+        old = tmp_path / "old-publisher"
+        parent.rename(old)
+        shutil.copytree(old, parent)
+        with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}) as second:
+            assert second is None
+
+
+def test_v1_owned_publisher_lease_survives_ancestor_symlink_change(tmp_path):
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    (first_dir / "journal").mkdir()
+    link = tmp_path / "current"
+    link.symlink_to(first_dir, target_is_directory=True)
+    path = link / "journal" / "identity.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}) as first:
+        assert first is not None
+        second_dir = tmp_path / "second"
+        shutil.copytree(first_dir, second_dir)
+        link.unlink()
+        link.symlink_to(second_dir, target_is_directory=True)
+        with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}) as second:
+            assert second is None
+
+
+def test_v1_owned_publisher_uses_private_lease_directory(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}):
+        directory = tmp_path / ".cmux-herdr-publisher-locks"
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert list(directory.glob("*.lock"))
+
+
+def test_v1_owned_publisher_resolves_symlink_before_parent_components(tmp_path):
+    target = tmp_path / "target"
+    child = target / "child"
+    child.mkdir(parents=True)
+    (tmp_path / "link").symlink_to(child, target_is_directory=True)
+    path = tmp_path / "link" / ".." / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}) as publisher:
+        assert publisher is not None
+        assert publisher.path == target / "publisher.json"
+
+
+def test_v1_owned_publisher_excludes_hard_linked_identity(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    alias = tmp_path / "alias.json"
+    os.link(path, alias)
+    with ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}) as first:
+        assert first is not None
+        with ch.v1_owned_publisher(
+            alias, store_id, lambda _: {"state": None}
+        ) as second:
+            assert second is None
+
+
+def test_v1_owned_publisher_excludes_copied_identity_at_another_path(tmp_path):
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    first_path = first_dir / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(first_path, store_id, create=True)
+    with ch.v1_owned_publisher(
+        first_path, store_id, lambda _: {"state": None}
+    ) as first:
+        assert first is not None
+        second_dir = tmp_path / "second"
+        shutil.copytree(first_dir, second_dir)
+        with ch.v1_owned_publisher(
+            second_dir / "publisher.json", store_id, lambda _: {"state": None}
+        ) as second:
+            assert second is None
+
+
+def test_v1_owned_publisher_rejects_identity_replaced_before_recovery(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "publisher.json"
+    other = tmp_path / "other.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    ch.v1_publisher_identity(other, store_id, create=True)
+    recover = ch.v1_publisher_recover
+    sent = []
+
+    def swap_then_recover(*args):
+        os.replace(other, path)
+        return recover(*args)
+
+    monkeypatch.setattr(ch, "v1_publisher_recover", swap_then_recover)
+    with (
+        pytest.raises(ValueError, match="publisher identity changed"),
+        ch.v1_owned_publisher(path, store_id, lambda data: sent.append(data)),
+    ):
+        pass
+    assert not sent
+
+
+def test_v1_owned_publisher_rejects_public_lease_directory(tmp_path):
+    directory = tmp_path / ".cmux-herdr-publisher-locks"
+    directory.mkdir(mode=0o755)
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    with (
+        pytest.raises(ValueError, match="invalid publisher lease directory"),
+        ch.v1_owned_publisher(path, store_id, lambda _: {"state": None}),
+    ):
+        pass
+
+
+def test_v1_owned_publisher_rejects_reentrant_publish(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    holder = []
+    rejections = []
+
+    def send(request):
+        if json.loads(request)["action"] == "set":
+            with pytest.raises(ValueError, match="already publishing"):
+                holder[0].publish([])
+            rejections.append(True)
+        return {"state": None}
+
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        holder.append(publisher)
+        publisher.publish([destination])
+    assert rejections == [True]
+
+
+def test_v1_owned_publisher_uses_guarded_send_for_updates(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    calls = []
+
+    def send(data):
+        calls.append(("plain", json.loads(data)["action"]))
+        return {"state": None}
+
+    def send_guarded(data, guard):
+        with guard():
+            calls.append(("guarded", json.loads(data)["action"]))
+        return {"state": None}
+
+    @contextmanager
+    def guard():
+        calls.append(("guard", "enter"))
+        try:
+            yield
+        finally:
+            calls.append(("guard", "exit"))
+
+    with ch.v1_owned_publisher(path, store_id, send, send_guarded=send_guarded) as p:
+        assert p.publish([destination], send_guard=guard)
+    assert calls == [
+        ("plain", "register"), ("guard", "enter"),
+        ("guarded", "set"), ("guard", "exit"),
+    ]
+
+
+def test_v1_owned_publisher_recovers_rejected_guard_without_stale_send(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    actions = []
+    new_epoch = str(uuid.uuid4())
+
+    def send(data):
+        action = json.loads(data)["action"]
+        actions.append(action)
+        if action == "resume":
+            return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    def guarded_send(data, guard):
+        with guard():
+            return send(data)
+
+    @contextmanager
+    def stale():
+        raise ValueError("stale publication")
+        yield
+
+    with (
+        ch.v1_owned_publisher(path, store_id, send, send_guarded=guarded_send) as p,
+        pytest.raises(ValueError, match="stale publication"),
+    ):
+        p.publish([destination], send_guard=stale)
+    with ch.v1_owned_publisher(path, store_id, send) as p:
+        assert not p.publish([])
+    assert actions == ["register", "resume"]
+
+
+def test_v1_owned_publisher_serializes_baseline_and_publication(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    def send(_data):
+        return {"state": None}
+    with ch.v1_owned_publisher(path, store_id, send, send_guarded=send) as publisher:
+        def prepare():
+            assert publisher.current_destinations() == []
+            with pytest.raises(ValueError, match="already publishing"):
+                publisher.publish([])
+            return [], nullcontext
+
+        assert publisher.publish_verified(prepare)
+
+
+def test_v1_owned_publisher_can_confirm_unchanged_initial_state(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    actions = []
+
+    def send(data):
+        actions.append(json.loads(data)["action"])
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        assert not publisher.publish([])
+        assert publisher.publish([], force=True)
+    assert actions == ["register", "set"]
+    assert ch.v1_publisher_identity(path, store_id, create=False)["revision"] == "1"
+
+
+def test_v1_owned_publisher_returns_durable_initial_publication_receipt(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+
+    def send(_data):
+        return {"state": None}
+
+    def guarded(data, guard):
+        with guard():
+            return send(data)
+
+    with ch.v1_owned_publisher(path, store_id, send, send_guarded=guarded) as p:
+        receipt = p.publish_verified(
+            lambda: ([], nullcontext), force=True, receipt=True
+        )
+        assert receipt == {
+            "store_id": store_id, "producer": identity["producer"],
+            "epoch": p.epoch, "revision": "1", "destinations": [],
+        }
+        assert p.receipt_is_current(receipt)
+        assert p.publish([], force=True)
+        assert not p.receipt_is_current(receipt)
+    assert "capability" not in receipt
+
+
+def test_v1_owned_verified_publication_recovers_pending_in_same_lease(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    actions = []
+    new_epoch = str(uuid.uuid4())
+
+    def send(data):
+        action = json.loads(data)["action"]
+        actions.append(action)
+        if action == "resume":
+            return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    def guarded(data, guard):
+        with guard():
+            return send(data)
+
+    @contextmanager
+    def stale():
+        raise ValueError("stale publication")
+        yield
+
+    with ch.v1_owned_publisher(path, store_id, send, send_guarded=guarded) as p:
+        with pytest.raises(ValueError, match="stale publication"):
+            p.publish([destination], send_guard=stale)
+        assert p.publish_verified(lambda: (p.current_destinations(), nullcontext))
+    assert actions == ["register", "resume"]
+
+
+def test_v1_owned_publisher_fences_uncertain_set_before_new_state(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    new_epoch = str(uuid.uuid4())
+    actions = []
+
+    def send(data):
+        request = json.loads(data)
+        actions.append(request["action"])
+        if request["action"] == "set" and actions.count("set") == 1:
+            raise OSError("response lost")
+        if request["action"] == "resume":
+            return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        with pytest.raises(OSError, match="response lost"):
+            publisher.publish([destination])
+        assert not publisher.publish([])
+    assert actions == ["register", "set", "resume"]
+
+
+def test_v1_owned_publisher_reconciles_uncertain_committed_set(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    new_epoch = str(uuid.uuid4())
+    requests = []
+
+    def send(data):
+        request = json.loads(data)
+        requests.append(request)
+        if request["action"] == "set" and sum(
+            item["action"] == "set" for item in requests
+        ) == 1:
+            raise OSError("response lost after commit")
+        if request["action"] == "resume":
+            return {"state": {
+                "epoch": new_epoch, "revision": "0", "destinations": [destination]
+            }}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        with pytest.raises(OSError, match="response lost"):
+            publisher.publish([destination])
+        assert publisher.publish([])
+    assert [request["action"] for request in requests] == [
+        "register", "set", "resume", "set"
+    ]
+    assert requests[-1]["epoch"] == new_epoch
+    assert requests[-1]["destinations"] == []
+
+
+def test_v1_owned_publisher_fences_denied_update_and_can_publish_again(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    new_epoch = str(uuid.uuid4())
+    actions = []
+
+    def send(data):
+        action = json.loads(data)["action"]
+        actions.append(action)
+        if action == "set" and actions.count("set") == 1:
+            raise ch.OwnedSocketError("target_denied")
+        if action == "resume":
+            return {"state": {"epoch": new_epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        with pytest.raises(ch.OwnedSocketError, match="target_denied"):
+            publisher.publish([destination])
+        assert publisher.epoch == new_epoch
+        assert publisher.publish([destination])
+    assert actions == ["register", "set", "resume", "set"]
+
+
+def test_v1_owned_publisher_retries_interrupted_fence_without_new_request(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    epoch = str(uuid.uuid4())
+    requests = []
+
+    def send(data):
+        requests.append(data)
+        action = json.loads(data)["action"]
+        if action == "set" and len(requests) == 2:
+            raise ch.OwnedSocketError("target_denied")
+        if action == "resume":
+            if len(requests) == 3:
+                raise TimeoutError("response lost")
+            return {"state": {"epoch": epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        with pytest.raises(TimeoutError):
+            publisher.publish([destination])
+        assert publisher.publish([destination])
+    assert requests[2] == requests[3]
+    assert [json.loads(data)["action"] for data in requests] == [
+        "register", "set", "resume", "resume", "set"
+    ]
+
+
+def test_v1_owned_publisher_recovers_after_resume_journal_sync_failure(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    epoch = str(uuid.uuid4())
+    calls = []
+    write = ch._v1_write_publisher_journal
+
+    def fail_after_resume_write(*args):
+        write(*args)
+        journal = args[3]
+        if journal["epoch"] == epoch and not calls:
+            calls.append(True)
+            raise OSError("simulated sync failure")
+
+    def send(data):
+        action = json.loads(data)["action"]
+        if action == "set" and not calls:
+            raise ch.OwnedSocketError("target_denied")
+        if action == "resume":
+            return {"state": {
+                "epoch": epoch.upper(), "revision": "0", "destinations": []
+            }}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        monkeypatch.setattr(ch, "_v1_write_publisher_journal", fail_after_resume_write)
+        with pytest.raises(OSError, match="simulated sync failure"):
+            publisher.publish([destination])
+        assert publisher.publish([destination])
+
+
+def test_v1_owned_publisher_retries_resume_ack_before_journal_write(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    destination = {
+        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+        "title": "Waiting", "body": "",
+    }
+    epoch = str(uuid.uuid4())
+    failed = []
+    write = ch._v1_write_publisher_journal
+
+    def fail_before_resume_write(*args):
+        if args[3]["epoch"] == epoch and not failed:
+            failed.append(True)
+            raise OSError("simulated pre-write failure")
+        write(*args)
+
+    def send(data):
+        action = json.loads(data)["action"]
+        if action == "set" and not failed:
+            raise ch.OwnedSocketError("target_denied")
+        if action == "resume":
+            return {"state": {"epoch": epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        monkeypatch.setattr(ch, "_v1_write_publisher_journal", fail_before_resume_write)
+        with pytest.raises(OSError, match="simulated pre-write failure"):
+            publisher.publish([destination])
+        assert publisher.publish([destination])
+
+
+def test_v1_owned_publisher_retries_invalid_resume_response(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    target = {"workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
+              "title": "Waiting", "body": ""}
+    attempts = []
+    epoch = str(uuid.uuid4())
+
+    def send(data):
+        action = json.loads(data)["action"]
+        if action == "set" and not attempts:
+            raise ch.OwnedSocketError("target_denied")
+        if action == "resume":
+            attempts.append(data)
+            if len(attempts) == 1:
+                return {"state": None}
+            return {"state": {"epoch": epoch, "revision": "0", "destinations": []}}
+        return {"state": None}
+
+    with ch.v1_owned_publisher(path, store_id, send) as publisher:
+        with pytest.raises(ValueError, match="invalid resumed state"):
+            publisher.publish([target])
+        assert publisher.publish([target])
+    assert attempts[0] == attempts[1]
+
+
+def test_v1_owned_destinations_aggregate_sources_by_surface():
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"v1": {
+        "clients": {
+            "one": {"workspace": workspace, "surface": surface, "source": "a"},
+            "two": {
+                "workspace": workspace.upper(),
+                "surface": surface.upper(),
+                "source": "b",
+            },
+            "three": {"workspace": workspace, "surface": surface, "source": "a"},
+        },
+        "sources": {
+            "a": {"attention": {"p1": {"status": "blocked"}}},
+            "b": {"attention": {"p2": {"status": "done"}}},
+        },
+    }}
+    assert ch.v1_owned_destinations(state) == [{
+        "workspace_id": workspace, "surface_id": surface,
+        "title": "herdr: 1 waiting · 1 finished", "body": "",
+    }]
+    del state["v1"]["sources"]["b"]
+    with pytest.raises(ValueError, match="incomplete"):
+        ch.v1_owned_destinations(state)
+
+
+def test_v1_owned_destinations_rejects_corrupt_attention():
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"v1": {
+        "clients": {"one": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "unexpected"}}}},
+    }}
+    with pytest.raises(ValueError, match="attention"):
+        ch.v1_owned_destinations(state)
+    state["v1"]["sources"]["a"]["attention"]["p"] = {"acknowledged": "episode"}
+    assert ch.v1_owned_destinations(state) == []
+
+
+def test_v1_owned_publication_requires_complete_verified_snapshot(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"sessions": {}, "v1": {
+        "clients": {
+            "client": {"workspace": workspace, "surface": surface, "source": "a"}
+        },
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }}
+    ch.save_state(state)
+    sent = []
+    publisher = SimpleNamespace(publish=lambda targets: sent.append(targets))
+    partial = SimpleNamespace(scope=lambda: set())
+    assert not ch.v1_publish_owned_once(publisher, partial)
+    assert sent == []
+    complete = SimpleNamespace(scope=lambda: None)
+    assert ch.v1_publish_owned_once(publisher, complete)
+    assert sent[0][0]["title"] == "herdr: 1 waiting"
+    ch.STATE_PATH.write_text("invalid JSON")
+    with pytest.raises(ValueError):
+        ch.v1_publish_owned_once(publisher, complete)
+    assert len(sent) == 1
+
+
+def test_v1_owned_publication_accepts_complete_empty_initial_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    sent = []
+    publisher = SimpleNamespace(publish=lambda targets: sent.append(targets))
+    assert ch.v1_publish_owned_once(publisher, SimpleNamespace(scope=lambda: None))
+    assert sent == [[]]
+
+
+def test_v1_owned_publication_updates_only_certified_targets(tmp_path, monkeypatch):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, first, second = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    ch.save_state({"sessions": {}, "v1": {
+        "clients": {
+            "a": {"workspace": workspace, "surface": first, "source": "a"},
+            "b": {"workspace": workspace, "surface": second, "source": "b"},
+        },
+        "sources": {
+            "a": {"attention": {"p": {"status": "blocked"}}},
+            "b": {"attention": {"p": {"status": "done"}}},
+        },
+    }})
+    previous = [{"workspace_id": workspace, "surface_id": second,
+                 "title": "Existing", "body": ""}]
+    sent = []
+    publisher = SimpleNamespace(
+        current_destinations=lambda: previous,
+        publish=lambda value: sent.append(value),
+    )
+    verification = SimpleNamespace(scope=lambda: {(workspace, first)})
+    assert ch.v1_publish_owned_once(publisher, verification)
+    by_surface = {item["surface_id"]: item for item in sent[0]}
+    assert by_surface[first]["title"] == "herdr: 1 waiting"
+    assert by_surface[second] == previous[0]
+    sent.clear()
+    assert not ch.v1_publish_owned_once(publisher, verification, require_complete=True)
+    assert sent == []
+
+
+def test_v1_owned_publication_revalidates_after_preparation(tmp_path, monkeypatch):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"sessions": {}, "v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }}
+    ch.save_state(state)
+    sent = []
+
+    class Publisher:
+        send_guarded = True
+
+        def current_destinations(self):
+            return []
+
+        def publish_verified(self, prepare):
+            targets, send_guard = prepare()
+            state["v1"]["sources"]["a"]["attention"] = {}
+            ch.save_state(state)
+            with send_guard():
+                sent.append(targets)
+
+    with pytest.raises(ValueError, match="stale publication"):
+        ch.v1_publish_owned_once(Publisher(), SimpleNamespace(scope=lambda: None))
+    assert sent == []
+
+
+def test_v1_owned_publication_allows_state_update_during_journal_write(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"sessions": {}, "v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }}
+    ch.save_state(state)
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, store_id, create=True)
+    sent, updated = [], threading.Event()
+    write_journal = ch._v1_write_publisher_journal
+
+    def send(data):
+        sent.append(json.loads(data)["action"])
+        return {"state": None}
+
+    def guarded_send(data, guard):
+        with guard():
+            return send(data)
+
+    def update():
+        with ch.state_lock():
+            state["v1"]["sources"]["a"]["attention"] = {}
+            ch.save_state(state)
+        updated.set()
+
+    def slow_write(*args):
+        journal = args[3]
+        if journal["pending"] and json.loads(journal["pending"])["action"] == "set":
+            worker = threading.Thread(target=update)
+            worker.start()
+            assert updated.wait(2)
+            worker.join(2)
+        return write_journal(*args)
+
+    with ch.v1_owned_publisher(path, store_id, send, send_guarded=guarded_send) as p:
+        monkeypatch.setattr(ch, "_v1_write_publisher_journal", slow_write)
+        with pytest.raises(ValueError, match="stale publication"):
+            ch.v1_publish_owned_once(p, SimpleNamespace(scope=lambda: None))
+    assert sent == ["register"]
+
+
+def test_v1_owned_publication_does_not_send_changed_snapshot(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"sessions": {}, "v1": {
+        "clients": {
+            "client": {"workspace": workspace, "surface": surface, "source": "a"}
+        },
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }}
+    ch.save_state(state)
+    started, updated = threading.Event(), threading.Event()
+
+    def update():
+        started.set()
+        with ch.state_lock():
+            state["v1"]["sources"]["a"]["attention"]["p"]["status"] = "done"
+            ch.save_state(state)
+        updated.set()
+
+    worker = threading.Thread(target=update)
+
+    def publish(targets):
+        worker.start()
+        assert started.wait(5)
+        assert not updated.wait(0.05)
+        assert targets[0]["title"] == "herdr: 1 waiting"
+
+    assert ch.v1_publish_owned_once(
+        SimpleNamespace(publish=publish), SimpleNamespace(scope=lambda: None)
+    )
+    worker.join(5)
+    assert updated.is_set()
+
+
+def test_v1_owned_publication_sends_aggregate_over_local_socket(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    ch.save_state({"sessions": {}, "v1": {
+        "clients": {
+            "client": {"workspace": workspace, "surface": surface, "source": "a"}
+        },
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }})
+    store_id = str(uuid.uuid4())
+    identity_path = tmp_path / "publisher.json"
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for _ in range(3):
+                    request = json.loads(stream.readline())
+                    received.append(request)
+                    result = (
+                        {"store_id": store_id}
+                        if request["method"] == "notification.state.info"
+                        else {"state": None}
+                    )
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": result
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            assert session.store_identity() == store_id
+            ch.v1_publisher_identity(identity_path, store_id, create=True)
+            with ch.v1_owned_publisher(
+                identity_path, store_id, session.request,
+                send_guarded=session.request_with_send_guard,
+            ) as publisher:
+                assert ch.v1_publish_owned_once(
+                    publisher, SimpleNamespace(scope=lambda: None)
+                )
+        worker.join(5)
+        assert [item["method"] for item in received] == [
+            "notification.state.info", "notification.state.command",
+            "notification.state.command",
+        ]
+        assert [item["params"]["action"] for item in received[1:]] == [
+            "register", "set"
+        ]
+        assert received[2]["params"]["destinations"][0]["title"] == "herdr: 1 waiting"
+        identity = ch.v1_publisher_identity(identity_path, store_id, create=False)
+        assert identity["pending"] is None
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_publication_releases_state_lock_before_response(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"sessions": {}, "v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }}
+    ch.save_state(state)
+    store_id = str(uuid.uuid4())
+    path = tmp_path / "publisher.json"
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    updated = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for index in range(2):
+                    request = json.loads(stream.readline())
+                    if index == 1:
+                        with ch.state_lock():
+                            state["v1"]["sources"]["a"]["attention"] = {}
+                            ch.save_state(state)
+                        updated.set()
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": {"state": None}
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        ch.v1_publisher_identity(path, store_id, create=True)
+        with (
+            ch.V1OwnedSocketSession(sock_path, timeout=2) as session,
+            ch.v1_owned_publisher(
+                path, store_id, session.request,
+                send_guarded=session.request_with_send_guard,
+            ) as publisher,
+        ):
+            assert ch.v1_publish_owned_once(
+                publisher, SimpleNamespace(scope=lambda: None)
+            )
+        worker.join(5)
+        assert updated.is_set()
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_supervisor_publishes_over_one_session(tmp_path, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("owned")
+    marker.chmod(0o600)
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    ch.save_state({"sessions": {}, "v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }})
+    stop = threading.Event()
+    opened = []
+    published = []
+
+    class Publisher:
+        def publish(self, destinations):
+            published.append(destinations)
+            if len(published) == 2:
+                stop.set()
+
+    @contextmanager
+    def factory(*_args):
+        opened.append(True)
+        yield object(), Publisher()
+
+    monkeypatch.setattr(ch, "v1_owned_socket_transport", factory)
+    ch.v1_supervised_owned_publish_loop(stop, SimpleNamespace(scope=lambda: None), {})
+    assert opened == [True]
+    assert len(published) == 2
+    assert published[0][0]["title"] == "herdr: 1 waiting"
+
+
+def test_v1_owned_supervisor_reconnects_after_socket_loss(tmp_path, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("owned")
+    marker.chmod(0o600)
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    ch.save_state({"sessions": {}, "v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }})
+    stop = threading.Event()
+    opened = []
+    published = []
+
+    class Publisher:
+        def publish(self, destinations):
+            published.append(destinations)
+            if len(published) == 1:
+                raise ch.SocketError("response lost")
+            stop.set()
+
+    @contextmanager
+    def factory(*_args):
+        opened.append(True)
+        yield object(), Publisher()
+
+    monkeypatch.setattr(ch, "v1_owned_socket_transport", factory)
+    ch.v1_supervised_owned_publish_loop(stop, SimpleNamespace(scope=lambda: None), {})
+    assert opened == [True, True]
+    assert published[0] == published[1]
+
+
+def test_v1_owned_supervisor_publishes_before_and_after_transition(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    stop = threading.Event()
+    session, publisher = object(), object()
+    calls = []
+
+    @contextmanager
+    def factory(*_args):
+        yield session, publisher
+
+    def transition(current_session, current_publisher, _verification):
+        assert (current_session, current_publisher) == (session, publisher)
+        calls.append("transition")
+        marker = tmp_path / "v1-notification-backend"
+        marker.write_text("owned")
+        marker.chmod(0o600)
+        return True
+
+    def publish(*_args):
+        calls.append("publish")
+        if calls.count("publish") == 2:
+            stop.set()
+
+    monkeypatch.setattr(ch, "v1_owned_socket_transport", factory)
+    monkeypatch.setattr(ch, "v1_transition_owned_backend", transition)
+    monkeypatch.setattr(ch, "v1_publish_owned_once", publish)
+    ch.v1_supervised_owned_publish_loop(stop, SimpleNamespace(scope=lambda: None), {})
+    assert calls == ["publish", "transition", "publish"]
+
+
+def test_v1_owned_supervisor_transitions_over_socket(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "v1_cmux_socket_password", lambda *_args: None)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    ch.save_state({"v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }})
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready, stop = threading.Event(), threading.Event()
+    requests = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            server.settimeout(10)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for line in stream:
+                    request = json.loads(line)
+                    requests.append(request)
+                    method = request["method"]
+                    if method == "notification.state.info":
+                        result = {"store_id": store}
+                    elif method == "notification.list":
+                        result = {"notifications": []}
+                    else:
+                        result = {"state": None}
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": result,
+                    }).encode() + b"\n")
+
+    def monitor():
+        marker = tmp_path / "v1-notification-backend"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if marker.read_text() == "owned":
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.01)
+        stop.set()
+
+    worker = threading.Thread(target=serve, daemon=True)
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    monitor_thread.start()
+    try:
+        ch.v1_supervised_owned_publish_loop(
+            stop, SimpleNamespace(scope=lambda: None),
+            {"CMUX_SOCKET_PATH": str(sock_path)},
+        )
+        worker.join(5)
+        monitor_thread.join(5)
+        assert not worker.is_alive()
+        assert (tmp_path / "v1-notification-backend").read_text() == "owned"
+        sets = [item for item in requests if item["params"].get("action") == "set"]
+        assert len(sets) == 2
+        assert sets[0]["params"]["destinations"][0]["title"] == "herdr: 1 waiting"
+    finally:
+        stop.set()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_supervisor_starts_and_joins_both_publishers(monkeypatch):
+    calls = []
+
+    class Leases:
+        def acquire_leader(self):
+            return True
+
+        def reconcile(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            calls.append("leases closed")
+
+    class Sources:
+        def __init__(self, _start):
+            pass
+
+        def close(self):
+            calls.append("sources closed")
+
+    class Thread:
+        def __init__(self, *, target, **_kwargs):
+            self.name = target.__name__
+
+        def start(self):
+            calls.append(("start", self.name))
+
+        def join(self):
+            calls.append(("join", self.name))
+
+    monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
+    monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch.threading, "Thread", Thread)
+    stop = SimpleNamespace(is_set=lambda: True)
+    assert ch.v1_run_supervisor({}, stop)
+    assert calls == [
+        ("start", "v1_supervised_publish_loop"),
+        ("start", "v1_supervised_owned_publish_loop"),
+        ("join", "v1_supervised_publish_loop"),
+        ("join", "v1_supervised_owned_publish_loop"),
+        "sources closed", "leases closed",
+    ]
+
+
+def test_v1_owned_supervisor_publishes_partial_scope_during_migration(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    stop = ch.threading.Event()
+    session, publisher = object(), object()
+    calls = []
+
+    @ch.contextmanager
+    def transport(*args):
+        yield session, publisher
+
+    monkeypatch.setattr(ch, "v1_owned_socket_transport", transport)
+    monkeypatch.setattr(ch, "v1_notification_backend", lambda: "ordinary")
+    monkeypatch.setattr(
+        ch, "v1_publish_owned_once", lambda *args: calls.append("publish")
+    )
+
+    def transition(*args):
+        calls.append("transition")
+        stop.set()
+        return False
+
+    monkeypatch.setattr(ch, "v1_transition_owned_backend", transition)
+    verified = SimpleNamespace(scope=lambda: {("workspace", "surface")})
+    ch.v1_supervised_owned_publish_loop(stop, verified, {})
+    assert calls == ["publish", "transition"]
+
+
+def test_v1_owned_supervisor_recovers_lost_update_over_socket(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "v1_cmux_socket_password", lambda *_: None)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("owned")
+    marker.chmod(0o600)
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    ch.save_state({"sessions": {}, "v1": {
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }})
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready, stop = threading.Event(), threading.Event()
+    store_id, new_epoch = str(uuid.uuid4()), str(uuid.uuid4())
+    requests = []
+    committed = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(2)
+            server.settimeout(10)
+            ready.set()
+            for connection_number in range(2):
+                conn, _ = server.accept()
+                with conn, conn.makefile("rb") as stream:
+                    while line := stream.readline():
+                        request = json.loads(line)
+                        requests.append(request)
+                        params = request["params"]
+                        if request["method"] == "notification.state.info":
+                            result = {"store_id": store_id}
+                        elif params["action"] == "set":
+                            if connection_number == 0:
+                                committed.extend(params["destinations"])
+                                break  # The server committed but its reply was lost.
+                            assert params["destinations"] == committed
+                            result = {"state": None}
+                        elif params["action"] == "resume":
+                            result = {"state": {
+                                "epoch": new_epoch, "revision": "0",
+                                "destinations": committed,
+                            }}
+                        else:
+                            result = {"state": None}
+                        conn.sendall(json.dumps({
+                            "id": request["id"], "ok": True, "result": result,
+                        }).encode() + b"\n")
+                        if params.get("action") == "resume":
+                            stop.set()
+                            break
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    watchdog = threading.Timer(15, stop.set)
+    watchdog.start()
+    try:
+        ch.v1_supervised_owned_publish_loop(
+            stop, SimpleNamespace(scope=lambda: None),
+            {"CMUX_SOCKET_PATH": str(sock_path)},
+        )
+        worker.join(5)
+        assert not worker.is_alive()
+        journal = ch.v1_publisher_identity(
+            tmp_path / "v1-owned-publisher.json", store_id, create=False
+        )
+        assert journal["epoch"] == new_epoch
+        assert journal["pending"] is None
+        assert journal["destinations"] == committed
+        assert committed[0]["title"] == "herdr: 1 waiting"
+        assert [r["params"].get("action", "info") for r in requests] == [
+            "info", "register", "set", "info", "resume"
+        ]
+    finally:
+        watchdog.cancel()
+        stop.set()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_publisher_prepares_large_replacement_after_large_ack(tmp_path):
+    path = tmp_path / "publisher.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    identity["phase"] = "active"
+    path.write_text(json.dumps(identity))
+    destinations = [
+        {
+            "workspace_id": str(uuid.uuid4()),
+            "surface_id": str(uuid.uuid4()),
+            "title": "Waiting",
+            "body": "x" * 8192,
+        }
+        for _ in range(256)
+    ]
+    first = _publisher_prepare_set(path, store_id, destinations)
+    ch.v1_publisher_ack_set(path, store_id, first)
+    second = _publisher_prepare_set(path, store_id, destinations)
+    assert json.loads(second)["revision"] == "2"
+
+
+def test_v1_publisher_rejects_parent_replacement_after_commit(tmp_path, monkeypatch):
+    parent = tmp_path / "publisher"
+    parent.mkdir()
+    path = parent / "identity.json"
+    store_id = str(uuid.uuid4())
+    identity = ch.v1_publisher_identity(path, store_id, create=True)
+    identity["phase"] = "active"
+    path.write_text(json.dumps(identity))
+    replace = os.replace
+
+    def replace_and_move(*args, **kwargs):
+        replace(*args, **kwargs)
+        parent.rename(tmp_path / "moved")
+        parent.mkdir()
+
+    monkeypatch.setattr(ch.os, "replace", replace_and_move)
+    with pytest.raises(ValueError, match="directory changed"):
+        _publisher_prepare_set(path, store_id, [])
 
 
 @pytest.fixture
@@ -36,6 +1853,11 @@ def no_session_env(monkeypatch):
     monkeypatch.delenv("HERDR_SESSION", raising=False)
     monkeypatch.delenv("HERDR_SOCKET_PATH", raising=False)
     monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolated_publisher_lease_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "_v1_publisher_lease_home", lambda: tmp_path)
 
 
 @pytest.fixture
@@ -1470,6 +3292,920 @@ def test_socket_rpc_roundtrip():
 
     assert result == {"type": "pong"}
     assert received == [{"id": "1", "method": "ping", "params": {}}]
+
+
+def test_v1_owned_socket_request_preserves_saved_params_bytes():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    received = []
+    pending = b'{"store_id":"example", "action":"read"}'
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                data = b""
+                while not data.endswith(b"\n"):
+                    data += conn.recv(65536)
+                received.append(data)
+                request = json.loads(data)
+                conn.sendall(json.dumps({"id": request["id"], "ok": True,
+                                         "result": {"state": None}}).encode() + b"\n")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    try:
+        assert ch.v1_owned_socket_request(sock_path, pending) == {"state": None}
+        thread.join(5)
+        assert pending in received[0]
+        assert json.loads(received[0])["method"] == "notification.state.command"
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [b'{"id":"wrong","ok":true,"result":{}}\n', b"not-json\n", b"{}\n"],
+)
+def test_v1_owned_socket_request_rejects_invalid_response(response):
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(response)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    try:
+        with pytest.raises(ch.SocketError):
+            ch.v1_owned_socket_request(sock_path, b'{}')
+        thread.join(5)
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_request_preserves_error_code():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(65536))
+                response = {"id": request["id"], "ok": False,
+                            "error": {"code": "wrong_epoch", "message": "secret"}}
+                conn.sendall(json.dumps(response).encode() + b"\n")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    try:
+        with pytest.raises(ch.OwnedSocketError) as error:
+            ch.v1_owned_socket_request(sock_path, b"{}")
+        assert error.value.code == "wrong_epoch"
+        assert "secret" not in str(error.value)
+        thread.join(5)
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_session_reuses_connection_for_requests():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for _ in range(2):
+                    request = json.loads(stream.readline())
+                    received.append(request["params"])
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": {"state": None}
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            assert session.request(b'{"action":"register"}') == {"state": None}
+            assert session.request(b'{"action":"set"}') == {"state": None}
+        with pytest.raises(ch.SocketError, match="cannot be reopened"), session:
+            pass
+        worker.join(5)
+        assert received == [{"action": "register"}, {"action": "set"}]
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_session_presents_capability_on_every_request():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    prefixes = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for _ in range(2):
+                    prefix, capability, command = stream.readline().split(b" ", 2)
+                    prefixes.append((prefix, capability))
+                    request = json.loads(command)
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": {"state": None},
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path, capability="test-token") as session:
+            session.request(b'{"action":"register"}')
+            session.request(b'{"action":"set"}')
+        worker.join(5)
+        assert prefixes == [(b"_cmux_capability_v1", b"test-token")] * 2
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_session_reads_store_identity():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    store_id = str(uuid.uuid4())
+    requests = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(65536))
+                requests.append(request)
+                conn.sendall(json.dumps({
+                    "id": request["id"], "ok": True,
+                    "result": {"store_id": store_id.upper()},
+                }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            assert session.store_identity() == store_id
+        worker.join(5)
+        assert requests[0]["method"] == "notification.state.info"
+        assert requests[0]["params"] == {}
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_backend_probe_requires_valid_store_identity(monkeypatch, tmp_path):
+    events = []
+
+    class Session:
+        def __init__(self, path, **_kwargs):
+            events.append(("open", path))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            events.append(("close",))
+
+        def store_identity(self):
+            events.append(("probe",))
+            return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        def list_notifications(self):
+            events.append(("list",))
+            return []
+
+    monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
+    assert ch.v1_probe_owned_backend({"CMUX_SOCKET_PATH": "/tmp/cmux"}, tmp_path)
+    assert events == [
+        ("open", "/tmp/cmux"), ("probe",), ("probe",), ("list",), ("close",)
+    ]
+    assert not ch.v1_probe_owned_backend({}, tmp_path)
+
+
+def test_v1_owned_backend_probe_waits_for_unidentified_legacy_unread(
+    monkeypatch, tmp_path
+):
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def store_identity(self):
+            return str(uuid.uuid4())
+
+        def list_notifications(self):
+            return [{"id": str(uuid.uuid4()), "is_read": False,
+                     "subtitle": ch.NOTIFICATION_SUBTITLE}]
+
+    monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
+    assert not ch.v1_probe_owned_backend({"CMUX_SOCKET_PATH": "/tmp/cmux"}, tmp_path)
+
+
+def test_v1_owned_backend_rechecks_store_and_unread_notifications():
+    store_id = str(uuid.uuid4())
+    session = SimpleNamespace(store_identity=lambda: store_id, list_notifications=list)
+    assert ch.v1_owned_backend_is_clear(session, store_id)
+    session.list_notifications = lambda: [
+        {"id": str(uuid.uuid4()), "is_read": False,
+         "subtitle": ch.NOTIFICATION_SUBTITLE}
+    ]
+    assert not ch.v1_owned_backend_is_clear(session, store_id)
+    session.store_identity = lambda: str(uuid.uuid4())
+    assert not ch.v1_owned_backend_is_clear(session, store_id)
+
+
+def test_v1_supervisor_handoff_requires_complete_and_supported_backend(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    calls = []
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            calls.append("probe")
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def store_identity(self):
+            return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        def list_notifications(self):
+            return []
+
+    monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
+    monkeypatch.setattr(
+        ch, "v1_try_supervisor_handoff",
+        lambda *_args, **kwargs: calls.append("handoff") or kwargs["final_check"](),
+    )
+    verified = SimpleNamespace(scope=lambda: set())
+    assert not ch.v1_maybe_supervisor_handoff({}, object(), object(), verified, {})
+    assert calls == []
+    verified.scope = lambda: None
+    assert ch.v1_maybe_supervisor_handoff(
+        {}, object(), object(), verified, {"CMUX_SOCKET_PATH": "/tmp/cmux"}
+    )
+    assert calls == ["probe", "handoff"]
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("owned")
+    marker.chmod(0o600)
+    calls.clear()
+    assert not ch.v1_maybe_supervisor_handoff({}, object(), object(), verified, {})
+    assert calls == []
+
+
+def test_v1_supervisor_keeps_legacy_when_store_provenance_is_missing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.STATE_PATH.write_text(json.dumps({"v1": {"destinations": {
+        "old": {"notification_id": "old-notice"}
+    }}}))
+    calls = []
+
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def store_identity(self):
+            return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        def list_notifications(self):
+            return [{"id": "old-notice", "is_read": False}]
+
+    monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
+    monkeypatch.setattr(
+        ch, "v1_try_supervisor_handoff", lambda *args, **kwargs: calls.append("retire")
+    )
+    verified = SimpleNamespace(scope=lambda: None)
+    assert not ch.v1_maybe_supervisor_handoff(
+        {}, object(), object(), verified, {"CMUX_SOCKET_PATH": "/tmp/cmux"}
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize("visible", [[], [{"id": "old-notice", "is_read": True}]])
+def test_v1_cleanup_can_skip_resolved_unproven_ordinary_notice(visible):
+    state = {"v1": {"destinations": {"old": {"notification_id": "old-notice"}}}}
+    resolved = ch.v1_resolved_unproven_destinations(state, visible)
+    inventory = ch.v1_ordinary_cleanup_inventory(
+        state, str(uuid.uuid4()), resolved_unproven=resolved
+    )
+    assert inventory["items"] == []
+
+
+def test_v1_supervisor_attempts_handoff_after_recovery_and_discovery(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    calls = []
+
+    class Leases:
+        def acquire_leader(self):
+            return True
+
+        def reconcile(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class Sources:
+        def __init__(self, _start):
+            pass
+
+        def reconcile(self, desired, **_kwargs):
+            return desired
+
+        def close(self):
+            pass
+
+    class Verification:
+        def __init__(self, _sources):
+            pass
+
+        def update(self, *_args, **_kwargs):
+            pass
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self):
+            pass
+
+    class Stop:
+        done = False
+
+        def is_set(self):
+            return self.done
+
+        def wait(self, _seconds):
+            self.done = True
+
+    monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
+    monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch, "V1PublicationVerification", Verification)
+    monkeypatch.setattr(ch.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        ch, "v1_recover_legacy_handoff", lambda: calls.append("recover") or True
+    )
+    monkeypatch.setattr(ch, "v1_discover_clients", lambda _cfg: {"complete": True})
+    monkeypatch.setattr(ch, "v1_discovered_targets", lambda _inventory: {"c": {}})
+    monkeypatch.setattr(ch, "v1_reconcile_supervisor_inventory", lambda *_args: None)
+    monkeypatch.setattr(
+        ch, "v1_maybe_supervisor_handoff",
+        lambda *_args: calls.append("handoff") or False,
+    )
+    assert ch.v1_run_supervisor({}, Stop())
+    assert calls == ["recover", "handoff"]
+
+
+def test_v1_owned_socket_send_guard_released_before_response():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready, released = threading.Event(), threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(65536))
+                assert released.wait(2)
+                conn.sendall(json.dumps({
+                    "id": request["id"], "ok": True, "result": {"state": None},
+                }).encode() + b"\n")
+
+    @contextmanager
+    def guard():
+        try:
+            yield
+        finally:
+            released.set()
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            assert session.request_with_send_guard(b'{"action":"set"}', guard) == {
+                "state": None
+            }
+        worker.join(5)
+        assert not worker.is_alive()
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_send_guard_failure_sends_nothing():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                received.append(conn.recv(65536))
+
+    @contextmanager
+    def guard():
+        raise ValueError("stale publication")
+        yield
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            with pytest.raises(ValueError, match="stale publication"):
+                session.request_with_send_guard(b'{"action":"set"}', guard)
+            with pytest.raises(ch.SocketError, match="session is closed"):
+                session.request(b"{}")
+        worker.join(5)
+        assert received == [b""]
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_guarded_send_times_out_and_closes_connection():
+    client, server = socket.socketpair()
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    session = ch.V1OwnedSocketSession("unused", timeout=5)
+    session.conn = client
+    released = []
+
+    @contextmanager
+    def guard():
+        try:
+            yield
+        finally:
+            released.append(True)
+
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            session.request_with_send_guard(
+                json.dumps({"data": "x" * 2_000_000}).encode(), guard
+            )
+        assert time.monotonic() - start < 1
+        assert released == [True]
+        assert session.conn is None
+    finally:
+        session.__exit__(None, None, None)
+        server.close()
+
+
+@pytest.mark.parametrize("result", [{}, {"store_id": "invalid"}, {"store_id": None}])
+def test_v1_owned_socket_session_rejects_invalid_store_identity(result):
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(65536))
+                conn.sendall(json.dumps({
+                    "id": request["id"], "ok": True, "result": result,
+                }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            with pytest.raises(ch.SocketError, match="invalid store identity"):
+                session.store_identity()
+            with pytest.raises(ch.SocketError, match="session is closed"):
+                session.request(b"{}")
+        worker.join(5)
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("capability", [None, "test-token"])
+def test_v1_owned_socket_session_authenticates_once_before_commands(capability):
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    received = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                received.append(stream.readline())
+                conn.sendall(b"OK authenticated\n")
+                for _ in range(2):
+                    line = stream.readline()
+                    if capability:
+                        prefix = b"_cmux_capability_v1 test-token "
+                        assert line.startswith(prefix)
+                        line = line[len(prefix):]
+                    request = json.loads(line)
+                    received.append(request["params"]["action"])
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": {"state": None},
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(
+            sock_path, password="test-password", capability=capability
+        ) as session:
+            session.request(b'{"action":"register"}')
+            session.request(b'{"action":"set"}')
+        worker.join(5)
+        prefix = b"_cmux_capability_v1 test-token " if capability else b""
+        assert received == [prefix + b"auth test-password\n", "register", "set"]
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_cmux_socket_password_prefers_environment_and_reads_saved_file(tmp_path):
+    directory = tmp_path / ".local" / "state" / "cmux"
+    directory.mkdir(parents=True)
+    (directory / "socket-control-password").write_text("saved-password\n")
+    assert ch.v1_cmux_socket_password(
+        {"CMUX_SOCKET_PASSWORD": "env-password\n"}, tmp_path
+    ) == "env-password"
+    assert ch.v1_cmux_socket_password({}, tmp_path) == "saved-password"
+    assert ch.v1_cmux_socket_password(
+        {"CMUX_SOCKET_PASSWORD": "\n"}, tmp_path
+    ) == "saved-password"
+    (directory / "socket-control-password").unlink()
+    assert ch.v1_cmux_socket_password({}, tmp_path) is None
+
+
+def test_v1_cmux_socket_password_normalizes_unicode_newlines(tmp_path):
+    directory = tmp_path / ".local" / "state" / "cmux"
+    directory.mkdir(parents=True)
+    (directory / "socket-control-password").write_text("\u2028saved\u0085")
+    assert ch.v1_cmux_socket_password(
+        {"CMUX_SOCKET_PASSWORD": "\u2029"}, tmp_path
+    ) == "saved"
+    assert ch.v1_cmux_socket_password(
+        {"CMUX_SOCKET_PASSWORD": "\x0bvalue\u2028"}, tmp_path
+    ) == "value"
+
+
+def test_v1_cmux_socket_password_tolerates_unreadable_file(tmp_path, monkeypatch):
+    def denied(*_args, **_kwargs):
+        raise PermissionError("unavailable")
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    assert ch.v1_cmux_socket_password({}, tmp_path) is None
+
+
+def test_v1_owned_socket_publisher_pins_store_before_registering(tmp_path):
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    store_id = str(uuid.uuid4())
+    requests = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for _ in range(2):
+                    request = json.loads(stream.readline())
+                    requests.append(request)
+                    result = (
+                        {"store_id": store_id}
+                        if request["method"] == "notification.state.info"
+                        else {"state": None}
+                    )
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": result,
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        path = tmp_path / "publisher.json"
+        with ch.v1_owned_socket_transport(
+            path, {"CMUX_SOCKET_PATH": str(sock_path)}, tmp_path
+        ) as (session, publisher):
+            assert publisher is not None
+            assert session.conn is not None
+        worker.join(5)
+        assert requests[1]["params"]["store_id"] == store_id
+        journal = ch.v1_publisher_identity(path, store_id, create=False)
+        assert journal["phase"] == "active"
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_publisher_rejects_replaced_store(tmp_path):
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    requests = []
+    path = tmp_path / "publisher.json"
+    original = str(uuid.uuid4())
+    ch.v1_publisher_identity(path, original, create=True)
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                request = json.loads(stream.readline())
+                requests.append(request)
+                conn.sendall(json.dumps({
+                    "id": request["id"], "ok": True,
+                    "result": {"store_id": str(uuid.uuid4())},
+                }).encode() + b"\n")
+                assert stream.readline() == b""
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with (
+            pytest.raises(ValueError, match="store identity changed"),
+            ch.v1_owned_socket_publisher(
+                path, {"CMUX_SOCKET_PATH": str(sock_path)}, tmp_path
+            ),
+        ):
+            pass
+        worker.join(5)
+        assert not worker.is_alive()
+        assert [request["method"] for request in requests] == [
+            "notification.state.info"
+        ]
+        journal = ch.v1_publisher_identity(path, original, create=False)
+        assert journal["phase"] == "bootstrap"
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_session_keeps_connection_after_rejection():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                first = json.loads(stream.readline())
+                conn.sendall(json.dumps({
+                    "id": first["id"], "ok": False,
+                    "error": {"code": "target_denied"},
+                }).encode() + b"\n")
+                second = json.loads(stream.readline())
+                conn.sendall(json.dumps({
+                    "id": second["id"], "ok": True, "result": {"state": None},
+                }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            with pytest.raises(ch.OwnedSocketError, match="target_denied"):
+                session.request(b'{"action":"set"}')
+            assert session.request(b'{"action":"resume"}') == {"state": None}
+        worker.join(5)
+        assert not worker.is_alive()
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_session_rejects_concurrent_requests():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(65536))
+                entered.set()
+                release.wait(5)
+                conn.sendall(json.dumps({
+                    "id": request["id"], "ok": True, "result": {"state": None},
+                }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            request = threading.Thread(
+                target=lambda: results.append(session.request(b'{}')), daemon=True
+            )
+            request.start()
+            assert entered.wait(5)
+            with pytest.raises(ch.SocketError, match="already in use"):
+                session.request(b'{}')
+            release.set()
+            request.join(5)
+            assert results == [{"state": None}]
+        worker.join(5)
+    finally:
+        release.set()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_session_closes_after_lost_response():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            with pytest.raises(ch.SocketError, match="closed the connection"):
+                session.request(b'{"action":"set"}')
+            with pytest.raises(ch.SocketError, match="session is closed"):
+                session.request(b'{"action":"set"}')
+        worker.join(5)
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("malformed", ["missing_ok", "deep_json"])
+def test_v1_owned_socket_request_rejects_malformed_error(malformed):
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = json.loads(conn.recv(65536))
+                if malformed == "missing_ok":
+                    data = json.dumps(
+                        {"id": request["id"], "error": {"code": "wrong_epoch"}}
+                    ).encode()
+                else:
+                    data = b"[" * 2000 + b"]" * 2000
+                conn.sendall(data + b"\n")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    try:
+        with pytest.raises(ch.SocketError) as error:
+            ch.v1_owned_socket_request(sock_path, b"{}")
+        assert not isinstance(error.value, ch.OwnedSocketError)
+        thread.join(5)
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_owned_socket_request_uses_one_deadline():
+    import threading
+
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                with suppress(OSError):
+                    for byte in b"123456789":
+                        time.sleep(0.03)
+                        conn.sendall(bytes([byte]))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    try:
+        with pytest.raises(TimeoutError):
+            ch.v1_owned_socket_request(sock_path, b"{}", timeout=0.08)
+        thread.join(5)
+    finally:
+        sock_path.unlink(missing_ok=True)
 
 
 def test_socket_rpc_error_raises():
@@ -3313,9 +6049,43 @@ def test_v1_supervisor_handoff_commits_only_after_retirement(monkeypatch, tmp_pa
         def reconcile(self, desired, *, complete):
             return desired
 
-    assert ch.v1_try_supervisor_handoff({}, Sources(), ch.threading.Event())
-    assert calls == ["retire", "clear journal"]
+    def final_check():
+        calls.append("final check")
+        return True
+
+    assert ch.v1_try_supervisor_handoff(
+        {}, Sources(), ch.threading.Event(), final_check=final_check
+    )
+    assert calls == ["retire", "final check", "clear journal"]
     assert (tmp_path / "v1-enabled").read_text() == "enabled"
+
+
+def test_v1_supervisor_handoff_rolls_back_when_final_backend_check_fails(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    desired = {"c": {"target": {"socket_path": "/tmp/a", "server_boot_id": "a" * 32}}}
+    monkeypatch.setattr(ch, "v1_discover_clients", lambda cfg: {"complete": True})
+    monkeypatch.setattr(ch, "v1_discovered_targets", lambda inventory: desired)
+    monkeypatch.setattr(ch, "v1_legacy_source_inventory", lambda cfg: set())
+    monkeypatch.setattr(ch, "v1_handoff_has_coverage", lambda *args: True)
+    monkeypatch.setattr(ch, "v1_supervisor_bindings_match", lambda desired: True)
+    monkeypatch.setattr(ch, "v1_probe_source", lambda target: True)
+    monkeypatch.setattr(ch, "pending_v1_legacy_restores", lambda: [])
+    calls = []
+    monkeypatch.setattr(
+        ch, "retire_v1_legacy_daemons", lambda plan: calls.append("retire") or True
+    )
+    monkeypatch.setattr(
+        ch, "restart_legacy_daemons", lambda plan: calls.append("restore")
+    )
+    sources = SimpleNamespace(reconcile=lambda desired, complete: desired)
+
+    assert not ch.v1_try_supervisor_handoff(
+        {}, sources, ch.threading.Event(), final_check=lambda: False
+    )
+    assert calls == ["retire", "restore"]
+    assert not (tmp_path / "v1-enabled").exists()
 
 
 def test_v1_supervisor_handoff_recovers_interrupted_pending_marker(
@@ -9068,6 +11838,909 @@ def test_v1_publication_aggregates_sources_across_destination_case(
     assert calls == [{"done", "waiting"}]
 
 
+def test_v1_sidebar_only_publication_does_not_write_notifications(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    state = {}
+    ch.register_v1_client(state, "a", "source", "w", "s", 1)
+    stale = ch.v1_destination_key("old", "surface")
+    state["v1"]["destinations"] = {stale: {"notification_id": "old-notice"}}
+    ch.save_state(state)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+    sidebar, notices = [], []
+    monkeypatch.setattr(
+        ch, "reconcile_v1_sidebar", lambda *args, **kwargs: sidebar.append(args[2])
+    )
+    monkeypatch.setattr(
+        ch, "reconcile_v1_destination", lambda *args, **kwargs: notices.append("write")
+    )
+    monkeypatch.setattr(
+        ch, "retire_v1_destination", lambda *args, **kwargs: notices.append("retire")
+    )
+    ch.publish_v1_clients({}, notifications=False)
+    assert sidebar == [{"w": {"source"}}]
+    assert notices == []
+    assert (
+        ch.load_state()["v1"]["destinations"][stale]["notification_id"] == "old-notice"
+    )
+
+
+@pytest.mark.parametrize("backend", ["preparing-owned", "owned", "unknown"])
+def test_v1_publication_backend_fences_ordinary_notification_writers(
+    monkeypatch, tmp_path, backend
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text(backend)
+    marker.chmod(0o600)
+    state = {}
+    ch.register_v1_client(state, "a", "source", "w", "s", 1)
+    ch.save_state(state)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+    sidebar, notices = [], []
+    monkeypatch.setattr(
+        ch, "reconcile_v1_sidebar", lambda *args, **kwargs: sidebar.append(args[2])
+    )
+    monkeypatch.setattr(
+        ch, "reconcile_v1_destination", lambda *args, **kwargs: notices.append(args)
+    )
+    ch.publish_v1_clients({})
+    assert sidebar == [{"w": {"source"}}]
+    assert notices == []
+
+
+def test_v1_publication_backend_logs_unknown_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("unknown")
+    marker.chmod(0o600)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    logs = []
+    monkeypatch.setattr(ch, "log", logs.append)
+    monkeypatch.setattr(ch, "publish_v1_clients_once", lambda *args, **kwargs: False)
+    ch.publish_v1_clients({})
+    assert any("invalid notification backend" in item for item in logs)
+
+
+def test_v1_publication_backend_read_failure_keeps_sidebar(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    open_file = os.open
+
+    def read(path, *args, **kwargs):
+        if Path(path).name == "v1-notification-backend":
+            raise PermissionError("unavailable")
+        return open_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", read)
+    calls = []
+    monkeypatch.setattr(
+        ch, "publish_v1_clients_once",
+        lambda *args, **kwargs: calls.append(kwargs["notifications"]) or False,
+    )
+    ch.publish_v1_clients({})
+    assert calls == [False]
+
+
+def test_v1_prepare_owned_backend_is_durable_and_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    assert not ch.v1_prepare_owned_backend()
+    (tmp_path / "v1-enabled").write_text("enabled")
+    assert ch.v1_prepare_owned_backend()
+    marker = tmp_path / "v1-notification-backend"
+    assert marker.read_text() == "preparing-owned"
+    assert marker.stat().st_mode & 0o077 == 0
+    assert ch.v1_prepare_owned_backend()
+    marker.write_text("owned")
+    assert not ch.v1_prepare_owned_backend()
+    assert marker.read_text() == "owned"
+
+
+def test_v1_activation_marker_preserves_previous_value_on_sync_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    ch.v1_write_activation_marker("pending")
+    marker = tmp_path / "v1-enabled"
+    assert marker.read_text() == "pending"
+    assert marker.stat().st_mode & 0o077 == 0
+    fsync = ch.os.fsync
+    calls = []
+
+    def fail_first(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise OSError("sync failed")
+        return fsync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", fail_first)
+    with pytest.raises(OSError, match="sync failed"):
+        ch.v1_write_activation_marker("enabled")
+    assert marker.read_text() == "pending"
+    ch.v1_write_activation_marker("enabled")
+    assert marker.read_text() == "enabled"
+
+
+def test_v1_activation_rollback_requires_directory_sync(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("pending")
+    with ch.v1_activation_lock():
+        def fail_sync(_fd):
+            raise OSError("directory sync failed")
+
+        monkeypatch.setattr(ch.os, "fsync", fail_sync)
+        with pytest.raises(OSError, match="directory sync failed"):
+            ch.v1_remove_activation_marker()
+
+
+def test_v1_recovery_syncs_absent_marker_before_restarting(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    calls = []
+    monkeypatch.setattr(ch, "pending_v1_legacy_restores", lambda: [("watch", "a", 1)])
+    monkeypatch.setattr(
+        ch, "restart_legacy_daemons", lambda _plan: calls.append("restart")
+    )
+    sync = ch.os.fsync
+
+    def record_sync(fd):
+        calls.append("sync")
+        return sync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", record_sync)
+    assert not ch.v1_recover_legacy_handoff()
+    assert calls == ["sync", "restart"]
+
+
+def test_v1_recovery_syncs_absent_marker_without_restore_plan(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "pending_v1_legacy_restores", lambda: [])
+    sync = ch.os.fsync
+    calls = []
+
+    def record_sync(fd):
+        calls.append(True)
+        return sync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", record_sync)
+    assert ch.v1_recover_legacy_handoff()
+    assert calls == [True]
+
+
+def test_v1_daemon_startup_requires_absent_marker_sync(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    def fail_sync(_fd):
+        raise OSError("sync failed")
+
+    monkeypatch.setattr(ch.os, "fsync", fail_sync)
+    with (
+        pytest.raises(OSError, match="sync failed"),
+        ch.v1_daemon_startup_lock(tmp_path / "watch-test.pid"),
+    ):
+        pytest.fail("daemon must not start after failed directory sync")
+
+
+def test_v1_daemon_takeover_syncs_after_reacquiring_activation(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    path = tmp_path / "watch-work.pid"
+    path.write_text(json.dumps({"pid": 123, "script": "old", "mtime": 0}))
+    monkeypatch.setattr(ch, "live_daemon_pid", lambda *_args: 123)
+    monkeypatch.setattr(ch, "v1_verified_daemon_audit_token", lambda *_args: [123] * 8)
+    monkeypatch.setattr(ch, "v1_signal_audit_token", lambda *_args: None)
+    monkeypatch.setattr(ch, "v1_daemon_incarnation_exited", lambda *_args: True)
+    calls = []
+    monkeypatch.setattr(
+        ch, "_v1_sync_absent_activation_marker", lambda _lock: calls.append("sync")
+    )
+    with (tmp_path / "v1-activation.lock").open("w") as activation:
+        ch.fcntl.flock(activation, ch.fcntl.LOCK_EX)
+        ch.take_over_daemon(path, "watch", activation)
+    assert calls == ["sync"]
+
+
+def test_v1_activation_rollback_does_not_modify_replaced_directory(
+    monkeypatch, tmp_path
+):
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(ch, "state_dir", state)
+    (state / "v1-enabled").write_text("pending")
+    with ch.v1_activation_lock():
+        state.rename(tmp_path / "original")
+        state.mkdir()
+        marker = state / "v1-enabled"
+        marker.write_text("enabled")
+        with pytest.raises(ValueError, match="activation directory changed"):
+            ch.v1_remove_activation_marker()
+        assert marker.read_text() == "enabled"
+
+
+def test_v1_activation_lock_rejects_fifo(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    os.mkfifo(tmp_path / "v1-activation.lock", 0o600)
+    with pytest.raises((OSError, ValueError)), ch.v1_activation_lock():
+        pytest.fail("FIFO must not be used as an activation lock")
+
+
+def test_v1_prepare_owned_backend_accepts_explicit_ordinary(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("ordinary")
+    marker.chmod(0o600)
+    assert ch.v1_prepare_owned_backend()
+    assert marker.read_text() == "preparing-owned"
+
+
+def test_v1_prepare_owned_backend_retries_after_directory_sync_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    sync = ch.os.fsync
+    calls = []
+
+    def fail_once(fd):
+        calls.append(fd)
+        if len(calls) == 3:
+            raise OSError("directory sync failed")
+        return sync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", fail_once)
+    with pytest.raises(OSError, match="directory sync failed"):
+        ch.v1_prepare_owned_backend()
+    assert (tmp_path / "v1-notification-backend").read_text() == "preparing-owned"
+    assert ch.v1_prepare_owned_backend()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_v1_publication_backend_rejects_unsafe_marker(monkeypatch, tmp_path, kind):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    marker = tmp_path / "v1-notification-backend"
+    if kind == "symlink":
+        marker.symlink_to(tmp_path / "missing")
+    else:
+        os.mkfifo(marker, 0o600)
+    calls = []
+    monkeypatch.setattr(
+        ch, "publish_v1_clients_once",
+        lambda *args, **kwargs: calls.append(kwargs["notifications"]) or False,
+    )
+    ch.publish_v1_clients({})
+    assert calls == [False]
+
+
+def test_v1_prepare_owned_backend_waits_for_ordinary_publication(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    started, release, transitioned = (threading.Event() for _ in range(3))
+
+    def publish(*_args, **_kwargs):
+        started.set()
+        assert release.wait(2)
+        return False
+
+    monkeypatch.setattr(ch, "publish_v1_clients_once", publish)
+    writer = threading.Thread(target=lambda: ch.publish_v1_clients({}))
+    transition = threading.Thread(
+        target=lambda: (ch.v1_prepare_owned_backend(), transitioned.set())
+    )
+    writer.start()
+    assert started.wait(2)
+    transition.start()
+    try:
+        assert not transitioned.wait(0.05)
+        assert not (tmp_path / "v1-notification-backend").exists()
+    finally:
+        release.set()
+        writer.join(2)
+        transition.join(2)
+    assert transitioned.is_set()
+    assert (tmp_path / "v1-notification-backend").read_text() == "preparing-owned"
+
+
+def test_v1_prepare_owned_backend_waits_for_handoff_lock(monkeypatch, tmp_path):
+    import fcntl
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    transitioned = threading.Event()
+    with (tmp_path / "v1-activation.lock").open("w") as activation:
+        fcntl.flock(activation, fcntl.LOCK_EX)
+        worker = threading.Thread(
+            target=lambda: (ch.v1_prepare_owned_backend(), transitioned.set())
+        )
+        worker.start()
+        try:
+            assert not transitioned.wait(0.05)
+            assert not (tmp_path / "v1-notification-backend").exists()
+        finally:
+            fcntl.flock(activation, fcntl.LOCK_UN)
+            worker.join(2)
+    assert transitioned.is_set()
+
+
+def test_v1_prepare_ordinary_cleanup_stage_fences_and_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    (tmp_path / "v1-enabled").write_text("enabled")
+    state = {"v1": {"destinations": {
+        ch.v1_destination_key(workspace, surface): {
+            "notification_id": "owned", "store_id": store,
+        }
+    }}}
+    ch.save_state(state)
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert inventory["items"][0]["id"] == "owned"
+    assert (tmp_path / "v1-notification-backend").read_text() == "preparing-owned"
+    assert json.loads((tmp_path / "v1-ordinary-cleanup.json").read_text()) == inventory
+    assert ch.v1_prepare_ordinary_cleanup_stage(session) == inventory
+
+
+def test_v1_prepare_ordinary_cleanup_stage_rejects_unproven_store(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"destinations": {
+        ch.v1_destination_key(workspace, surface): {"notification_id": "owned"}
+    }}})
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: [{"id": "owned", "is_read": False}],
+    )
+    with pytest.raises(ValueError, match="unproven notification store"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert not (tmp_path / "v1-ordinary-cleanup.json").exists()
+    assert not (tmp_path / "v1-notification-backend").exists()
+
+
+def test_v1_old_unread_notice_keeps_publication_until_read_then_fences(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"destinations": {
+        ch.v1_destination_key(workspace, surface): {"notification_id": "old"}
+    }}})
+    notice = {"id": "old", "is_read": False}
+    session = SimpleNamespace(
+        store_identity=lambda: store, list_notifications=lambda: [notice.copy()]
+    )
+    with pytest.raises(ValueError, match="unproven notification store"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert ch.v1_notification_backend() == "ordinary"
+    notice["is_read"] = True
+    inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert inventory["items"] == []
+    assert ch.v1_notification_backend() == "preparing-owned"
+
+
+def test_v1_cleanup_stage_does_not_prepare_when_already_owned(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("owned")
+    marker.chmod(0o600)
+    session = SimpleNamespace(store_identity=lambda: str(uuid.uuid4()))
+    with pytest.raises(ValueError, match="preparation is unavailable"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert not (tmp_path / "v1-ordinary-cleanup.json").exists()
+
+
+def test_v1_prepare_ordinary_cleanup_stage_retries_after_persistence_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store = str(uuid.uuid4())
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"destinations": {}}})
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    persist = ch.v1_prepare_ordinary_cleanup
+    calls = []
+
+    def fail_once(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError("simulated crash")
+        return persist(*args, **kwargs)
+
+    monkeypatch.setattr(ch, "v1_prepare_ordinary_cleanup", fail_once)
+    with pytest.raises(OSError, match="simulated crash"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert not (tmp_path / "v1-notification-backend").exists()
+    assert ch.v1_prepare_ordinary_cleanup_stage(session) == {
+        "store_id": store, "items": []
+    }
+
+
+def test_v1_cleanup_stage_recovers_saved_inventory_after_state_loss(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"destinations": {
+        ch.v1_destination_key(workspace, surface): {
+            "notification_id": "owned", "store_id": store
+        }
+    }}})
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
+    ch.STATE_PATH.unlink()
+    assert ch.v1_prepare_ordinary_cleanup_stage(session) == inventory
+
+
+def test_v1_cleanup_stage_merges_unfenced_inventory_after_interruption(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    (tmp_path / "v1-enabled").write_text("enabled")
+    old = {"id": "old", "workspace_id": workspace, "surface_id": surface}
+    ch.v1_prepare_ordinary_cleanup(
+        tmp_path / "v1-ordinary-cleanup.json", {"store_id": store, "items": [old]}
+    )
+    other_surface = str(uuid.uuid4())
+    ch.save_state({"v1": {"destinations": {
+        ch.v1_destination_key(workspace, other_surface): {
+            "notification_id": "new", "store_id": store
+        }
+    }}})
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert {item["id"] for item in inventory["items"]} == {"old", "new"}
+
+
+def test_v1_cleanup_stage_rejects_conflicting_unfenced_inventory(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    (tmp_path / "v1-enabled").write_text("enabled")
+    previous = {"store_id": store, "items": [
+        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
+    ]}
+    journal = tmp_path / "v1-ordinary-cleanup.json"
+    ch.v1_prepare_ordinary_cleanup(journal, previous)
+    ch.save_state({"v1": {"destinations": {
+        ch.v1_destination_key(workspace, str(uuid.uuid4())): {
+            "notification_id": "owned", "store_id": store
+        }
+    }}})
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    with pytest.raises(ValueError, match="conflicting cleanup notification"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert json.loads(journal.read_text()) == previous
+    assert not (tmp_path / "v1-notification-backend").exists()
+
+
+@pytest.mark.parametrize("bad_inventory", [None, {}, {"items": [None]}])
+def test_v1_cleanup_stage_rejects_invalid_saved_inventory(
+    monkeypatch, tmp_path, bad_inventory
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    store = str(uuid.uuid4())
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("preparing-owned")
+    marker.chmod(0o600)
+    journal = tmp_path / "v1-ordinary-cleanup.json"
+    if isinstance(bad_inventory, dict) and "items" in bad_inventory:
+        bad_inventory["store_id"] = store
+    journal.write_text(json.dumps(bad_inventory))
+    journal.chmod(0o600)
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    with pytest.raises(ValueError):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert marker.read_text() == "preparing-owned"
+
+
+def test_v1_cleanup_stage_rejects_saved_inventory_from_another_store(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("preparing-owned")
+    marker.chmod(0o600)
+    ch.v1_prepare_ordinary_cleanup(
+        tmp_path / "v1-ordinary-cleanup.json",
+        {"store_id": str(uuid.uuid4()), "items": []},
+    )
+    session = SimpleNamespace(store_identity=lambda: str(uuid.uuid4()),
+                              list_notifications=list)
+    with pytest.raises(ValueError, match="store identity"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+
+
+def test_v1_cleanup_stage_rejects_unidentified_legacy_notification(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"destinations": {}}})
+    session = SimpleNamespace(
+        store_identity=lambda: str(uuid.uuid4()),
+        list_notifications=lambda: [{
+            "id": str(uuid.uuid4()), "subtitle": ch.NOTIFICATION_SUBTITLE,
+            "is_read": False,
+        }],
+    )
+    with pytest.raises(ValueError, match="unidentified legacy notification"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert not (tmp_path / "v1-notification-backend").exists()
+
+
+def test_v1_cleanup_stage_recognizes_owned_row_after_interrupted_publish(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    store, producer = str(uuid.uuid4()), str(uuid.uuid4())
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("preparing-owned")
+    marker.chmod(0o600)
+    ch.v1_prepare_ordinary_cleanup(
+        tmp_path / "v1-ordinary-cleanup.json", {"store_id": store, "items": []}
+    )
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: [{
+            "id": str(uuid.uuid4()), "subtitle": ch.NOTIFICATION_SUBTITLE,
+            "is_read": False, "owned_producer_id": producer.upper(),
+        }],
+    )
+    assert ch.v1_prepare_ordinary_cleanup_stage(session, producer=producer) == {
+        "store_id": store, "items": []
+    }
+
+
+def test_v1_cleanup_stage_does_not_adopt_another_producers_notification(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    store, producer = str(uuid.uuid4()), str(uuid.uuid4())
+    ch.save_state({"v1": {"destinations": {}}})
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: [{
+            "id": str(uuid.uuid4()), "subtitle": ch.NOTIFICATION_SUBTITLE,
+            "is_read": False, "owned_producer_id": str(uuid.uuid4()),
+        }],
+    )
+    with pytest.raises(ValueError, match="unidentified legacy notification"):
+        ch.v1_prepare_ordinary_cleanup_stage(session, producer=producer)
+    assert not (tmp_path / "v1-notification-backend").exists()
+
+
+def test_v1_cleanup_stage_lists_after_publication_is_fenced(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"destinations": {}}})
+    store = str(uuid.uuid4())
+
+    def list_notifications():
+        with ch.v1_source_leader("publication") as leader:
+            assert not leader
+        return []
+
+    session = SimpleNamespace(
+        store_identity=lambda: store, list_notifications=list_notifications
+    )
+    assert ch.v1_prepare_ordinary_cleanup_stage(session) == {
+        "store_id": store, "items": []
+    }
+
+
+def test_v1_cleanup_stage_drains_and_retries_from_durable_inventory(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    ch.save_state({"v1": {"destinations": {
+        ch.v1_destination_key(workspace, surface): {
+            "notification_id": "owned", "store_id": store
+        }
+    }}})
+    notice = {"id": "owned", "workspace_id": workspace,
+              "surface_id": surface, "is_read": False}
+    attempts = []
+
+    def mark(_notice_id):
+        attempts.append(True)
+        if len(attempts) == 1:
+            return False
+        notice["is_read"] = True
+        return True
+
+    session = SimpleNamespace(
+        store_identity=lambda: store, list_notifications=lambda: [notice],
+        mark_notification_read=mark,
+    )
+    assert not ch.v1_drain_ordinary_cleanup_stage(session)
+    ch.STATE_PATH.unlink()
+    assert ch.v1_drain_ordinary_cleanup_stage(session)
+    assert notice["is_read"]
+    assert (tmp_path / "v1-notification-backend").read_text() == "preparing-owned"
+
+
+def test_v1_commit_owned_backend_requires_current_receipt(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    store = str(uuid.uuid4())
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("preparing-owned")
+    marker.chmod(0o600)
+    inventory = {"store_id": store, "items": []}
+    ch.v1_prepare_ordinary_cleanup(tmp_path / "v1-ordinary-cleanup.json", inventory)
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    valid = [False]
+
+    @contextmanager
+    def verified(_receipt):
+        yield valid[0]
+
+    publisher = SimpleNamespace(transport_session=session, validated_receipt=verified)
+    with pytest.raises(ValueError, match="publication receipt"):
+        ch.v1_commit_owned_backend(session, publisher, {"store_id": store})
+    assert marker.read_text() == "preparing-owned"
+    valid[0] = True
+    assert ch.v1_commit_owned_backend(session, publisher, {"store_id": store})
+    assert marker.read_text() == "owned"
+    assert ch.v1_commit_owned_backend(session, publisher, {"store_id": store})
+
+
+def test_v1_commit_owned_backend_rejects_directory_replacement(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(ch, "state_dir", state_dir)
+    store = str(uuid.uuid4())
+    (state_dir / "v1-enabled").write_text("enabled")
+    marker = state_dir / "v1-notification-backend"
+    marker.write_text("preparing-owned")
+    marker.chmod(0o600)
+    ch.v1_prepare_ordinary_cleanup(
+        state_dir / "v1-ordinary-cleanup.json", {"store_id": store, "items": []}
+    )
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+
+    @contextmanager
+    def verified(_receipt):
+        yield True
+
+    publisher = SimpleNamespace(transport_session=session, validated_receipt=verified)
+
+    def replace_directory(*_args):
+        state_dir.rename(tmp_path / "old-state")
+        state_dir.mkdir()
+        replacement = state_dir / "v1-notification-backend"
+        replacement.write_text("preparing-owned")
+        replacement.chmod(0o600)
+        return True
+
+    monkeypatch.setattr(ch, "v1_drain_ordinary_cleanup", replace_directory)
+    with pytest.raises(ValueError, match="directory changed"):
+        ch.v1_commit_owned_backend(session, publisher, {"store_id": store})
+    assert (state_dir / "v1-notification-backend").read_text() == "preparing-owned"
+
+
+def test_v1_commit_owned_backend_rechecks_marker_before_replace(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    store = str(uuid.uuid4())
+    (tmp_path / "v1-enabled").write_text("enabled")
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text("preparing-owned")
+    marker.chmod(0o600)
+    ch.v1_prepare_ordinary_cleanup(
+        tmp_path / "v1-ordinary-cleanup.json", {"store_id": store, "items": []}
+    )
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+
+    @contextmanager
+    def verified(_receipt):
+        yield True
+
+    publisher = SimpleNamespace(transport_session=session, validated_receipt=verified)
+    fsync = os.fsync
+    changed = []
+
+    def swap_during_sync(fd):
+        fsync(fd)
+        if changed:
+            return
+        for candidate in tmp_path.glob(".backend-*"):
+            if candidate.stat().st_ino == os.fstat(fd).st_ino:
+                replacement = tmp_path / "replacement"
+                replacement.write_text("ordinary")
+                replacement.chmod(0o600)
+                os.replace(replacement, marker)
+                changed.append(True)
+                break
+
+    monkeypatch.setattr(ch.os, "fsync", swap_during_sync)
+    with pytest.raises(ValueError, match="backend file changed"):
+        ch.v1_commit_owned_backend(session, publisher, {"store_id": store})
+    assert marker.read_text() == "ordinary"
+
+
+def test_v1_owned_transition_orders_prepare_publish_drain_and_commit(
+    monkeypatch, tmp_path
+):
+    producer = str(uuid.uuid4())
+    store = str(uuid.uuid4())
+    session = object()
+    publisher = SimpleNamespace(
+        transport_session=session, path=tmp_path / "publisher.json", store_id=store
+    )
+    verification = SimpleNamespace(scope=lambda: None)
+    calls = []
+    receipt = {"store_id": store, "producer": producer}
+    monkeypatch.setattr(
+        ch, "v1_publisher_identity", lambda *args, **kwargs: {"producer": producer}
+    )
+    monkeypatch.setattr(
+        ch, "v1_prepare_ordinary_cleanup_stage",
+        lambda current, **kwargs: calls.append(("prepare", kwargs["producer"])),
+    )
+    monkeypatch.setattr(
+        ch, "v1_drain_ordinary_cleanup_stage",
+        lambda current, **kwargs: calls.append(("drain", kwargs["producer"])) or True,
+    )
+    monkeypatch.setattr(
+        ch, "v1_publish_owned_once",
+        lambda *args, **kwargs: calls.append(("publish", kwargs)) or receipt,
+    )
+    monkeypatch.setattr(
+        ch, "v1_commit_owned_backend",
+        lambda *args: calls.append(("commit", args[2])) or True,
+    )
+    assert ch.v1_transition_owned_backend(session, publisher, verification)
+    assert calls == [
+        ("prepare", producer),
+        ("publish", {"require_complete": True, "force": True, "receipt": True}),
+        ("drain", producer),
+        ("commit", receipt),
+    ]
+    calls.clear()
+    verification.scope = lambda: set()
+    assert not ch.v1_transition_owned_backend(session, publisher, verification)
+    assert not calls
+    verification.scope = lambda: None
+    monkeypatch.setattr(ch, "v1_publish_owned_once", lambda *args, **kwargs: None)
+    assert not ch.v1_transition_owned_backend(session, publisher, verification)
+    assert calls == [("prepare", producer)]
+
+
+def test_v1_owned_transition_runs_over_one_socket(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    ch.save_state({"v1": {
+        "destinations": {},
+        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
+        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+    }})
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready = threading.Event()
+    requests = []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for line in stream:
+                    request = json.loads(line)
+                    requests.append(request)
+                    if request["method"] == "notification.state.info":
+                        result = {"store_id": store}
+                    elif request["method"] == "notification.list":
+                        result = {"notifications": []}
+                    else:
+                        result = {"state": None}
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": result,
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.v1_owned_socket_transport(
+            tmp_path / "publisher.json", {"CMUX_SOCKET_PATH": str(sock_path)}, tmp_path
+        ) as (session, publisher):
+            assert ch.v1_transition_owned_backend(
+                session, publisher, SimpleNamespace(scope=lambda: None)
+            )
+        worker.join(5)
+        actions = [item["params"].get("action") for item in requests]
+        assert actions.count("register") == 1
+        assert actions.count("set") == 1
+        assert (tmp_path / "v1-notification-backend").read_text() == "owned"
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_cleanup_stage_rejects_missing_state_before_fencing(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    session = SimpleNamespace(
+        store_identity=lambda: str(uuid.uuid4()), list_notifications=list
+    )
+    with pytest.raises(ValueError, match="missing cleanup source state"):
+        ch.v1_prepare_ordinary_cleanup_stage(session)
+    assert not (tmp_path / "v1-notification-backend").exists()
+
+
+def test_v1_cleanup_stage_accepts_initialized_state_without_destinations(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    (tmp_path / "v1-enabled").write_text("enabled")
+    ch.save_state({"v1": {"clients": {}, "sources": {}}})
+    store = str(uuid.uuid4())
+    session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
+    assert ch.v1_prepare_ordinary_cleanup_stage(session) == {
+        "store_id": store, "items": []
+    }
+
+
+@pytest.mark.parametrize("backend", ["preparing-owned", "owned"])
+def test_v1_legacy_recovery_does_not_restart_writers_after_backend_fence(
+    monkeypatch, tmp_path, backend
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    marker = tmp_path / "v1-notification-backend"
+    marker.write_text(backend)
+    marker.chmod(0o600)
+    (tmp_path / "v1-enabled").write_text("pending")
+    restarts = []
+    monkeypatch.setattr(ch, "pending_v1_legacy_restores", lambda: [("watch", "a", 123)])
+    monkeypatch.setattr(ch, "restart_legacy_daemons", restarts.append)
+    assert not ch.v1_recover_legacy_handoff()
+    assert (tmp_path / "v1-enabled").read_text() == "pending"
+    assert not restarts
+
+
 def test_v1_destination_stops_after_alias_cleanup_invalidates_plan(monkeypatch):
     upper, lower = ch.v1_destination_key("W", "S"), ch.v1_destination_key("w", "s")
     state = {
@@ -9181,6 +12854,341 @@ def test_v1_retire_destination_matches_notification_case(monkeypatch):
     monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: effects.append(args) or True)
     assert ch.retire_v1_destination({}, state, key)
     assert ["mark-notification-read", "--id", "owned"] in effects
+
+
+def test_v1_ordinary_cleanup_inventory_pins_ids_and_rejects_conflicts():
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    first = ch.v1_destination_key(workspace, surface)
+    alias = ch.v1_destination_key(workspace.upper(), surface.upper())
+    state = {"v1": {"destinations": {
+        first: {"notification_id": "notice-a", "store_id": store},
+        alias: {"notification_id": "notice-b", "store_id": store},
+    }}}
+    inventory = ch.v1_ordinary_cleanup_inventory(state, store)
+    assert inventory == {"store_id": store, "items": [
+        {"workspace_id": workspace, "surface_id": surface, "id": "notice-a"},
+        {"workspace_id": workspace, "surface_id": surface, "id": "notice-b"},
+    ]}
+    other = ch.v1_destination_key(str(uuid.uuid4()), surface)
+    state["v1"]["destinations"][other] = {
+        "notification_id": "notice-a", "store_id": store
+    }
+    with pytest.raises(ValueError, match="conflicting notification"):
+        ch.v1_ordinary_cleanup_inventory(state, store)
+
+
+def test_v1_cleanup_inventory_is_durable_and_cannot_be_replaced(tmp_path):
+    store = str(uuid.uuid4())
+    path = tmp_path / "cleanup.json"
+    inventory = {"store_id": store, "items": []}
+    assert ch.v1_prepare_ordinary_cleanup(path, inventory) == inventory
+    assert json.loads(path.read_text()) == inventory
+    assert path.stat().st_mode & 0o077 == 0
+    assert ch.v1_prepare_ordinary_cleanup(path, inventory) == inventory
+    with pytest.raises(ValueError, match="cleanup inventory changed"):
+        ch.v1_prepare_ordinary_cleanup(
+            path, {"store_id": str(uuid.uuid4()), "items": []}
+        )
+    assert json.loads(path.read_text()) == inventory
+
+
+def test_v1_cleanup_inventory_rejects_symlink_without_touching_target(tmp_path):
+    target = tmp_path / "unrelated.json"
+    target.write_text("unrelated")
+    path = tmp_path / "cleanup.json"
+    path.symlink_to(target)
+    with pytest.raises(OSError):
+        ch.v1_prepare_ordinary_cleanup(
+            path, {"store_id": str(uuid.uuid4()), "items": []}
+        )
+    assert target.read_text() == "unrelated"
+
+
+def test_v1_cleanup_inventory_rejects_insecure_existing_file(tmp_path):
+    path = tmp_path / "cleanup.json"
+    inventory = {"store_id": str(uuid.uuid4()), "items": []}
+    path.write_text(json.dumps(inventory))
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="invalid cleanup inventory file"):
+        ch.v1_prepare_ordinary_cleanup(path, inventory)
+
+
+def test_v1_cleanup_inventory_retries_after_file_sync_failure(tmp_path, monkeypatch):
+    path = tmp_path / "cleanup.json"
+    inventory = {"store_id": str(uuid.uuid4()), "items": []}
+    fsync = ch.os.fsync
+    calls = []
+
+    def fail_once(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise OSError("sync failed")
+        return fsync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", fail_once)
+    with pytest.raises(OSError, match="sync failed"):
+        ch.v1_prepare_ordinary_cleanup(path, inventory)
+    assert not path.exists()
+    assert ch.v1_prepare_ordinary_cleanup(path, inventory) == inventory
+
+
+def test_v1_cleanup_inventory_retries_after_directory_sync_failure(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "cleanup.json"
+    inventory = {"store_id": str(uuid.uuid4()), "items": []}
+    fsync = ch.os.fsync
+    calls = []
+
+    def fail_directory_once(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError("directory sync failed")
+        return fsync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", fail_directory_once)
+    with pytest.raises(OSError, match="directory sync failed"):
+        ch.v1_prepare_ordinary_cleanup(path, inventory)
+    assert json.loads(path.read_text()) == inventory
+    assert ch.v1_prepare_ordinary_cleanup(path, inventory) == inventory
+    assert len(calls) >= 4
+
+
+def test_v1_cleanup_inventory_syncs_existing_file(tmp_path, monkeypatch):
+    path = tmp_path / "cleanup.json"
+    inventory = {"store_id": str(uuid.uuid4()), "items": []}
+    ch.v1_prepare_ordinary_cleanup(path, inventory)
+    inode = path.stat().st_ino
+    fsync = ch.os.fsync
+    synced = []
+
+    def record_sync(fd):
+        synced.append(os.fstat(fd).st_ino)
+        return fsync(fd)
+
+    monkeypatch.setattr(ch.os, "fsync", record_sync)
+    assert ch.v1_prepare_ordinary_cleanup(path, inventory) == inventory
+    assert inode in synced
+
+
+def test_v1_cleanup_inventory_rejects_removed_file_during_read(tmp_path, monkeypatch):
+    path = tmp_path / "cleanup.json"
+    inventory = {"store_id": str(uuid.uuid4()), "items": []}
+    ch.v1_prepare_ordinary_cleanup(path, inventory)
+    load = ch.json.load
+
+    def remove_after_read(file):
+        saved = load(file)
+        path.unlink()
+        return saved
+
+    monkeypatch.setattr(ch.json, "load", remove_after_read)
+    with pytest.raises((OSError, ValueError)):
+        ch.v1_prepare_ordinary_cleanup(path, inventory)
+
+
+@pytest.mark.parametrize("entry", [{"notification_id": ""}, None])
+def test_v1_ordinary_cleanup_inventory_rejects_unidentified_entry(entry):
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    state = {"v1": {"destinations": {ch.v1_destination_key(workspace, surface): entry}}}
+    with pytest.raises(ValueError, match="unidentified notification"):
+        ch.v1_ordinary_cleanup_inventory(state, str(uuid.uuid4()))
+
+
+def test_v1_ordinary_cleanup_inventory_skips_empty_destination():
+    workspace, surface, store = (str(uuid.uuid4()) for _ in range(3))
+    state = {"v1": {"destinations": {ch.v1_destination_key(workspace, surface): {}}}}
+    assert ch.v1_ordinary_cleanup_inventory(state, store) == {
+        "store_id": store, "items": []
+    }
+
+
+def test_v1_ordinary_cleanup_inventory_rejects_object_destination_key():
+    workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
+    key = json.dumps({workspace: "ignored", surface: "ignored"})
+    store = str(uuid.uuid4())
+    state = {"v1": {"destinations": {key: {
+        "notification_id": "owned", "store_id": store
+    }}}}
+    with pytest.raises(ValueError, match="invalid notification target"):
+        ch.v1_ordinary_cleanup_inventory(state, store)
+
+
+@pytest.mark.parametrize("recorded", [None, "other-store"])
+def test_v1_ordinary_cleanup_rejects_unproven_store(recorded):
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    state = {"v1": {"destinations": {
+        ch.v1_destination_key(workspace, surface): {
+            "notification_id": "owned", "store_id": recorded,
+        }
+    }}}
+    with pytest.raises(ValueError, match="unproven notification store"):
+        ch.v1_ordinary_cleanup_inventory(state, store)
+
+
+def test_v1_ordinary_cleanup_reads_only_recorded_ids_and_verifies():
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    inventory = {"store_id": store, "items": [
+        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
+    ]}
+    notice = {"id": "owned", "workspace_id": workspace,
+              "surface_id": surface, "is_read": False}
+    foreign = {"id": "foreign", "workspace_id": workspace,
+               "surface_id": surface, "is_read": False}
+    calls = []
+    def mark(notice_id):
+        calls.append(notice_id)
+        notice["is_read"] = True
+        return True
+
+    session = SimpleNamespace(store_identity=lambda: store,
+                              list_notifications=lambda: [notice, foreign],
+                              mark_notification_read=mark)
+    assert ch.v1_drain_ordinary_cleanup(session, inventory)
+    assert calls == ["owned"]
+    assert not foreign["is_read"]
+
+
+def test_v1_ordinary_cleanup_preserves_obligation_on_failure():
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    inventory = {"store_id": store, "items": [
+        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
+    ]}
+    notice = {"id": "owned", "workspace_id": workspace,
+              "surface_id": surface, "is_read": False}
+    calls = []
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: [notice],
+        mark_notification_read=lambda item: calls.append(item) or True,
+    )
+    assert not ch.v1_drain_ordinary_cleanup(session, inventory)
+    assert len(calls) == 1
+    calls.clear()
+    with pytest.raises(ValueError, match="store identity"):
+        session.store_identity = lambda: str(uuid.uuid4())
+        ch.v1_drain_ordinary_cleanup(session, inventory)
+    assert not calls
+
+
+@pytest.mark.parametrize("variant", ["wrong-target", "invalid-read", "duplicate"])
+def test_v1_ordinary_cleanup_rejects_ambiguous_listing(variant):
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    inventory = {"store_id": store, "items": [
+        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
+    ]}
+    notice = {"id": "owned", "workspace_id": workspace,
+              "surface_id": surface, "is_read": False}
+    if variant == "wrong-target":
+        notice["surface_id"] = str(uuid.uuid4())
+    elif variant == "invalid-read":
+        notice["is_read"] = None
+    listing = [notice, notice] if variant == "duplicate" else [notice]
+    calls = []
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: listing,
+        mark_notification_read=lambda item: calls.append(item) or True,
+    )
+    assert not ch.v1_drain_ordinary_cleanup(session, inventory)
+    assert not calls
+
+
+def test_v1_ordinary_cleanup_uses_one_socket_for_store_and_mutation():
+    import threading
+
+    store, workspace, surface, notice_id = (str(uuid.uuid4()) for _ in range(4))
+    inventory = {"store_id": store, "items": [
+        {"id": notice_id, "workspace_id": workspace, "surface_id": surface}
+    ]}
+    notice = {"id": notice_id, "workspace_id": workspace,
+              "surface_id": surface, "is_read": False}
+    sock_path = short_sock_path(uuid.uuid4().hex[:8])
+    ready, requests = threading.Event(), []
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(sock_path))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as stream:
+                for _ in range(4):
+                    request = json.loads(stream.readline())
+                    requests.append(request)
+                    method = request["method"]
+                    if method == "notification.state.info":
+                        result = {"store_id": store}
+                    elif method == "notification.mark_read":
+                        notice["is_read"] = True
+                        result = {"marked_read": 1}
+                    else:
+                        result = {"notifications": [notice]}
+                    conn.sendall(json.dumps({
+                        "id": request["id"], "ok": True, "result": result,
+                    }).encode() + b"\n")
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        with ch.V1OwnedSocketSession(sock_path) as session:
+            assert ch.v1_drain_ordinary_cleanup(session, inventory)
+        worker.join(5)
+        assert [request["method"] for request in requests] == [
+            "notification.state.info", "notification.list",
+            "notification.mark_read", "notification.list",
+        ]
+        assert requests[2]["params"] == {"id": notice_id}
+    finally:
+        sock_path.unlink(missing_ok=True)
+
+
+def test_v1_ordinary_cleanup_retries_partial_progress():
+    store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
+    notices = [
+        {"id": item, "workspace_id": workspace, "surface_id": surface,
+         "is_read": False}
+        for item in ("first", "second")
+    ]
+    inventory = {"store_id": store, "items": [
+        {"id": item["id"], "workspace_id": workspace, "surface_id": surface}
+        for item in notices
+    ]}
+    calls = []
+    fail = [True]
+
+    def mark(notice_id):
+        calls.append(notice_id)
+        if notice_id == "second" and fail[0]:
+            return False
+        next(item for item in notices if item["id"] == notice_id)["is_read"] = True
+        return True
+
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: notices,
+        mark_notification_read=mark,
+    )
+    assert not ch.v1_drain_ordinary_cleanup(session, inventory)
+    assert [item["is_read"] for item in notices] == [True, False]
+    fail[0] = False
+    assert ch.v1_drain_ordinary_cleanup(session, inventory)
+    assert calls == ["first", "second", "second"]
+
+
+@pytest.mark.parametrize("inventory", [None, {}, {"items": []}, {"items": [None]}])
+def test_v1_ordinary_cleanup_rejects_invalid_inventory(inventory):
+    store = str(uuid.uuid4())
+    if isinstance(inventory, dict) and "items" in inventory:
+        inventory["store_id"] = store
+    session = SimpleNamespace(store_identity=lambda: store)
+    if inventory == {"items": [], "store_id": store}:
+        session.list_notifications = lambda: []
+        assert ch.v1_drain_ordinary_cleanup(session, inventory)
+    else:
+        with pytest.raises(ValueError, match="invalid cleanup inventory"):
+            ch.v1_drain_ordinary_cleanup(session, inventory)
 
 
 def test_v1_partial_publication_preserves_active_destination_across_case_changes(
@@ -11875,6 +15883,78 @@ def test_v1_activation_restores_stopped_legacy_daemons_on_interruption(
         ch.activate_v1_client("c", "source", "w", "s", None, ch.threading.Event())
     assert not (tmp_path / "v1-enabled").exists()
     assert restored == plan
+
+
+def test_v1_activation_releases_lock_when_retirement_is_busy(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    pid_path = tmp_path / "remote.pid"
+    monkeypatch.setattr(
+        ch, "retire_v1_legacy_daemons",
+        lambda plan: ch.stop_v1_legacy_daemon(pid_path, "remote", plan),
+    )
+    monkeypatch.setattr(ch, "restart_legacy_daemons", lambda plan: None)
+    result = []
+    def activate():
+        result.append(ch._activate_v1_client_once(
+            "c", "source", "w", "s", None, ch.threading.Event()
+        ))
+
+    with open(tmp_path / "remote.lock", "w") as daemon_lock:
+        ch.fcntl.flock(daemon_lock, ch.fcntl.LOCK_EX)
+        worker = ch.threading.Thread(target=activate, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result == [False]
+        with ch.v1_activation_lock():
+            assert not (tmp_path / "v1-enabled").exists()
+
+
+def test_v1_activation_keeps_pending_marker_when_event_replay_fails(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda plan: False)
+    monkeypatch.setattr(
+        ch, "_v1_rollback_legacy_events_and_marker_locked", lambda: False
+    )
+    restored = []
+    monkeypatch.setattr(
+        ch, "restart_legacy_daemons", lambda plan: restored.append(plan)
+    )
+    assert not ch._activate_v1_client_once(
+        "c", "source", "w", "s", None, ch.threading.Event()
+    )
+    assert (tmp_path / "v1-enabled").read_text() == "pending"
+    assert restored == []
+
+
+def test_v1_activation_replays_event_when_retirement_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "load_config_strict", lambda: {})
+    monkeypatch.setattr(ch, "restart_legacy_daemons", lambda plan: None)
+    replayed = []
+    monkeypatch.setattr(
+        ch, "handle_event", lambda cfg, state, event, **kwargs: replayed.append(event)
+    )
+    event = status_event("p", "w", "done")
+
+    def retire(plan):
+        ch.save_state({
+            "v1_pending_legacy_events": [{"session": "work", "event": event}]
+        })
+        return False
+
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", retire)
+    assert not ch._activate_v1_client_once(
+        "c", "source", "w", "s", None, ch.threading.Event()
+    )
+    assert replayed == [event]
+    assert not (tmp_path / "v1-enabled").exists()
+    assert not ch.load_state().get("v1_pending_legacy_events")
 
 
 def test_v1_interrupted_cutovers_preserve_pending_restore(monkeypatch, tmp_path):
