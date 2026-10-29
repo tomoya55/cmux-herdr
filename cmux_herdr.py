@@ -6487,20 +6487,26 @@ def v1_local_socket(session):
     return None
 
 
-def open_subscription(sock_path, subscriptions):
+def open_subscription(sock_path, subscriptions, *, timeout=None):
     """Connected socket streaming the subscribed events as NDJSON."""
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.connect(str(sock_path))
-    conn.sendall(
-        json.dumps(
-            {
-                "id": "watch",
-                "method": "events.subscribe",
-                "params": {"subscriptions": subscriptions},
-            }
-        ).encode()
-        + b"\n"
-    )
+    try:
+        if timeout is not None:
+            conn.settimeout(timeout)
+        conn.connect(str(sock_path))
+        conn.sendall(
+            json.dumps(
+                {
+                    "id": "watch",
+                    "method": "events.subscribe",
+                    "params": {"subscriptions": subscriptions},
+                }
+            ).encode()
+            + b"\n"
+        )
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -6508,13 +6514,9 @@ V1_SUBSCRIPTION_IDLE_TIMEOUT = 10
 
 
 def open_v1_subscription(sock_path, subscriptions):
-    conn = open_subscription(sock_path, subscriptions)
-    try:
-        conn.settimeout(V1_SUBSCRIPTION_IDLE_TIMEOUT)
-    except BaseException:
-        conn.close()
-        raise
-    return conn
+    return open_subscription(
+        sock_path, subscriptions, timeout=V1_SUBSCRIPTION_IDLE_TIMEOUT
+    )
 
 
 def list_pane_ids(sock_path):

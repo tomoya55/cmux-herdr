@@ -7582,10 +7582,39 @@ def test_v1_supervisor_source_reports_ready_only_once_after_subscription(
     assert calls == [("source", "generation", "/source.sock", "a" * 32)]
 
 
+def test_v1_subscription_bounds_connect_and_closes_on_failure(monkeypatch):
+    events = []
+
+    class Connection:
+        def settimeout(self, value):
+            events.append(("timeout", value))
+
+        def connect(self, path):
+            events.append(("connect", path))
+            raise TimeoutError("connect stalled")
+
+        def close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr(ch.socket, "socket", lambda *args: Connection())
+    with pytest.raises(TimeoutError):
+        ch.open_v1_subscription("/socket", [])
+    assert events == [
+        ("timeout", ch.V1_SUBSCRIPTION_IDLE_TIMEOUT),
+        ("connect", "/socket"),
+        ("close",),
+    ]
+
+
 def test_v1_subscription_reconnects_after_silent_stream(monkeypatch):
     client, server = socket.socketpair()
     monkeypatch.setattr(ch, "V1_SUBSCRIPTION_IDLE_TIMEOUT", 0.1)
-    monkeypatch.setattr(ch, "open_subscription", lambda *args: client)
+
+    def open_socket(*args, timeout):
+        client.settimeout(timeout)
+        return client
+
+    monkeypatch.setattr(ch, "open_subscription", open_socket)
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: [])
     monkeypatch.setattr(ch, "sync_v1_source", lambda *args, **kwargs: True)
     monkeypatch.setattr(ch, "v1_subscription_matches_source", lambda *args: True)
