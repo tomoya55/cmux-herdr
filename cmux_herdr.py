@@ -818,15 +818,15 @@ def prune_dead_sessions(cfg, state):
 
 
 def reconcile(cfg, state):
-    clear_legacy_sidebar_logs(cfg, state)
-    bucket = session_bucket(state)
-    previous = dict(bucket["workspaces"])
-    bucket["workspaces"].clear()
     try:
         agents = herdr_cli(["agent", "list"]).get("agents", [])
     except Exception as e:
         log(f"reconcile: agent list failed: {e}")
-        agents = []
+        return
+    clear_legacy_sidebar_logs(cfg, state)
+    bucket = session_bucket(state)
+    previous = dict(bucket["workspaces"])
+    bucket["workspaces"].clear()
     ws_ids = set()
     for a in agents:
         status = a.get("agent_status")

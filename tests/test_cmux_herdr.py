@@ -1652,3 +1652,23 @@ def test_watch_pid_path_is_per_session(monkeypatch, tmp_path):
     assert ch.watch_pid_path("tom") != ch.watch_pid_path("coten")
     # Session names reach the filesystem; keep them to safe characters.
     assert "/" not in ch.watch_pid_path("a/b").name
+
+
+def test_reconcile_keeps_state_when_agent_snapshot_fails(
+    monkeypatch, state, cmux_calls
+):
+    state["legacy_log_cleared"] = True
+    bucket = ch.session_bucket(state)
+    bucket["workspaces"]["w1"] = {
+        "label": "project",
+        "panes": {"p": {"status": "done", "agent": "claude", "title": "task"}},
+    }
+    before = json.loads(json.dumps(state))
+
+    def fail(_args):
+        raise RuntimeError("temporary outage")
+
+    monkeypatch.setattr(ch, "herdr_cli", fail)
+    ch.reconcile({}, state)
+    assert state == before
+    assert not cmux_calls
