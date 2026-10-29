@@ -1967,6 +1967,64 @@ def v1_observer_socket_exists(path):
         return False
 
 
+def v1_native_surface_ownership(nodes, directories, tty_device, deadline):
+    """Find validated native bridges without exempting unrelated processes."""
+    owners, transports, clients, used = set(), set(), {}, set()
+    complete = True
+    for pid, node in nodes.items():
+        if time.monotonic() >= deadline:
+            return owners, transports, clients, False
+        if type(node.get("tty_device")) is int and node["tty_device"] != tty_device:
+            continue
+        path = node.get("path")
+        if not (
+            node.get("name") == "herdr"
+            or isinstance(path, str)
+            and Path(path).name == "herdr"
+        ):
+            continue
+        sockets = [
+            directory.parent / "transport-observers" / f"{pid}.sock"
+            for directory in directories
+        ]
+        sockets = [
+            candidate for candidate in sockets if v1_observer_socket_exists(candidate)
+        ]
+        if not sockets:
+            continue
+        if len(sockets) != 1:
+            complete = False
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return owners, transports, clients, False
+        envelope = v1_native_transport_envelope(
+            sockets[0], pid, timeout=min(2, remaining)
+        )
+        claims = v1_native_transport_claims(envelope)
+        records = (
+            v1_native_transport_topology(envelope, claims, nodes, tty_device)
+            if claims
+            else None
+        )
+        if not records or len(records) != len(claims):
+            complete = False
+            continue
+        claimed = {pid}
+        for claim in claims:
+            claimed.update((claim["client"]["pid"], claim["ssh_child"]["pid"]))
+        if len(claimed) != 1 + 2 * len(claims) or claimed & used:
+            complete = False
+            continue
+        used.update(claimed)
+        owners.add(pid)
+        for claim, record in zip(claims, records, strict=True):
+            client_pid = claim["client"]["pid"]
+            transports.add(claim["ssh_child"]["pid"])
+            clients[client_pid] = (claim["observation"], record)
+    return owners, transports, clients, complete
+
+
 def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
     """Collect candidates from one tree; recheck them before accepting ownership."""
     clients, seen, surfaces = [], set(), set()
@@ -2017,6 +2075,7 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                         if not isinstance(surface.get("processes"), list):
                             return None
                         stack = list(surface["processes"])
+                        nodes = {}
                         while stack:
                             if time.monotonic() >= deadline:
                                 return {"clients": clients, "complete": False}
@@ -2034,11 +2093,23 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                                 return None
                             seen.add(pid)
                             stack.extend(children)
+                            nodes[pid] = process
+                        owners, transports, native_clients, native_complete = (
+                            v1_native_surface_ownership(
+                                nodes, directories, tty_device, deadline
+                            )
+                        )
+                        complete &= native_complete
+                        for pid, process in nodes.items():
+                            if time.monotonic() >= deadline:
+                                return {"clients": clients, "complete": False}
                             name, path = process.get("name"), process.get("path")
                             if not (isinstance(name, str) and name) and not (
                                 isinstance(path, str) and path
                             ):
                                 complete = False
+                                continue
+                            if pid in owners or pid in transports:
                                 continue
                             if (
                                 name == "ssh"
@@ -2060,6 +2131,22 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                                 complete = False
                                 continue
                             if process["tty_device"] != tty_device:
+                                continue
+                            if pid in native_clients:
+                                inventory, ownership = native_clients[pid]
+                                clients.append(
+                                    {
+                                        "pid": pid,
+                                        "workspace": workspace_id,
+                                        "surface": surface_id,
+                                        "instance": inventory["instance"],
+                                        "sources": inventory["sources"],
+                                        "sources_complete": inventory[
+                                            "sources_complete"
+                                        ],
+                                        "native_ownership": ownership,
+                                    }
+                                )
                                 continue
                             sockets = [
                                 candidate

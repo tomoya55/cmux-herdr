@@ -1723,6 +1723,65 @@ def test_v1_discovers_unfocused_clients_without_guessing_on_missing_socket(
     ]
 
 
+def test_v1_discovery_accepts_only_verified_native_transport(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 100)
+    client = {"pid": 42, "ppid": 40, "name": "herdr", "tty_device": 100, "children": []}
+    ssh = {"pid": 43, "ppid": 40, "name": "ssh", "tty_device": 100, "children": []}
+    launcher = {
+        "pid": 40,
+        "name": "herdr",
+        "tty_device": 100,
+        "children": [client, ssh],
+    }
+    surface = {"id": "s", "type": "terminal", "tty": "tty", "processes": [launcher]}
+    tree = {
+        "windows": [{"workspaces": [{"id": "w", "panes": [{"surfaces": [surface]}]}]}]
+    }
+    nested = {
+        "pid": 42,
+        "instance": "instance",
+        "sources_complete": True,
+        "sources": [],
+    }
+    claim = {"client": {"pid": 42}, "ssh_child": {"pid": 43}, "observation": nested}
+    record = {"client": {"pid": 42}, "ssh_child": {"pid": 43}, "connection_id": "conn"}
+    monkeypatch.setattr(
+        ch,
+        "v1_observer_socket_exists",
+        lambda path: (
+            path.parent.name == "transport-observers"
+            and path.name in {"40.sock", "44.sock"}
+        ),
+    )
+    monkeypatch.setattr(
+        ch, "v1_native_transport_envelope", lambda *args, **kwargs: {"owner_pid": 40}
+    )
+    monkeypatch.setattr(ch, "v1_native_transport_claims", lambda value: [claim])
+    monkeypatch.setattr(ch, "v1_native_transport_topology", lambda *args: [record])
+    result = ch.v1_discover_clients_in_tree(
+        tree, [tmp_path / "herdr" / "client-observers"]
+    )
+    assert result["complete"] is True
+    assert result["clients"][0]["pid"] == 42
+    assert result["clients"][0]["native_ownership"] == record
+    surface["processes"].append(
+        {"pid": 44, "name": "herdr", "tty_device": 101, "children": []}
+    )
+    assert (
+        ch.v1_discover_clients_in_tree(tree, [tmp_path / "herdr" / "client-observers"])[
+            "complete"
+        ]
+        is True
+    )
+    surface["processes"].append(
+        {"pid": 45, "name": "ssh", "tty_device": 100, "children": []}
+    )
+    result = ch.v1_discover_clients_in_tree(
+        tree, [tmp_path / "herdr" / "client-observers"]
+    )
+    assert result["complete"] is False
+
+
 def test_v1_discovery_rejects_duplicate_pid_across_surfaces(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 100)
     process = {"pid": 20, "name": "herdr", "tty_device": 100, "children": []}
