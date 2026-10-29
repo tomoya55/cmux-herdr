@@ -2528,6 +2528,8 @@ def test_v1_supervisor_reconcile_keeps_old_source_until_binding_commit_succeeds(
 
 
 def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
+    import threading
+
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     spec = {
         "workspace": "w",
@@ -2541,6 +2543,7 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
     }
     inventory = {"complete": True, "clients": []}
     calls = []
+    published = threading.Event()
 
     class Leases:
         def acquire_leader(self):
@@ -2572,10 +2575,18 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
             return self.done
 
         def wait(self, seconds):
+            if (tmp_path / "v1-enabled").exists() and (
+                tmp_path / "v1-enabled"
+            ).read_text() == "enabled":
+                assert published.wait(3)
             self.done = True
 
     monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
     monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch, "v1_recover_legacy_handoff", lambda: True)
+    monkeypatch.setattr(
+        ch, "v1_supervisor_bindings_match", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(ch, "v1_discover_clients", lambda cfg: inventory)
     monkeypatch.setattr(ch, "v1_discovered_targets", lambda value: {"c": spec})
     monkeypatch.setattr(
@@ -2584,21 +2595,95 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ch, "v1_supervisor_focus_tick", lambda *args: calls.append("focus")
     )
-    monkeypatch.setattr(ch, "publish_v1_clients", lambda *args: calls.append("publish"))
+
+    def publish(*args):
+        calls.append("publish")
+        published.set()
+
+    monkeypatch.setattr(ch, "publish_v1_clients", publish)
+    ch.v1_run_supervisor({}, Stop())
+    assert calls == ["reclaim", "reconcile", "sources closed", "leases closed"]
+    calls.clear()
+    (tmp_path / "v1-enabled").write_text("pending")
     ch.v1_run_supervisor({}, Stop())
     assert calls == ["reclaim", "reconcile", "sources closed", "leases closed"]
     calls.clear()
     (tmp_path / "v1-enabled").write_text("enabled")
     ch.v1_run_supervisor({}, Stop())
-    assert calls == [
-        "reclaim",
-        "reconcile",
-        "tokens",
-        "focus",
-        "publish",
-        "sources closed",
-        "leases closed",
-    ]
+    assert calls[0] == "reclaim"
+    assert calls[-2:] == ["sources closed", "leases closed"]
+    assert sorted(calls[1:-2]) == sorted(["reconcile", "tokens", "focus", "publish"])
+
+
+def test_v1_supervisor_publishes_while_discovery_is_stalled(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    entered, release, published = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    first_entered, first_release = threading.Event(), threading.Event()
+    stop = threading.Event()
+
+    class Leases:
+        def acquire_leader(self):
+            return True
+
+        def reconcile(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class Sources:
+        def __init__(self, start):
+            pass
+
+        def sync_tokens(self):
+            pass
+
+        def reconcile(self, *args, **kwargs):
+            return {}
+
+        def close(self):
+            pass
+
+    def discover(cfg):
+        if not first_entered.is_set():
+            first_entered.set()
+            first_release.wait(5)
+            return {"complete": True, "clients": []}
+        entered.set()
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
+    monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch, "v1_recover_legacy_handoff", lambda: True)
+    monkeypatch.setattr(ch, "v1_reconcile_supervisor_inventory", lambda *args: None)
+    monkeypatch.setattr(
+        ch, "v1_supervisor_bindings_match", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(ch, "v1_discover_clients", discover)
+    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg: published.set())
+    worker = threading.Thread(target=ch.v1_run_supervisor, args=({}, stop))
+    worker.start()
+    try:
+        assert first_entered.wait(3)
+        assert not published.wait(0.25), "unverified startup bindings were published"
+        first_release.set()
+        assert entered.wait(3)
+        published.clear()
+        assert published.wait(2), "publication waited for stalled discovery"
+    finally:
+        stop.set()
+        first_release.set()
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
 
 
 def test_v1_source_process_reads_queued_ready_after_deadline(monkeypatch):
@@ -2619,7 +2704,7 @@ def test_v1_source_process_reads_queued_ready_after_deadline(monkeypatch):
         worker._process.stdout.close()
 
 
-def test_v1_supervisor_reclaims_bindings_before_publishing_when_discovery_fails(
+def test_v1_supervisor_preserves_but_does_not_publish_unverified_bindings(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
@@ -2659,7 +2744,8 @@ def test_v1_supervisor_reclaims_bindings_before_publishing_when_discovery_fails(
 
     monkeypatch.setattr(ch, "publish_v1_clients", publish)
     ch.v1_run_supervisor({}, Stop())
-    assert seen == [True]
+    assert seen == []
+    assert "c" in ch.load_state()["v1"]["clients"]
 
 
 def test_v1_handoff_coverage_requires_every_legacy_source_and_ready_binding():
@@ -9433,6 +9519,7 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
             "boot_id": boot,
             "endpoint": "local",
             "connection_generation": 4,
+            "snapshot_revision": 1,
             "pane_id": "p",
             "outer_focused": True,
             "agent_state_change_seq": 7,
@@ -9483,7 +9570,21 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
     observed[:] = [wrong, wrong]
     assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     observation["native_ownership"] = ownership
-    observed[:] = [observation, observation]
+    observed[:] = [
+        {
+            **observation,
+            "observation": {**observation["observation"], "snapshot_revision": 2},
+        },
+        observation,
+    ]
+    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    observed[:] = [
+        observation,
+        {
+            **observation,
+            "observation": {**observation["observation"], "snapshot_revision": 2},
+        },
+    ]
     assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     attention = ch.load_state()["v1"]["sources"]["src"]["attention"]
     assert attention["p"]["acknowledged"] == episode

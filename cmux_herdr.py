@@ -2752,6 +2752,28 @@ def v1_surface_observation(cfg, workspace_id, surface_id):
         return None
 
 
+def v1_focus_observations_match(before, after):
+    """Compare focused identity while allowing unrelated projection updates."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    first, second = before.get("observation"), after.get("observation")
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    old_revision, new_revision = (
+        first.get("snapshot_revision"),
+        second.get("snapshot_revision"),
+    )
+    if (old_revision is not None or new_revision is not None) and (
+        type(old_revision) is not int
+        or type(new_revision) is not int
+        or not 0 <= old_revision <= new_revision < 2**64
+    ):
+        return False
+    first = {key: value for key, value in first.items() if key != "snapshot_revision"}
+    second = {key: value for key, value in second.items() if key != "snapshot_revision"}
+    return {**before, "observation": first} == {**after, "observation": second}
+
+
 def v1_reconcile_focus(cfg, client_id, source_id, workspace_id, surface_id, sock_path):
     """Acknowledge a completion only after two matching focus observations."""
     try:
@@ -2764,7 +2786,9 @@ def v1_reconcile_focus(cfg, client_id, source_id, workspace_id, surface_id, sock
             "snapshot"
         )
         after = v1_surface_observation(cfg, workspace_id, surface_id)
-        if before != after or not v1_cmux_is_foreground(cfg, workspace_id, surface_id):
+        if not v1_focus_observations_match(before, after) or not v1_cmux_is_foreground(
+            cfg, workspace_id, surface_id
+        ):
             return False
         observation = after["observation"]
         with state_lock():
@@ -3667,10 +3691,14 @@ class V1SupervisedSources:
         self._workers.clear()
 
 
-def v1_supervisor_bindings_match(desired):
+def v1_supervisor_bindings_match(desired, *, exact=False):
     """Verify all destinations belong to this supervisor and prepared source."""
     with state_lock():
         clients = load_state().get("v1", {}).get("clients", {})
+        if exact and {
+            key for key, client in clients.items() if client.get("supervised")
+        } != set(desired):
+            return False
         return all(
             clients.get(key, {}).get("supervised")
             and clients[key].get("pid") == os.getpid()
@@ -4196,6 +4224,28 @@ def v1_supervisor_focus_tick(cfg, desired, ready):
         )
 
 
+def v1_supervised_publish_loop(cfg, stop, verified):
+    """Publish committed state independently of slow discovery and focus RPCs."""
+    while not stop.is_set():
+        try:
+            if (
+                verified.is_set()
+                and (state_dir / "v1-enabled").read_text() == "enabled"
+            ):
+                publish_v1_clients(cfg)
+        except FileNotFoundError:
+            pass
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            log(f"v1 supervisor publication failed: {error}")
+        stop.wait(1)
+
+
 def v1_run_supervisor(cfg, stop):
     """Maintain discovered bindings; publish only after migration commits."""
     leases = V1SupervisedLeases()
@@ -4207,8 +4257,17 @@ def v1_run_supervisor(cfg, stop):
         return V1SupervisedSourceProcess(source_id, resolved) if resolved else None
 
     sources = V1SupervisedSources(start_source)
+    publisher_stop = threading.Event()
+    publisher_verified = threading.Event()
+    publisher = None
     try:
         leases.reconcile({}, {}, complete=False)
+        publisher = threading.Thread(
+            target=v1_supervised_publish_loop,
+            args=(cfg, publisher_stop, publisher_verified),
+            daemon=True,
+        )
+        publisher.start()
         next_recovery = 0
         while not stop.is_set():
             try:
@@ -4221,6 +4280,12 @@ def v1_run_supervisor(cfg, stop):
                     v1_reconcile_supervisor_inventory(inventory, sources, leases)
                     desired = v1_discovered_targets(inventory)
                     ready = sources.reconcile(desired, complete=False)
+                    if (
+                        inventory["complete"]
+                        and ready == desired
+                        and v1_supervisor_bindings_match(desired, exact=True)
+                    ):
+                        publisher_verified.set()
                 try:
                     enabled = (state_dir / "v1-enabled").read_text() == "enabled"
                 except FileNotFoundError:
@@ -4229,7 +4294,6 @@ def v1_run_supervisor(cfg, stop):
                     sources.sync_tokens()
                     if desired is not None:
                         v1_supervisor_focus_tick(cfg, desired, ready)
-                    publish_v1_clients(cfg)
             except (
                 OSError,
                 ValueError,
@@ -4241,6 +4305,9 @@ def v1_run_supervisor(cfg, stop):
             stop.wait(1)
         return True
     finally:
+        publisher_stop.set()
+        if publisher is not None:
+            publisher.join()
         try:
             sources.close()
         finally:
