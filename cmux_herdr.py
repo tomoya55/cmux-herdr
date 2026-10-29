@@ -1555,6 +1555,97 @@ def v1_tty_device(tty):
         return None
 
 
+def v1_native_process_info(pid):
+    """Read a live Darwin process incarnation and its kernel relationships."""
+    if sys.platform != "darwin" or type(pid) is not int or not 0 < pid < 2**31:
+        return None
+
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("flags", ctypes.c_uint32),
+            ("status", ctypes.c_uint32),
+            ("xstatus", ctypes.c_uint32),
+            ("pid", ctypes.c_uint32),
+            ("ppid", ctypes.c_uint32),
+            ("uid", ctypes.c_uint32),
+            ("gid", ctypes.c_uint32),
+            ("ruid", ctypes.c_uint32),
+            ("rgid", ctypes.c_uint32),
+            ("svuid", ctypes.c_uint32),
+            ("svgid", ctypes.c_uint32),
+            ("reserved", ctypes.c_uint32),
+            ("comm", ctypes.c_char * 16),
+            ("name", ctypes.c_char * 32),
+            ("nfiles", ctypes.c_uint32),
+            ("pgid", ctypes.c_uint32),
+            ("pjobc", ctypes.c_uint32),
+            ("tty_device", ctypes.c_uint32),
+            ("tty_pgid", ctypes.c_uint32),
+            ("nice", ctypes.c_int32),
+            ("start_sec", ctypes.c_uint64),
+            ("start_usec", ctypes.c_uint64),
+        ]
+
+    try:
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        proc_pidinfo = lib.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        info = ProcBsdInfo()
+        size = ctypes.sizeof(info)
+        if proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size:
+            return None
+        if info.pid != pid or info.status == 5 or info.start_usec >= 1_000_000:
+            return None
+        start_token = info.start_sec * 1_000_000 + info.start_usec
+        if not 0 < start_token < 2**64:
+            return None
+        return {
+            "pid": pid,
+            "ppid": info.ppid,
+            "pgid": info.pgid,
+            "tty_device": info.tty_device,
+            "tty_pgid": info.tty_pgid,
+            "start_token": start_token,
+        }
+    except (OSError, AttributeError, ValueError, OverflowError):
+        return None
+
+
+def v1_native_transport_envelope(path, pid, *, timeout=2):
+    """Read an observer envelope from the same live launcher incarnation.
+
+    Its bridge inventory is untrusted until separately validated.
+    """
+    before = v1_native_process_info(pid)
+    if before is None:
+        return None
+    response = v1_read_client_response(path, expected_peer=pid, timeout=timeout)
+    after = v1_native_process_info(pid)
+    if (
+        before != after
+        or not isinstance(response, dict)
+        or type(response.get("version")) is not int
+        or response["version"] != 1
+        or type(response.get("owner_pid")) is not int
+        or response["owner_pid"] != pid
+        or type(response.get("owner_start_token")) is not int
+        or response["owner_start_token"] != before["start_token"]
+        or not isinstance(response.get("instance"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", response["instance"])
+        or type(response.get("revision")) is not int
+        or not 0 <= response["revision"] < 2**64
+    ):
+        return None
+    return response
+
+
 def v1_foreground_surface_processes(payload, workspace_id, surface_id):
     """Find foreground processes in one unambiguous cmux surface tree."""
 

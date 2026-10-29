@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -3588,6 +3589,80 @@ def test_v1_audit_token_signal_rejects_wrong_process_generation():
 def test_v1_daemon_self_info_includes_kernel_process_identity():
     info = ch.daemon_self_info()
     assert info["audit_token"] == ch.v1_process_audit_token(os.getpid())
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS process info")
+def test_v1_native_process_identity_checks_live_kernel_incarnation():
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        info = ch.v1_native_process_info(child.pid)
+        assert info is not None
+        assert info["pid"] == child.pid
+        assert info["ppid"] == os.getpid()
+        assert info["pgid"] == os.getpgid(child.pid)
+        assert info["start_token"] > 0
+        assert ch.v1_native_process_info(child.pid) == info
+        child.kill()
+        deadline = time.monotonic() + 3
+        while ch.v1_wait_child_state(child.pid) is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert ch.v1_native_process_info(child.pid) is None
+        child.wait(timeout=3)
+        assert ch.v1_native_process_info(child.pid) is None
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+
+
+@pytest.mark.parametrize("invalid_pid", [0, -1, 2**31, True, 1.5, "1"])
+def test_v1_native_process_info_rejects_invalid_pid(invalid_pid):
+    assert ch.v1_native_process_info(invalid_pid) is None
+
+
+def test_v1_native_transport_envelope_requires_matching_live_socket_owner(monkeypatch):
+    identity = {"pid": 42, "start_token": 123}
+    response = {
+        "version": 1,
+        "owner_pid": 42,
+        "owner_start_token": 123,
+        "instance": "a" * 32,
+        "revision": 1,
+        "status": "unavailable",
+        "ownership_complete": False,
+        "bridges": [],
+    }
+    calls = []
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: identity.copy())
+    monkeypatch.setattr(
+        ch,
+        "v1_read_client_response",
+        lambda path, expected_peer=None, **kw: (
+            calls.append(expected_peer) or response.copy()
+        ),
+    )
+    assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) == response
+    assert calls == [42]
+    for change in (
+        {"owner_pid": 43},
+        {"owner_start_token": 124},
+        {"instance": "bad"},
+        {"revision": True},
+        {"version": True},
+    ):
+        monkeypatch.setattr(
+            ch,
+            "v1_read_client_response",
+            lambda *args, change=change, **kwargs: {**response, **change},
+        )
+        assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
+    monkeypatch.setattr(ch, "v1_read_client_response", lambda *args, **kwargs: None)
+    assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
+    identities = iter([identity, {**identity, "start_token": 124}])
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: next(identities))
+    monkeypatch.setattr(ch, "v1_read_client_response", lambda *args, **kwargs: response)
+    assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
 
 
 def test_v1_daemon_identity_requires_matching_recorded_audit_token(
