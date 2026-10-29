@@ -2127,6 +2127,10 @@ def v1_force_read_action():
         sock_path = os.environ.get("HERDR_SOCKET_PATH")
         if not isinstance(pane_id, str) or not pane_id or not sock_path:
             return False
+        snapshot = socket_rpc(sock_path, "session.snapshot", {}).get("snapshot") or {}
+        boot = snapshot.get("server_boot_id")
+        if not isinstance(boot, str) or not re.fullmatch(r"[0-9a-f]{32}", boot):
+            return False
         pane = socket_rpc(sock_path, "pane.get", {"pane_id": pane_id}).get("pane", {})
         status = pane.get("agent_status")
         if pane.get("pane_id") != pane_id or not (
@@ -2140,9 +2144,10 @@ def v1_force_read_action():
             return False
         socket_rpc(
             sock_path,
-            "pane.report_metadata",
+            "pane.report_metadata_if_boot",
             {
                 "pane_id": pane_id,
+                "expected_server_boot_id": boot,
                 "source": "cmux-herdr.v1",
                 "tokens": {"cmux_herdr_ack": token},
                 "ttl_ms": 30000,
