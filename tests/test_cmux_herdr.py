@@ -4417,6 +4417,83 @@ def test_v1_focus_episode_requires_matching_server_and_current_completion():
     assert ch.v1_verified_focus_episode(state, "source", observation, snapshot) is None
 
 
+def test_v1_focus_episode_after_agent_release_requires_presented_release():
+    boot = "a" * 32
+    entry = {
+        "status": "done",
+        "episode": "gen:t:7",
+        "generation": "gen",
+        "terminal_id": "t",
+        "sequence": 7,
+        "server_boot_id": boot,
+    }
+    state = {"v1": {"sources": {"source": {"attention": {"p": entry}}}}}
+    observation = {
+        "boot_id": boot,
+        "pane_id": "p",
+        "outer_focused": True,
+        "agent_state_change_seq": None,
+        "pane_state": {
+            "terminal_id": "t",
+            "state_change_seq": 8,
+            "agent_present": False,
+            "released_completion_seq": 7,
+        },
+    }
+    snapshot = {
+        "server_boot_id": boot,
+        "agents": [],
+        "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 8}],
+    }
+    assert (
+        ch.v1_verified_focus_episode(state, "source", observation, snapshot)
+        == "gen:t:7"
+    )
+    for pane_state in (
+        None,
+        {**observation["pane_state"], "agent_present": True},
+        {**observation["pane_state"], "terminal_id": "other"},
+        {**observation["pane_state"], "state_change_seq": 7},
+        {**observation["pane_state"], "state_change_seq": 9},
+    ):
+        assert (
+            ch.v1_verified_focus_episode(
+                state, "source", {**observation, "pane_state": pane_state}, snapshot
+            )
+            is None
+        )
+    assert (
+        ch.v1_verified_focus_episode(
+            state, "source", observation, {**snapshot, "panes": snapshot["panes"] * 2}
+        )
+        is None
+    )
+    assert (
+        ch.v1_verified_focus_episode(
+            state, "source", observation, {**snapshot, "agents": [{"pane_id": "p"}]}
+        )
+        is None
+    )
+    later = {
+        **observation,
+        "pane_state": {
+            **observation["pane_state"],
+            "state_change_seq": 10,
+            "released_completion_seq": 9,
+        },
+    }
+    later_snapshot = {
+        **snapshot,
+        "panes": [{**snapshot["panes"][0], "state_change_seq": 10}],
+    }
+    assert ch.v1_verified_focus_episode(state, "source", later, later_snapshot) is None
+    later["pane_state"]["released_completion_seq"] = 7
+    assert (
+        ch.v1_verified_focus_episode(state, "source", later, later_snapshot)
+        == "gen:t:7"
+    )
+
+
 def test_v1_surface_processes_select_only_foreground_process_group(monkeypatch):
     monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 100, raising=False)
     tree = {

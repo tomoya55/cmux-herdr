@@ -2012,20 +2012,7 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
     if not isinstance(agents, list) or any(not isinstance(a, dict) for a in agents):
         return None
     matches = [agent for agent in agents if agent.get("pane_id") == pane_id]
-    if len(matches) != 1:
-        return None
-    agent = matches[0]
-    terminal = agent.get("terminal_id")
-    sequence = agent.get("state_change_seq")
-    if (
-        agent.get("agent_status") not in ("done", "idle")
-        or not isinstance(terminal, str)
-        or not terminal
-        or type(sequence) is not int
-        or sequence < 0
-        or type(observation.get("agent_state_change_seq")) is not int
-        or observation["agent_state_change_seq"] != sequence
-    ):
+    if len(matches) > 1:
         return None
     entry = (
         state.get("v1", {})
@@ -2035,16 +2022,54 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
         .get(pane_id, {})
     )
     generation = entry.get("generation")
+    terminal = entry.get("terminal_id")
+    sequence = entry.get("sequence")
     if (
         entry.get("status") != "done"
         or entry.get("provisional")
         or not isinstance(generation, str)
         or not generation
         or entry.get("server_boot_id") != boot
-        or entry.get("terminal_id") != terminal
-        or entry.get("sequence") != sequence
+        or not isinstance(terminal, str)
+        or not terminal
+        or type(sequence) is not int
+        or sequence < 0
     ):
         return None
+    if matches:
+        agent = matches[0]
+        if (
+            agent.get("agent_status") not in ("done", "idle")
+            or agent.get("terminal_id") != terminal
+            or type(agent.get("state_change_seq")) is not int
+            or agent["state_change_seq"] != sequence
+            or type(observation.get("agent_state_change_seq")) is not int
+            or observation["agent_state_change_seq"] != sequence
+        ):
+            return None
+    else:
+        panes = snapshot.get("panes")
+        presented = observation.get("pane_state")
+        if not isinstance(panes, list) or any(not isinstance(p, dict) for p in panes):
+            return None
+        pane_matches = [pane for pane in panes if pane.get("pane_id") == pane_id]
+        if len(pane_matches) != 1 or not isinstance(presented, dict):
+            return None
+        pane = pane_matches[0]
+        release_sequence = pane.get("state_change_seq")
+        if (
+            observation.get("agent_state_change_seq") is not None
+            or presented.get("agent_present") is not False
+            or pane.get("terminal_id") != terminal
+            or presented.get("terminal_id") != terminal
+            or type(release_sequence) is not int
+            or release_sequence <= sequence
+            or type(presented.get("released_completion_seq")) is not int
+            or presented["released_completion_seq"] != sequence
+            or type(presented.get("state_change_seq")) is not int
+            or presented["state_change_seq"] != release_sequence
+        ):
+            return None
     episode = f"{generation}:{terminal}:{sequence}"
     return episode if entry.get("episode") == episode else None
 
