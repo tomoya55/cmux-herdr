@@ -7582,7 +7582,8 @@ def test_v1_supervisor_source_reports_ready_only_once_after_subscription(
     assert calls == [("source", "generation", "/source.sock", "a" * 32)]
 
 
-def test_v1_subscription_bounds_connect_and_closes_on_failure(monkeypatch):
+@pytest.mark.parametrize("failure", ["connect", "send"])
+def test_v1_subscription_bounds_connect_and_closes_on_failure(monkeypatch, failure):
     events = []
 
     class Connection:
@@ -7591,7 +7592,12 @@ def test_v1_subscription_bounds_connect_and_closes_on_failure(monkeypatch):
 
         def connect(self, path):
             events.append(("connect", path))
-            raise TimeoutError("connect stalled")
+            if failure == "connect":
+                raise TimeoutError("connect stalled")
+
+        def sendall(self, data):
+            events.append(("send",))
+            raise TimeoutError("send stalled")
 
         def close(self):
             events.append(("close",))
@@ -7602,6 +7608,7 @@ def test_v1_subscription_bounds_connect_and_closes_on_failure(monkeypatch):
     assert events == [
         ("timeout", ch.V1_SUBSCRIPTION_IDLE_TIMEOUT),
         ("connect", "/socket"),
+        *([("send",)] if failure == "send" else []),
         ("close",),
     ]
 
