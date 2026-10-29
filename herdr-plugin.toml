@@ -13,6 +13,11 @@ id = "refresh"
 title = "Refresh cmux sidebar"
 command = ["/bin/zsh", "-c", "python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile; nohup python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" remote </dev/null >>\"$HERDR_PLUGIN_STATE_DIR/remote.log\" 2>&1 &; nohup python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" watch </dev/null >>\"$HERDR_PLUGIN_STATE_DIR/watch.log\" 2>&1 &"]
 
+[[actions]]
+id = "mark-agent-read"
+title = "Mark focused agent result as read"
+command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" force-read"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["/bin/zsh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" event"]
