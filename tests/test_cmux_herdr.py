@@ -4953,6 +4953,12 @@ def test_attention_sidebar_uses_pending_completion_after_idle():
     assert panes["p"]["status"] == "idle"
 
 
+def test_attention_sidebar_preserves_pending_blocked_when_agent_state_unknown():
+    panes = {"p": {"status": "unknown", "agent": "letta", "title": "task"}}
+    attention = {"p": {"status": "blocked", "episode": "a"}}
+    assert ch.sidebar_panes(panes, attention)["p"]["status"] == "blocked"
+
+
 def test_attention_sidebar_prefers_current_work_over_old_completion():
     panes = {"p": {"status": "working", "agent": "claude", "title": "task"}}
     attention = {"p": {"status": "done", "episode": "a"}}
@@ -5240,6 +5246,161 @@ def test_v1_status_event_rejects_a_stale_subscription_server():
         state, "source", {"pane_id": "p", "agent_status": "done"}, event_boot="b" * 32
     )
     assert state == before
+
+
+@pytest.mark.parametrize("next_status", ["working", "idle", "done"])
+def test_v1_unknown_keeps_blocked_until_known_transition(next_status):
+    boot = "a" * 32
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "blocked",
+        "state_change_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    source = state["v1"]["sources"]["source"]
+    source["server_boot_id"] = boot
+    unknown = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "agent_status": "unknown",
+        "state_change_seq": 8,
+    }
+    assert ch.apply_v1_status_event(state, "source", unknown, event_boot=boot)
+    assert source["attention"]["p"]["status"] == "blocked"
+    known = {**unknown, "agent_status": next_status, "state_change_seq": 9}
+    assert ch.apply_v1_status_event(state, "source", known, event_boot=boot)
+    assert source["attention"]["p"].get("status") != "blocked"
+
+
+def test_v1_missing_agent_after_generation_change_retires_old_blocked():
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "blocked",
+        "state_change_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "old", [agent], ["p"])
+    absent = {**agent, "agent_status": "unknown", "state_change_seq": 1}
+    ch.apply_v1_snapshot(
+        state, "source", "new", [], ["p"], pane_records=[absent], reconnect=True
+    )
+    source = state["v1"]["sources"]["source"]
+    assert not ch.has_pending_attention(source["attention"], "p")
+    assert ch.sidebar_panes(source["panes"], source["attention"]) == {}
+    snapshot = {"agents": [], "panes": [absent]}
+    ch.v1_reconcile_absent_agents(
+        state, "source", "new", snapshot, [], [absent], snapshot
+    )
+    assert ch.sidebar_panes(source["panes"], source["attention"]) == {}
+
+
+def test_v1_unknown_snapshot_after_generation_change_retires_old_blocked():
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "blocked",
+        "state_change_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "old", [agent], ["p"])
+    unknown = {**agent, "agent_status": "unknown", "state_change_seq": 1}
+    ch.apply_v1_snapshot(state, "source", "new", [unknown], ["p"], reconnect=True)
+    source = state["v1"]["sources"]["source"]
+    assert not ch.has_pending_attention(source["attention"], "p")
+    assert ch.sidebar_panes(source["panes"], source["attention"]) == {}
+
+
+def test_v1_legacy_unknown_absence_without_identity_stays_blocked(monkeypatch):
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "blocked",
+        "state_change_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"])
+    assert ch.apply_v1_status_event(
+        state, "source", {"pane_id": "p", "agent_status": "unknown"}
+    )
+    pane = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "unknown",
+    }
+
+    def rpc(path, method, params):
+        if method == "session.snapshot":
+            return {"snapshot": {"agents": [], "panes": [pane]}}
+        return {"agents": []} if method == "agent.list" else {"panes": [pane]}
+
+    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    assert ch.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
+    source = state["v1"]["sources"]["source"]
+    assert source["attention"]["p"]["status"] == "blocked"
+
+
+def test_v1_unknown_snapshot_of_present_agent_preserves_blocked():
+    boot = "a" * 32
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "blocked",
+        "state_change_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    source = state["v1"]["sources"]["source"]
+    unknown = {**agent, "agent_status": "unknown", "state_change_seq": 8}
+    ch.apply_v1_snapshot(
+        state, "source", "g", [unknown], ["p"], boot_id=boot, reconnect=True
+    )
+    assert source["attention"]["p"]["status"] == "blocked"
+    assert source["attention"]["p"]["sequence"] == 8
+
+
+def test_v1_unknown_keeps_blocked_until_confirmed_absence():
+    boot = "a" * 32
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "blocked",
+        "state_change_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    source = state["v1"]["sources"]["source"]
+    source["server_boot_id"] = boot
+    unknown = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "agent_status": "unknown",
+        "state_change_seq": 8,
+    }
+    assert ch.apply_v1_status_event(state, "source", unknown, event_boot=boot)
+    assert source["attention"]["p"]["status"] == "blocked"
+    assert source["attention"]["p"]["sequence"] == 8
+    absent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "unknown",
+        "state_change_seq": 8,
+    }
+    snapshot = {"server_boot_id": boot, "agents": [], "panes": [absent]}
+    ch.v1_reconcile_absent_agents(
+        state, "source", "g", snapshot, [], [absent], snapshot
+    )
+    assert not ch.has_pending_attention(source["attention"], "p")
 
 
 def test_v1_unknown_event_preserves_completion_identity_and_ordering():

@@ -774,7 +774,9 @@ def apply_attention_status(attention, pane_id, status, episode, *, sequence=None
             return
         if current.get("status") != status or current.get("episode") != episode:
             attention[pane_id] = {"status": status, "episode": episode}
-    elif status == "working" or attention.get(pane_id, {}).get("status") == "blocked":
+    elif status == "working" or (
+        status == "idle" and current.get("status") == "blocked"
+    ):
         attention.pop(pane_id, None)
     elif status == "unknown" and current.get("status") == "done":
         completion_sequence = v1_completion_sequence(current)
@@ -828,7 +830,11 @@ def reconcile_agent_snapshot(attention, agents, generation):
             attention.pop(pane_id, None)
             current = {}
         if current.get("generation") not in (None, generation):
-            current.pop("sequence", None)
+            if current.get("status") == "blocked":
+                attention.pop(pane_id, None)
+                current = {}
+            else:
+                current.pop("sequence", None)
         episode = f"{generation}:{terminal_id}:{sequence}"
         apply_attention_status(
             attention, pane_id, agent.get("agent_status"), episode, sequence=sequence
@@ -858,6 +864,11 @@ def apply_v1_snapshot(
     )
     attention = source.setdefault("attention", {})
     panes = source.setdefault("panes", {})
+    if source.get("cursor_generation") not in (None, generation):
+        panes.clear()
+        for pane_id, entry in list(attention.items()):
+            if entry.get("status") == "blocked":
+                attention.pop(pane_id, None)
     for pane in pane_records or []:
         pane_id = pane["pane_id"]
         panes.setdefault(
@@ -1062,11 +1073,17 @@ def v1_reconcile_absent_agents(
             "sequence": sequence,
         }
         current = attention.get(pane_id, {})
+        observed_unknown_at_absence = (
+            current.get("status") == "blocked"
+            and tracked.get(pane_id, {}).get("status") == "unknown"
+            and current.get("sequence") == sequence
+        )
         if (
             current.get("generation") == generation
             and current.get("terminal_id") == terminal
             and type(current.get("sequence")) is int
             and current["sequence"] >= sequence
+            and not observed_unknown_at_absence
         ):
             continue
         if current.get("terminal_id") not in (None, terminal):
@@ -1076,7 +1093,7 @@ def v1_reconcile_absent_agents(
             and current.get("generation") == generation
             and current.get("terminal_id") == terminal
             and type(current.get("sequence")) is int
-            and current["sequence"] < sequence
+            and (current["sequence"] < sequence or observed_unknown_at_absence)
         ):
             attention[pane_id] = {
                 "sequence": current["sequence"],
@@ -2437,16 +2454,17 @@ def sync_v1_episode_tokens(source_id, socket_path, *, expected_boot=None):
 
 
 def sidebar_panes(panes, attention):
-    """Combine live pane state with unacknowledged completion state."""
+    """Combine live pane state with pending attention."""
     result = {}
     for pane_id, pane in panes.items():
         status = pane.get("status")
         if status == "done" and not has_pending_attention(attention, pane_id):
             continue
         if status not in TRACKED_STATUSES:
-            if attention.get(pane_id, {}).get("status") != "done":
+            pending_status = attention.get(pane_id, {}).get("status")
+            if pending_status not in ATTENTION_STATUSES:
                 continue
-            status = "done"
+            status = pending_status
         result[pane_id] = {**pane, "status": status}
     return result
 
