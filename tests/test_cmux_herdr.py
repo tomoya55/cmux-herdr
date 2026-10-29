@@ -3800,6 +3800,80 @@ def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
         assert ch.v1_native_transport_claims({**response, **change}) is None
 
 
+def test_v1_native_topology_requires_same_surface_kernel_parentage_and_tty(monkeypatch):
+    owner = {
+        "owner_pid": 40,
+        "owner_start_token": 3,
+        "instance": "c" * 32,
+        "revision": 5,
+    }
+    claim = {
+        "bridge_id": "bridge",
+        "connection_id": "connection",
+        "client": {"pid": 42, "start_token": 1},
+        "ssh_child": {"pid": 43, "start_token": 2},
+        "source": {"target": "host", "session": "work"},
+        "generation": 9,
+        "observation": {"instance": "b" * 32, "sources": []},
+    }
+    live = {
+        40: {
+            "pid": 40,
+            "start_token": 3,
+            "ppid": 10,
+            "tty_device": 100,
+            "path": "/bin/herdr",
+        },
+        42: {
+            "pid": 42,
+            "start_token": 1,
+            "ppid": 40,
+            "tty_device": 100,
+            "path": "/bin/herdr",
+        },
+        43: {
+            "pid": 43,
+            "start_token": 2,
+            "ppid": 40,
+            "tty_device": 100,
+            "path": "/usr/bin/ssh",
+        },
+    }
+    nodes = {
+        40: {"pid": 40, "ppid": 10, "name": "herdr", "tty_device": 100},
+        42: {"pid": 42, "ppid": 40, "name": "herdr", "tty_device": 100},
+        43: {"pid": 43, "ppid": 40, "name": "ssh", "tty_device": 100},
+    }
+    nodes[40]["children"] = [nodes[42], nodes[43]]
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: live.get(pid))
+    assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is not None
+    for pid, key, value in (
+        (42, "ppid", 10),
+        (43, "tty_device", 101),
+        (40, "start_token", 4),
+        (42, "path", "/bin/sh"),
+    ):
+        original = live[pid][key]
+        live[pid][key] = value
+        assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is None
+        live[pid][key] = original
+    nodes[43]["ppid"] = 10
+    assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is None
+    nodes[43]["ppid"] = 40
+    calls = {40: 0, 42: 0, 43: 0}
+
+    def replaced(pid):
+        calls[pid] += 1
+        return (
+            {**live[pid], "start_token": 999}
+            if pid == 42 and calls[pid] > 1
+            else live[pid].copy()
+        )
+
+    monkeypatch.setattr(ch, "v1_native_process_info", replaced)
+    assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is None
+
+
 def test_v1_daemon_identity_requires_matching_recorded_audit_token(
     monkeypatch, tmp_path
 ):

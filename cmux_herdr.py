@@ -1617,6 +1617,15 @@ def v1_native_process_info(pid):
         start_token = info.start_sec * 1_000_000 + info.start_usec
         if not 0 < start_token < 2**64:
             return None
+        proc_pidpath = lib.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+        path = ctypes.create_string_buffer(4096)
+        if proc_pidpath(pid, path, len(path)) <= 0:
+            return None
+        executable = os.fsdecode(path.value)
+        if not os.path.isabs(executable):
+            return None
         return {
             "pid": pid,
             "ppid": info.ppid,
@@ -1624,6 +1633,7 @@ def v1_native_process_info(pid):
             "tty_device": info.tty_device,
             "tty_pgid": info.tty_pgid,
             "start_token": start_token,
+            "path": executable,
         }
     except (OSError, AttributeError, ValueError, OverflowError):
         return None
@@ -1790,6 +1800,98 @@ def v1_native_transport_claims(response):
             }
         )
     return claims if not indexed else None
+
+
+def v1_native_transport_topology(response, claims, nodes, tty_device):
+    """Check validated claims against a single surface and live kernel identities."""
+    try:
+        owner_pid = response["owner_pid"]
+        owner_node = nodes[owner_pid]
+        if type(tty_device) is not int or not isinstance(claims, list) or not claims:
+            return None
+
+        def role(node, name):
+            path = node.get("path")
+            return (
+                node.get("name") == name
+                or isinstance(path, str)
+                and Path(path).name == name
+            )
+
+        def process(pid, token, name, parent=None):
+            node = nodes.get(pid)
+            if (
+                not isinstance(node, dict)
+                or node.get("pid") != pid
+                or not role(node, name)
+                or node.get("tty_device") != tty_device
+            ):
+                return None
+            info = v1_native_process_info(pid)
+            if (
+                not info
+                or info.get("pid") != pid
+                or info.get("start_token") != token
+                or info.get("tty_device") != tty_device
+                or not role(info, name)
+            ):
+                return None
+            if node.get("ppid") != info.get("ppid") or (
+                parent is not None and info.get("ppid") != parent
+            ):
+                return None
+            return info
+
+        owner = process(owner_pid, response["owner_start_token"], "herdr")
+        if owner is None or not isinstance(owner_node.get("children"), list):
+            return None
+        child_nodes = owner_node["children"]
+        if any(not isinstance(node, dict) for node in child_nodes):
+            return None
+        observations = {owner_pid: owner}
+        records = []
+        for claim in claims:
+            client, ssh = claim["client"], claim["ssh_child"]
+            for identity, name in ((client, "herdr"), (ssh, "ssh")):
+                pid = identity["pid"]
+                matching = [node for node in child_nodes if node.get("pid") == pid]
+                if (
+                    len(matching) != 1
+                    or matching[0] != nodes.get(pid)
+                    or pid in observations
+                ):
+                    return None
+                info = process(pid, identity["start_token"], name, owner_pid)
+                if info is None:
+                    return None
+                observations[pid] = info
+            nested = claim["observation"]
+            records.append(
+                {
+                    "owner_pid": owner_pid,
+                    "owner_start_token": response["owner_start_token"],
+                    "owner_instance": response["instance"],
+                    "revision": response["revision"],
+                    "bridge_id": claim["bridge_id"],
+                    "connection_id": claim["connection_id"],
+                    "client": client.copy(),
+                    "ssh_child": ssh.copy(),
+                    "source": claim["source"].copy(),
+                    "generation": claim["generation"],
+                    "client_instance": nested["instance"],
+                    "sources": sorted(
+                        nested["sources"], key=lambda item: item["endpoint"]
+                    ),
+                    "tty_device": tty_device,
+                }
+            )
+        if any(
+            v1_native_process_info(pid) != info for pid, info in observations.items()
+        ):
+            return None
+        return records
+    except (KeyError, TypeError, AttributeError, ValueError, OSError):
+        return None
 
 
 def v1_foreground_surface_processes(payload, workspace_id, surface_id):
