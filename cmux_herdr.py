@@ -1506,6 +1506,15 @@ def valid_v1_source_inventory(response, pid):
 
 def v1_read_client_response(path, expected_peer=None, *, timeout=2):
     """Read one bounded response and optionally verify its socket peer PID."""
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate observer response key")
+            result[key] = value
+        return result
+
     try:
         deadline = time.monotonic() + timeout
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -1527,7 +1536,9 @@ def v1_read_client_response(path, expected_peer=None, *, timeout=2):
                 data += chunk
             if b"\n" not in data or len(data) > 65536:
                 return None
-            response = json.loads(data.split(b"\n", 1)[0])
+            response = json.loads(
+                data.split(b"\n", 1)[0], object_pairs_hook=unique_object
+            )
         return response if isinstance(response, dict) else None
     except (OSError, ValueError, TypeError, RecursionError):
         return None
@@ -1644,6 +1655,141 @@ def v1_native_transport_envelope(path, pid, *, timeout=2):
     ):
         return None
     return response
+
+
+def v1_native_transport_claims(response):
+    """Validate launcher-scoped claims; callers must verify peer and topology."""
+
+    def uint(value, *, positive=False, maximum=2**64):
+        return type(value) is int and int(positive) <= value < maximum
+
+    def identity(value):
+        return (
+            isinstance(value, dict)
+            and uint(value.get("pid"), positive=True, maximum=2**31)
+            and uint(value.get("start_token"), positive=True)
+        )
+
+    def identifier(value):
+        return isinstance(value, str) and bool(value) and "\x00" not in value
+
+    if (
+        not isinstance(response, dict)
+        or type(response.get("version")) is not int
+        or response["version"] != 1
+        or response.get("status") != "ok"
+        or response.get("ownership_complete") is not True
+        or not uint(response.get("owner_pid"), positive=True, maximum=2**31)
+        or not uint(response.get("owner_start_token"), positive=True)
+        or not isinstance(response.get("instance"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", response["instance"])
+        or not uint(response.get("revision"))
+        or response["revision"] == 2**64 - 1
+    ):
+        return None
+    bridges, bounds = response.get("bridges"), response.get("bound_observations")
+    if (
+        not isinstance(bridges, list)
+        or not 0 < len(bridges) <= 64
+        or not isinstance(bounds, list)
+        or len(bridges) != len(bounds)
+    ):
+        return None
+    indexed = {}
+    for bound in bounds:
+        if (
+            not isinstance(bound, dict)
+            or not identifier(bound.get("bridge_id"))
+            or bound["bridge_id"] in indexed
+        ):
+            return None
+        indexed[bound["bridge_id"]] = bound
+    claims, seen_processes, seen_connections = [], {response["owner_pid"]}, set()
+    for bridge in bridges:
+        if not isinstance(bridge, dict) or not identifier(bridge.get("id")):
+            return None
+        bound = indexed.pop(bridge["id"], None)
+        connection, client, source = (
+            bridge.get("connection"),
+            bridge.get("client"),
+            bridge.get("source"),
+        )
+        if (
+            not isinstance(bound, dict)
+            or not isinstance(connection, dict)
+            or not isinstance(source, dict)
+            or not identifier(source.get("target"))
+            or source["target"].startswith("-")
+            or not identifier(source.get("session"))
+            or not identity(client)
+            or not identity(connection.get("consumer"))
+            or client != connection["consumer"]
+            or not identity(connection.get("ssh_child"))
+            or not identifier(connection.get("id"))
+            or type(connection.get("peer_identity_verified")) is not bool
+            or connection["id"] in seen_connections
+            or bound.get("connection_id") != connection["id"]
+            or not uint(bound.get("generation"))
+            or not isinstance(bound.get("instance"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", bound["instance"])
+        ):
+            return None
+        ssh = connection["ssh_child"]
+        if (
+            client["pid"] in seen_processes
+            or ssh["pid"] in seen_processes
+            or ssh["pid"] == client["pid"]
+        ):
+            return None
+        seen_processes.update((client["pid"], ssh["pid"]))
+        seen_connections.add(connection["id"])
+        nested = bound.get("observation")
+        if (
+            not valid_v1_source_inventory(nested, client["pid"])
+            or nested["instance"] != bound["instance"]
+            or nested["sources_complete"] is not True
+            or "observation" not in nested
+            or not all(
+                uint(item["connection_generation"]) for item in nested["sources"]
+            )
+        ):
+            return None
+        local = [item for item in nested["sources"] if item["endpoint"] == "local"]
+        if (
+            len(local) != 1
+            or local[0].get("ssh_target") != source.get("target")
+            or local[0].get("session") != source.get("session")
+            or local[0]["connection_generation"] != bound["generation"]
+        ):
+            return None
+        pane = nested["observation"]
+        if pane is not None and (
+            not valid_v1_client_observation(nested, client["pid"])
+            or not uint(pane["snapshot_revision"])
+            or (
+                pane["agent_state_change_seq"] is not None
+                and not uint(pane["agent_state_change_seq"])
+            )
+            or not any(
+                pane["endpoint"] == item["endpoint"]
+                and pane["boot_id"] == item["boot_id"]
+                and pane["connection_generation"] == item["connection_generation"]
+                for item in nested["sources"]
+            )
+        ):
+            return None
+        claims.append(
+            {
+                "bridge_id": bridge["id"],
+                "connection_id": connection["id"],
+                "client": client,
+                "ssh_child": ssh,
+                "source": source,
+                "generation": bound["generation"],
+                "observation": nested,
+            }
+        )
+    return claims if not indexed else None
 
 
 def v1_foreground_surface_processes(payload, workspace_id, surface_id):

@@ -1547,6 +1547,29 @@ def test_v1_focus_observation_requires_matching_socket_peer(monkeypatch):
     assert seen == [42]
 
 
+def test_v1_observer_response_rejects_duplicate_json_keys():
+    import threading
+
+    path = short_sock_path("duplicates")
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(path))
+            listener.listen(1)
+            ready.set()
+            conn, _ = listener.accept()
+            with conn:
+                conn.sendall(b'{"status":"unavailable","status":"ok"}\n')
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    assert ch.v1_read_client_response(path) is None
+    thread.join(5)
+    path.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -3684,6 +3707,97 @@ def test_v1_native_transport_envelope_requires_matching_live_socket_owner(monkey
     monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: next(identities))
     monkeypatch.setattr(ch, "v1_read_client_response", lambda *args, **kwargs: response)
     assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
+
+
+def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
+    pid = {"pid": 42, "start_token": 1}
+    ssh = {"pid": 43, "start_token": 2}
+    source = {
+        "endpoint": "local",
+        "boot_id": "a" * 32,
+        "connection_generation": 9,
+        "ssh_target": "host",
+        "session": "work",
+    }
+    client = {
+        "version": 1,
+        "status": "ok",
+        "pid": 42,
+        "instance": "b" * 32,
+        "sources_complete": True,
+        "sources": [source],
+        "observation": None,
+    }
+    bridge = {
+        "id": "bridge",
+        "client": pid,
+        "source": {"target": "host", "session": "work"},
+        "connection": {
+            "id": "connection",
+            "consumer": pid,
+            "ssh_child": ssh,
+            "peer_identity_verified": False,
+        },
+    }
+    bound = {
+        "bridge_id": "bridge",
+        "connection_id": "connection",
+        "instance": "b" * 32,
+        "generation": 9,
+        "observation": client,
+    }
+    response = {
+        "version": 1,
+        "status": "ok",
+        "owner_pid": 40,
+        "owner_start_token": 3,
+        "instance": "c" * 32,
+        "revision": 5,
+        "ownership_complete": True,
+        "bridges": [bridge],
+        "bound_observations": [bound],
+    }
+    claims = ch.v1_native_transport_claims(response)
+    assert claims is not None and len(claims) == 1
+    pane = {
+        "endpoint": "local",
+        "boot_id": "a" * 32,
+        "connection_generation": 9,
+        "snapshot_revision": 3,
+        "pane_id": "pane",
+        "outer_focused": None,
+        "agent_state_change_seq": None,
+    }
+    pane_bound = {**bound, "observation": {**client, "observation": pane}}
+    assert ch.v1_native_transport_claims(
+        {**response, "bound_observations": [pane_bound]}
+    )
+    for key in ("snapshot_revision", "agent_state_change_seq"):
+        invalid = {
+            **pane_bound,
+            "observation": {**client, "observation": {**pane, key: 2**64}},
+        }
+        assert (
+            ch.v1_native_transport_claims({**response, "bound_observations": [invalid]})
+            is None
+        )
+    for change in (
+        {"ownership_complete": False},
+        {"status": "unavailable"},
+        {"bound_observations": []},
+        {"bound_observations": [bound, bound]},
+        {"bridges": [bridge, bridge]},
+        {"bound_observations": [{**bound, "connection_id": "other"}]},
+        {"bound_observations": [{**bound, "generation": 10}]},
+        {"bound_observations": [{**bound, "instance": "d" * 32}]},
+        {
+            "bridges": [
+                {**bridge, "connection": {**bridge["connection"], "consumer": ssh}}
+            ]
+        },
+        {"bridges": [{**bridge, "source": {"target": "other", "session": "work"}}]},
+    ):
+        assert ch.v1_native_transport_claims({**response, **change}) is None
 
 
 def test_v1_daemon_identity_requires_matching_recorded_audit_token(
