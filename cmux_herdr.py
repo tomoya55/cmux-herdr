@@ -734,6 +734,31 @@ def has_attention_panes(panes):
     return any(p["status"] in ATTENTION_STATUSES for p in panes.values())
 
 
+def v1_completion_sequence(entry):
+    """Recover the exact completed episode without treating its watermark as its ID."""
+    generation, terminal = entry.get("generation"), entry.get("terminal_id")
+    episode, watermark = entry.get("episode"), entry.get("sequence")
+    if not all(
+        isinstance(value, str) and value for value in (generation, terminal, episode)
+    ):
+        return None
+    prefix = f"{generation}:{terminal}:"
+    if not episode.startswith(prefix):
+        return None
+    suffix = episode[len(prefix) :]
+    if not re.fullmatch(r"0|[1-9][0-9]{0,19}", suffix):
+        return None
+    sequence = int(suffix)
+    if (
+        sequence > 0xFFFFFFFFFFFFFFFF
+        or type(watermark) is not int
+        or sequence > watermark
+    ):
+        return None
+    saved = entry.get("completion_sequence", sequence)
+    return sequence if type(saved) is int and saved == sequence else None
+
+
 def apply_attention_status(attention, pane_id, status, episode, *, sequence=None):
     """Update a pane's attention without treating a seen result as resolved."""
     current = attention.get(pane_id, {})
@@ -751,6 +776,10 @@ def apply_attention_status(attention, pane_id, status, episode, *, sequence=None
             attention[pane_id] = {"status": status, "episode": episode}
     elif status == "working" or attention.get(pane_id, {}).get("status") == "blocked":
         attention.pop(pane_id, None)
+    elif status == "unknown" and current.get("status") == "done":
+        completion_sequence = v1_completion_sequence(current)
+        if completion_sequence is not None:
+            current.setdefault("completion_sequence", completion_sequence)
     watermark = sequence if sequence is not None else previous_sequence
     if watermark is not None:
         attention.setdefault(pane_id, {})["sequence"] = watermark
@@ -2023,7 +2052,7 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
     )
     generation = entry.get("generation")
     terminal = entry.get("terminal_id")
-    sequence = entry.get("sequence")
+    sequence = v1_completion_sequence(entry)
     if (
         entry.get("status") != "done"
         or entry.get("provisional")

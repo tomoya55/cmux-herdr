@@ -5242,6 +5242,118 @@ def test_v1_status_event_rejects_a_stale_subscription_server():
     assert state == before
 
 
+def test_v1_unknown_event_preserves_completion_identity_and_ordering():
+    boot = "a" * 32
+    agent = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "workspace_id": "w",
+        "agent_status": "done",
+        "state_change_seq": 7,
+        "completion_seq": 7,
+    }
+    state = {}
+    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    source = state["v1"]["sources"]["source"]
+    source["server_boot_id"] = boot
+    source["attention"]["p"]["server_boot_id"] = boot
+    event = {
+        "pane_id": "p",
+        "terminal_id": "t",
+        "state_change_seq": 8,
+        "agent_status": "unknown",
+    }
+    assert ch.apply_v1_status_event(state, "source", event, event_boot=boot)
+    observation = {
+        "boot_id": boot,
+        "pane_id": "p",
+        "outer_focused": True,
+        "agent_state_change_seq": None,
+        "pane_state": {
+            "terminal_id": "t",
+            "state_change_seq": 9,
+            "agent_present": False,
+            "released_completion_seq": 7,
+        },
+    }
+    snapshot = {
+        "server_boot_id": boot,
+        "agents": [],
+        "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 9}],
+    }
+    assert (
+        ch.v1_verified_focus_episode(state, "source", observation, snapshot) == "g:t:7"
+    )
+    assert ch.apply_v1_status_event(
+        state,
+        "source",
+        {**event, "state_change_seq": 7, "agent_status": "blocked"},
+        event_boot=boot,
+    )
+    assert source["attention"]["p"]["status"] == "done"
+    assert source["attention"]["p"]["sequence"] == 8
+
+
+def test_v1_saved_unknown_state_recovers_exact_completion_identity():
+    boot = "a" * 32
+    entry = {
+        "status": "done",
+        "episode": "g:t:7",
+        "sequence": 8,
+        "generation": "g",
+        "terminal_id": "t",
+        "server_boot_id": boot,
+    }
+    state = {
+        "v1": {
+            "sources": {
+                "source": {
+                    "attention": {"p": entry},
+                    "panes": {"p": {"terminal_id": "t", "status": "unknown"}},
+                    "server_boot_id": boot,
+                    "cursor_generation": "g",
+                }
+            }
+        }
+    }
+    observation = {
+        "boot_id": boot,
+        "pane_id": "p",
+        "outer_focused": True,
+        "agent_state_change_seq": None,
+        "pane_state": {
+            "terminal_id": "t",
+            "state_change_seq": 10,
+            "agent_present": False,
+            "released_completion_seq": 7,
+        },
+    }
+    snapshot = {
+        "server_boot_id": boot,
+        "agents": [],
+        "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 10}],
+    }
+    assert (
+        ch.v1_verified_focus_episode(state, "source", observation, snapshot) == "g:t:7"
+    )
+    assert ch.apply_v1_status_event(
+        state,
+        "source",
+        {
+            "pane_id": "p",
+            "terminal_id": "t",
+            "state_change_seq": 9,
+            "agent_status": "unknown",
+        },
+        event_boot=boot,
+    )
+    assert (
+        ch.v1_verified_focus_episode(state, "source", observation, snapshot) == "g:t:7"
+    )
+    entry["episode"] = "other:t:7"
+    assert ch.v1_verified_focus_episode(state, "source", observation, snapshot) is None
+
+
 def test_v1_newer_noncompletion_idle_event_retires_previous_done():
     boot = "a" * 32
     agent = {
