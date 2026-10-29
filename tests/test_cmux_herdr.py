@@ -2031,6 +2031,40 @@ def test_v1_supervisor_keeps_previous_bindings_until_replacements_are_ready():
     )
 
 
+def test_v1_supervisor_retires_departed_binding_on_ready_surface_only():
+    old = {
+        "source": "old",
+        "workspace": "w",
+        "surface": "s",
+        "pid": 7,
+        "supervised": True,
+    }
+    unavailable = {
+        "source": "old-b",
+        "workspace": "other",
+        "surface": "b",
+        "pid": 7,
+        "supervised": True,
+    }
+    state = {"v1": {"clients": {"departed": old, "offline-old": unavailable}}}
+    a = {
+        "workspace": "w",
+        "surface": "s",
+        "target": {"remote": None, "socket_path": "/a", "server_boot_id": "a" * 32},
+        "connection_generation": 1,
+    }
+    b = {
+        "workspace": "other",
+        "surface": "b",
+        "target": {"remote": None, "socket_path": "/b", "server_boot_id": "b" * 32},
+        "connection_generation": 1,
+    }
+    ch.reconcile_v1_supervised_bindings(
+        state, {"a": a, "b": b}, {"a": a}, complete=True, supervisor_pid=9
+    )
+    assert set(state["v1"]["clients"]) == {"a", "offline-old"}
+
+
 def test_v1_supervisor_does_not_retire_unmanaged_clients():
     state = {
         "v1": {
@@ -2360,6 +2394,97 @@ def test_v1_supervisor_groups_symlink_aliases_for_same_source(tmp_path):
         manager.close()
 
 
+def test_v1_publication_workspace_requires_unregistered_discovered_surface(monkeypatch):
+    a = {"workspace": "w", "surface": "a", "target": {"socket_path": "/a"}}
+    b = {"workspace": "w", "surface": "b", "target": {"socket_path": "/b"}}
+
+    class Sources:
+        def current_ready(self, desired):
+            return {"a": a}
+
+    monkeypatch.setattr(
+        ch, "v1_verified_publication_targets", lambda desired, ready: {("w", "a")}
+    )
+    verification = ch.V1PublicationVerification(Sources())
+    verification.update({"a": a, "b": b}, complete=True)
+    assert not verification.workspace_allowed("w")
+
+
+def test_v1_publication_full_scope_rejects_unsupervised_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    spec = {"workspace": "w", "surface": "s", "target": {"socket_path": "/socket"}}
+    ch.save_state({"v1": {"clients": {"foreign": {"workspace": "w", "surface": "s"}}}})
+
+    class Sources:
+        def current_ready(self, desired):
+            return desired
+
+    monkeypatch.setattr(ch, "v1_bindings_match_clients", lambda *args, **kwargs: True)
+    verification = ch.V1PublicationVerification(Sources())
+    verification.update({"c": spec}, complete=True)
+    assert verification.scope() == set()
+
+
+def test_v1_publication_verification_revokes_on_incomplete_inventory_and_readiness(
+    monkeypatch,
+):
+    spec = {"workspace": "w", "surface": "s", "target": {"socket_path": "/socket"}}
+
+    class Sources:
+        ready = True
+
+        def current_ready(self, desired):
+            return desired if self.ready else {}
+
+    sources = Sources()
+    monkeypatch.setattr(
+        ch,
+        "v1_verified_publication_targets",
+        lambda desired, ready: {("w", "s")} if ready else set(),
+    )
+    verification = ch.V1PublicationVerification(sources)
+    assert verification.eligible() == set()
+    verification.update({"c": spec}, complete=True)
+    assert verification.eligible() == {("w", "s")}
+    sources.ready = False
+    assert verification.eligible() == set()
+    verification.update({"c": spec}, complete=False)
+    sources.ready = True
+    assert verification.eligible() == set()
+
+
+def test_v1_supervisor_sources_checks_readiness_without_discovery():
+    class Worker:
+        ready = True
+        alive = True
+
+        def stop(self):
+            self.alive = False
+
+    worker = Worker()
+    manager = ch.V1SupervisedSources(lambda *args: worker)
+    spec = {
+        "workspace": "w",
+        "surface": "s",
+        "connection_generation": 1,
+        "target": {
+            "remote": None,
+            "socket_path": "/tmp/source.sock",
+            "server_boot_id": "a" * 32,
+        },
+    }
+    try:
+        assert manager.reconcile({"c": spec}, complete=False) == {"c": spec}
+        assert manager.current_ready({"c": spec}) == {"c": spec}
+        worker.ready = False
+        assert manager.current_ready({"c": spec}) == {}
+        worker.ready = True
+        assert manager.current_ready({"c": spec}) == {"c": spec}
+    finally:
+        manager.close()
+
+
 def test_v1_supervisor_sources_retains_handle_if_stop_fails():
     class Worker:
         ready = True
@@ -2520,6 +2645,9 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
         def reconcile(self, desired, *, complete):
             return {"c": spec}
 
+        def current_ready(self, desired):
+            return {"c": spec}
+
         def sync_tokens(self):
             calls.append("tokens")
 
@@ -2541,6 +2669,8 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
     monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch, "load_state", lambda: {"v1": {"clients": {"c": {}}}})
+    monkeypatch.setattr(ch, "v1_bindings_match_clients", lambda *args, **kwargs: True)
     monkeypatch.setattr(ch, "v1_recover_legacy_handoff", lambda: True)
     monkeypatch.setattr(
         ch, "v1_supervisor_bindings_match", lambda *args, **kwargs: True
@@ -2554,7 +2684,7 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
         ch, "v1_supervisor_focus_tick", lambda *args: calls.append("focus")
     )
 
-    def publish(*args):
+    def publish(*args, **kwargs):
         calls.append("publish")
         published.set()
 
@@ -2571,6 +2701,76 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
     assert calls[0] == "reclaim"
     assert calls[-2:] == ["sources closed", "leases closed"]
     assert sorted(calls[1:-2]) == sorted(["reconcile", "focus", "publish"])
+
+
+def test_v1_supervisor_publishes_ready_surface_after_partial_restart(
+    monkeypatch, tmp_path
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    healthy = {"workspace": "wa", "surface": "sa", "target": {"socket_path": "/a"}}
+    offline = {"workspace": "wb", "surface": "sb", "target": {"socket_path": "/b"}}
+    desired = {"a": healthy, "b": offline}
+    published = threading.Event()
+    calls = []
+
+    class Leases:
+        def acquire_leader(self):
+            return True
+
+        def reconcile(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class Sources:
+        def __init__(self, start):
+            pass
+
+        def reconcile(self, *args, **kwargs):
+            return {"a": healthy}
+
+        def current_ready(self, desired):
+            return {"a": healthy}
+
+        def close(self):
+            pass
+
+    class Stop:
+        done = False
+
+        def is_set(self):
+            return self.done
+
+        def wait(self, seconds):
+            assert published.wait(3)
+            self.done = True
+
+    monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
+    monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch, "v1_recover_legacy_handoff", lambda: True)
+    monkeypatch.setattr(
+        ch, "v1_discover_clients", lambda cfg: {"complete": True, "clients": []}
+    )
+    monkeypatch.setattr(ch, "v1_discovered_targets", lambda inventory: desired)
+    monkeypatch.setattr(ch, "v1_reconcile_supervisor_inventory", lambda *args: None)
+    monkeypatch.setattr(ch, "v1_supervisor_focus_tick", lambda *args: None)
+    monkeypatch.setattr(
+        ch,
+        "v1_verified_publication_targets",
+        lambda desired, ready: {("wa", "sa")} if "a" in ready else set(),
+    )
+
+    def publish(cfg, **kwargs):
+        calls.append(kwargs["eligible_destinations"])
+        published.set()
+
+    monkeypatch.setattr(ch, "publish_v1_clients", publish)
+    ch.v1_run_supervisor({}, Stop())
+    assert calls == [{("wa", "sa")}]
 
 
 def test_v1_supervisor_publishes_while_discovery_is_stalled(monkeypatch, tmp_path):
@@ -2604,6 +2804,9 @@ def test_v1_supervisor_publishes_while_discovery_is_stalled(monkeypatch, tmp_pat
             pass
 
         def reconcile(self, *args, **kwargs):
+            return {}
+
+        def current_ready(self, desired):
             return {}
 
         def close(self):
@@ -8562,6 +8765,184 @@ def test_v1_watch_notifies_observer_after_each_state_change(monkeypatch):
         "source", "boot", "/socket", on_change=lambda: changes.append(True)
     )
     assert len(changes) == 3
+
+
+def test_v1_verified_publication_targets_require_complete_surface(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    spec_a = {"workspace": "wa", "surface": "sa"}
+    spec_b = {"workspace": "wb", "surface": "sb"}
+    spec_c = {"workspace": "wc", "surface": "sc"}
+    desired = {"a": spec_a, "b": spec_b, "c": spec_c, "d": spec_c}
+    ch.save_state(
+        {
+            "v1": {
+                "clients": {
+                    key: {"workspace": spec["workspace"], "surface": spec["surface"]}
+                    for key, spec in desired.items()
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(ch, "v1_bindings_match_clients", lambda *args, **kwargs: True)
+    assert ch.v1_verified_publication_targets(desired, {"a": spec_a, "c": spec_c}) == {
+        ("wa", "sa")
+    }
+    state = ch.load_state()
+    state["v1"]["clients"]["extra"] = {"workspace": "wa", "surface": "sa"}
+    ch.save_state(state)
+    assert (
+        ch.v1_verified_publication_targets(desired, {"a": spec_a, "c": spec_c}) == set()
+    )
+
+
+def test_v1_partial_publication_preserves_unverified_destinations(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    state = {}
+    ch.register_v1_client(state, "a", "healthy", "wa", "sa", 1)
+    ch.register_v1_client(state, "b", "offline", "wb", "sb", 2)
+    stale = ch.v1_destination_key("wb", "sb")
+    state["v1"]["destinations"] = {stale: {"notification_id": "offline-notice"}}
+    state["v1"]["sidebar_keys"] = {"wb": ["offline-key"]}
+    ch.save_state(state)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+    destinations, workspaces, retired = [], [], []
+    monkeypatch.setattr(
+        ch,
+        "reconcile_v1_sidebar",
+        lambda cfg, state, items, **kwargs: workspaces.append(items),
+    )
+    monkeypatch.setattr(
+        ch,
+        "reconcile_v1_destination",
+        lambda cfg, state, w, s, sources, **kwargs: destinations.append(
+            (w, s, sources)
+        ),
+    )
+    monkeypatch.setattr(
+        ch,
+        "retire_v1_destination",
+        lambda cfg, state, key, **kwargs: retired.append(key),
+    )
+    ch.publish_v1_clients({}, eligible_destinations={("wa", "sa")})
+    assert destinations == [("wa", "sa", ["healthy"])]
+    assert workspaces == [{"wa": {"healthy"}}]
+    assert not retired
+    assert (
+        ch.load_state()["v1"]["destinations"][stale]["notification_id"]
+        == "offline-notice"
+    )
+    assert ch.load_state()["v1"]["sidebar_keys"]["wb"] == ["offline-key"]
+
+
+def test_v1_partial_publication_rechecks_readiness_before_notification(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    state = {}
+    ch.register_v1_client(state, "a", "healthy", "w", "s", 1)
+    state["v1"]["sources"] = {"healthy": {"attention": {"p": {"status": "done"}}}}
+    ch.save_state(state)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "reconcile_v1_sidebar", lambda *args, **kwargs: None)
+    eligible = {("w", "s")}
+
+    def notifications(cfg):
+        eligible.clear()
+        return []
+
+    monkeypatch.setattr(ch, "cmux_notifications_checked", notifications)
+    effects = []
+    monkeypatch.setattr(ch, "run", lambda *args, **kwargs: effects.append(args))
+    ch.publish_v1_clients(
+        {}, eligible_destinations={("w", "s")}, eligibility_check=lambda: eligible
+    )
+    assert not effects
+
+
+def test_v1_publication_preserves_orphan_sidebar_when_full_scope_is_revoked(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state({"v1": {"sidebar_keys": {"w": ["old-key"]}}})
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    effects = []
+    monkeypatch.setattr(ch, "cmux_cli", lambda *args: effects.append(args) or True)
+    ch.publish_v1_clients({}, eligibility_check=lambda: set())
+    assert not effects
+    assert ch.load_state()["v1"]["sidebar_keys"] == {"w": ["old-key"]}
+
+
+def test_v1_sidebar_preserves_remaining_keys_when_readiness_is_lost(monkeypatch):
+    state = {"v1": {"sidebar_keys": {"w": ["a", "b"]}}}
+    ready = [True]
+    calls = []
+
+    def clear(cfg, args):
+        calls.append(args)
+        ready[0] = False
+        return True
+
+    monkeypatch.setattr(ch, "cmux_cli", clear)
+    ch.reconcile_v1_sidebar({}, state, {}, is_current=lambda workspace: ready[0])
+    assert len(calls) == 1
+    assert len(state["v1"]["sidebar_keys"]["w"]) == 1
+
+
+def test_v1_workspace_validation_detects_replaced_binding(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    snapshot = {
+        "v1": {
+            "clients": {"c": {"workspace": "w", "surface": "s", "source": "old"}},
+            "sources": {"old": {}, "new": {}},
+        }
+    }
+    ch.save_state(snapshot)
+    assert ch.v1_workspace_inputs_current(snapshot, "w")
+    live = ch.load_state()
+    live["v1"]["clients"]["c"]["source"] = "new"
+    ch.save_state(live)
+    assert not ch.v1_workspace_inputs_current(snapshot, "w")
+
+
+def test_v1_partial_publication_freezes_mixed_workspace_sidebar(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    state = {}
+    ch.register_v1_client(state, "a", "healthy", "w", "sa", 1)
+    ch.register_v1_client(state, "b", "offline", "w", "sb", 2)
+    state["v1"]["sidebar_keys"] = {"w": ["preserved"]}
+    ch.save_state(state)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    side_effects, destinations = [], []
+    monkeypatch.setattr(ch, "cmux_cli", lambda *args: side_effects.append(args) or True)
+    monkeypatch.setattr(ch, "push_pill", lambda *args: side_effects.append(args))
+    monkeypatch.setattr(
+        ch,
+        "reconcile_v1_destination",
+        lambda cfg, state, w, s, sources, **kwargs: destinations.append(
+            (w, s, sources)
+        ),
+    )
+    ch.publish_v1_clients({}, eligible_destinations={("w", "sa")})
+    assert destinations == [("w", "sa", ["healthy"])]
+    assert not side_effects
+    assert ch.load_state()["v1"]["sidebar_keys"]["w"] == ["preserved"]
 
 
 def test_v1_publish_uses_registered_destinations_and_combines_sources(

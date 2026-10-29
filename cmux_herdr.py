@@ -616,7 +616,7 @@ def pane_key(base, pane_id):
     return f"{base}.{sanitize_key(pane_id)}"
 
 
-def push_pill(cfg, ref, key, panes):
+def push_pill(cfg, ref, key, panes, *, is_current=lambda: True):
     """Publish the current state of one herdr workspace to the cmux sidebar.
 
     Everything here is keyed set-status state, never log history: entries
@@ -628,6 +628,8 @@ def push_pill(cfg, ref, key, panes):
     waiting = sum(1 for p in panes.values() if p["status"] == "blocked")
     done = sum(1 for p in panes.values() if p["status"] == "done")
     working = sum(1 for p in panes.values() if p["status"] == "working")
+    if not is_current():
+        return False
     if not panes:
         cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
     else:
@@ -665,6 +667,8 @@ def push_pill(cfg, ref, key, panes):
     # explicitly by the callers that observe them (events, snapshot diffs,
     # teardown) and by the orphan sweeps.
     for pane_id, pane in panes.items():
+        if not is_current():
+            return False
         status = pane["status"]
         cmux_cli(
             cfg,
@@ -682,6 +686,7 @@ def push_pill(cfg, ref, key, panes):
                 PANE_STATUS_ICONS.get(status, ICON_WORKING),
             ],
         )
+    return True
 
 
 def clear_pane_pill(cfg, bucket, ws_id, pane_id):
@@ -3509,9 +3514,22 @@ def reconcile_v1_supervised_bindings(
         if existing != record:
             clients[client_id] = record
             changed = True
-    if complete and all_ready:
+    if complete:
+        groups = {}
+        for key, spec in desired.items():
+            groups.setdefault((spec["workspace"], spec["surface"]), {})[key] = spec
         for client_id, client in list(clients.items()):
-            if client.get("supervised") and client_id not in desired:
+            target = (client.get("workspace"), client.get("surface"))
+            group = groups.get(target, {})
+            target_ready = bool(group) and all(
+                ready.get(key) == spec and clients.get(key, {}).get("supervised")
+                for key, spec in group.items()
+            )
+            if (
+                client.get("supervised")
+                and client_id not in desired
+                and (all_ready or target_ready)
+            ):
                 del clients[client_id]
                 changed = True
     return changed
@@ -3701,8 +3719,13 @@ class V1SupervisedSources:
     def __init__(self, start):
         self._start = start
         self._workers = {}
+        self._lock = threading.RLock()
 
     def reconcile(self, desired, *, complete):
+        with self._lock:
+            return self._reconcile(desired, complete=complete)
+
+    def _reconcile(self, desired, *, complete):
         grouped = {}
         for client_id, spec in desired.items():
             target = spec["target"]
@@ -3742,12 +3765,17 @@ class V1SupervisedSources:
         return ready
 
     def retire_obsolete(self, active):
-        for source_id in set(self._workers) - active:
-            self._workers[source_id]["worker"].stop()
-            self._workers.pop(source_id)
+        with self._lock:
+            for source_id in set(self._workers) - active:
+                self._workers[source_id]["worker"].stop()
+                self._workers.pop(source_id)
 
     def prepared_target(self, target):
         """Return the immutable endpoint prepared for this live incarnation."""
+        with self._lock:
+            return self._prepared_target(target)
+
+    def _prepared_target(self, target):
         entry = self._workers.get(v1_supervised_source_key(target))
         if not entry or not entry["worker"].alive or not entry["worker"].ready:
             return None
@@ -3757,37 +3785,120 @@ class V1SupervisedSources:
             candidate["socket_path"] = os.path.realpath(candidate["socket_path"])
         return prepared.copy() if prepared == candidate else None
 
+    def current_ready(self, desired):
+        """Read worker readiness independently of the discovery loop."""
+        with self._lock:
+            return {
+                key: spec
+                for key, spec in desired.items()
+                if self._prepared_target(spec["target"]) is not None
+            }
+
     def close(self):
-        for entry in self._workers.values():
-            entry["worker"].stop()
-        self._workers.clear()
+        with self._lock:
+            for entry in self._workers.values():
+                entry["worker"].stop()
+            self._workers.clear()
 
 
 def v1_supervisor_bindings_match(desired, *, exact=False):
     """Verify all destinations belong to this supervisor and prepared source."""
     with state_lock():
         clients = load_state().get("v1", {}).get("clients", {})
-        if exact and {
-            key for key, client in clients.items() if client.get("supervised")
-        } != set(desired):
-            return False
-        return all(
-            clients.get(key, {}).get("supervised")
-            and clients[key].get("pid") == os.getpid()
-            and clients[key].get("workspace") == spec["workspace"]
-            and clients[key].get("surface") == spec["surface"]
-            and clients[key].get("source") == v1_supervised_source_key(spec["target"])
-            and clients[key].get("server_boot_id") == spec["target"]["server_boot_id"]
-            and clients[key].get("connection_generation")
-            == spec["connection_generation"]
-            and clients[key].get("observed_client_pid")
-            == spec.get("observed_client_pid")
-            and clients[key].get("observed_client_instance")
-            == spec.get("observed_client_instance")
-            and clients[key].get("endpoint") == spec.get("endpoint")
-            and clients[key].get("native_ownership") == spec.get("native_ownership")
-            for key, spec in desired.items()
-        )
+        return v1_bindings_match_clients(clients, desired, exact=exact)
+
+
+def v1_bindings_match_clients(clients, desired, *, exact=False):
+    if exact and {
+        key for key, client in clients.items() if client.get("supervised")
+    } != set(desired):
+        return False
+    return all(
+        clients.get(key, {}).get("supervised")
+        and clients[key].get("pid") == os.getpid()
+        and clients[key].get("workspace") == spec["workspace"]
+        and clients[key].get("surface") == spec["surface"]
+        and clients[key].get("source") == v1_supervised_source_key(spec["target"])
+        and clients[key].get("server_boot_id") == spec["target"]["server_boot_id"]
+        and clients[key].get("connection_generation") == spec["connection_generation"]
+        and clients[key].get("observed_client_pid") == spec.get("observed_client_pid")
+        and clients[key].get("observed_client_instance")
+        == spec.get("observed_client_instance")
+        and clients[key].get("endpoint") == spec.get("endpoint")
+        and clients[key].get("native_ownership") == spec.get("native_ownership")
+        for key, spec in desired.items()
+    )
+
+
+def v1_verified_publication_targets(desired, ready):
+    """Identify surfaces whose complete client membership is prepared."""
+    groups = {}
+    for client_id, spec in desired.items():
+        groups.setdefault((spec["workspace"], spec["surface"]), {})[client_id] = spec
+    with state_lock():
+        clients = load_state().get("v1", {}).get("clients", {})
+    result = set()
+    for target, group in groups.items():
+        existing = {
+            key
+            for key, client in clients.items()
+            if (client.get("workspace"), client.get("surface")) == target
+        }
+        if (
+            existing == set(group)
+            and all(ready.get(key) == spec for key, spec in group.items())
+            and v1_bindings_match_clients(clients, group)
+        ):
+            result.add(target)
+    return result
+
+
+class V1PublicationVerification:
+    """Hold process-local discovery evidence and check live source readiness."""
+
+    def __init__(self, sources):
+        self._sources = sources
+        self._lock = threading.RLock()
+        self._desired = {}
+        self._complete = False
+
+    def update(self, desired, *, complete):
+        with self._lock:
+            self._desired = copy.deepcopy(desired) if complete else {}
+            self._complete = complete
+
+    def eligible(self):
+        with self._lock:
+            desired = self._desired
+            ready = self._sources.current_ready(desired)
+            return v1_verified_publication_targets(desired, ready)
+
+    def scope(self):
+        with self._lock:
+            if not self._complete:
+                return set()
+            ready = self._sources.current_ready(self._desired)
+            with state_lock():
+                clients = load_state().get("v1", {}).get("clients", {})
+                if (
+                    ready == self._desired
+                    and set(clients) == set(self._desired)
+                    and v1_bindings_match_clients(clients, self._desired, exact=True)
+                ):
+                    return None
+            return v1_verified_publication_targets(self._desired, ready)
+
+    def workspace_allowed(self, workspace):
+        with self._lock:
+            if not self._complete:
+                return False
+            targets = {
+                (spec["workspace"], spec["surface"])
+                for spec in self._desired.values()
+                if spec["workspace"] == workspace
+            }
+            scope = self.scope()
+            return scope is None or bool(targets) and targets.issubset(scope)
 
 
 def v1_reconcile_supervisor_inventory(inventory, sources, leases):
@@ -4300,11 +4411,21 @@ def v1_supervised_publish_loop(cfg, stop, verified):
     """Publish committed state independently of slow discovery and focus RPCs."""
     while not stop.is_set():
         try:
-            if (
-                verified.is_set()
-                and (state_dir / "v1-enabled").read_text() == "enabled"
-            ):
-                publish_v1_clients(cfg)
+            if (state_dir / "v1-enabled").read_text() == "enabled":
+                scope = verified.scope()
+                if scope is None:
+                    publish_v1_clients(
+                        cfg,
+                        eligibility_check=verified.scope,
+                        workspace_check=verified.workspace_allowed,
+                    )
+                elif scope:
+                    publish_v1_clients(
+                        cfg,
+                        eligible_destinations=scope,
+                        eligibility_check=verified.scope,
+                        workspace_check=verified.workspace_allowed,
+                    )
         except FileNotFoundError:
             pass
         except (
@@ -4330,7 +4451,7 @@ def v1_run_supervisor(cfg, stop):
 
     sources = V1SupervisedSources(start_source)
     publisher_stop = threading.Event()
-    publisher_verified = threading.Event()
+    publisher_verified = V1PublicationVerification(sources)
     publisher = None
     try:
         leases.reconcile({}, {}, complete=False)
@@ -4349,15 +4470,13 @@ def v1_run_supervisor(cfg, stop):
                 inventory = v1_discover_clients(cfg)
                 desired = ready = None
                 if inventory is not None:
+                    publisher_verified.update({}, complete=False)
                     v1_reconcile_supervisor_inventory(inventory, sources, leases)
                     desired = v1_discovered_targets(inventory)
                     ready = sources.reconcile(desired, complete=False)
-                    if (
-                        inventory["complete"]
-                        and ready == desired
-                        and v1_supervisor_bindings_match(desired, exact=True)
-                    ):
-                        publisher_verified.set()
+                    publisher_verified.update(desired, complete=inventory["complete"])
+                else:
+                    publisher_verified.update({}, complete=False)
                 try:
                     enabled = (state_dir / "v1-enabled").read_text() == "enabled"
                 except FileNotFoundError:
@@ -4546,7 +4665,7 @@ def retire_v1_destination(cfg, state, key, *, is_current=lambda: True):
     return True
 
 
-def reconcile_v1_legacy_sidebar(cfg, state, remote_state):
+def reconcile_v1_legacy_sidebar(cfg, state, remote_state, *, is_current=lambda: True):
     """Retire known legacy status keys, retrying failed cmux requests."""
     targets = set()
     clients = state.get("v1", {}).get("clients", {}).values()
@@ -4586,16 +4705,23 @@ def reconcile_v1_legacy_sidebar(cfg, state, remote_state):
         for key in sorted(
             set(visible) & {key for target, key in targets if target == ref}
         ):
-            cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
+            if is_current():
+                cmux_cli(cfg, ["clear-status", key, "--workspace", ref])
 
 
-def reconcile_v1_sidebar(cfg, state, workspaces):
+def reconcile_v1_sidebar(cfg, state, workspaces, *, allowed=None, is_current=None):
     """Maintain only sidebar keys owned by the active v1 clients."""
     v1 = state.setdefault("v1", {})
     sources = v1.setdefault("sources", {})
     tracked = v1.setdefault("sidebar_keys", {})
     for workspace in set(workspaces) | set(tracked):
+        if allowed is not None and workspace not in allowed:
+            continue
+        if is_current is not None and not is_current(workspace):
+            continue
         desired = set()
+        previous = set(tracked.get(workspace, []))
+        interrupted = False
         for source_id in sorted(workspaces.get(workspace, ())):
             source = sources.get(source_id, {})
             visible = sidebar_panes(
@@ -4609,12 +4735,28 @@ def reconcile_v1_sidebar(cfg, state, workspaces):
             for group, panes in groups.items():
                 identity = json.dumps([source_id, group], separators=(",", ":"))
                 base = "herdr.v1." + hashlib.sha256(identity.encode()).hexdigest()
-                push_pill(cfg, workspace, base, panes)
+                if is_current is None:
+                    push_pill(cfg, workspace, base, panes)
+                elif not push_pill(
+                    cfg,
+                    workspace,
+                    base,
+                    panes,
+                    is_current=lambda workspace=workspace: is_current(workspace),
+                ):
+                    interrupted = True
                 desired.add(base)
                 desired.update(pane_key(base, pane_id) for pane_id in panes)
-        previous = set(tracked.get(workspace, []))
+                if interrupted:
+                    break
+            if interrupted:
+                break
+        if interrupted:
+            desired.update(previous)
         for key in previous - desired:
-            if not cmux_cli(cfg, ["clear-status", key, "--workspace", workspace]):
+            if (is_current is not None and not is_current(workspace)) or not cmux_cli(
+                cfg, ["clear-status", key, "--workspace", workspace]
+            ):
                 desired.add(key)
         if desired:
             tracked[workspace] = sorted(desired)
@@ -4655,13 +4797,25 @@ def v1_destination_inputs_current(snapshot, workspace, surface):
         return relevant(snapshot) == relevant(load_state())
 
 
-def publish_v1_clients(cfg, *, wait=False):
+def publish_v1_clients(
+    cfg,
+    *,
+    wait=False,
+    eligible_destinations=None,
+    eligibility_check=None,
+    workspace_check=None,
+):
     """Reconcile each registered surface once using all of its sources."""
     with v1_source_leader("publication", blocking=wait) as leader:
         if not leader or not retire_v1_legacy_daemons():
             return
         for _ in range(3):
-            if not publish_v1_clients_once(cfg):
+            if not publish_v1_clients_once(
+                cfg,
+                eligible_destinations=eligible_destinations,
+                eligibility_check=eligibility_check,
+                workspace_check=workspace_check,
+            ):
                 break
 
 
@@ -4675,7 +4829,26 @@ def v1_publication_inputs(state):
     return copy.deepcopy(v1.get("clients", {})), sources
 
 
-def publish_v1_clients_once(cfg):
+def v1_workspace_inputs_current(snapshot, workspace):
+    def relevant(state):
+        clients, sources = v1_publication_inputs(state)
+        clients = {
+            key: value
+            for key, value in clients.items()
+            if value.get("workspace") == workspace
+        }
+        return clients, {
+            client.get("source"): sources.get(client.get("source"))
+            for client in clients.values()
+        }
+
+    with state_lock():
+        return relevant(snapshot) == relevant(load_state())
+
+
+def publish_v1_clients_once(
+    cfg, *, eligible_destinations=None, eligibility_check=None, workspace_check=None
+):
     with state_lock():
         state = load_state()
         prune_v1_clients(state)
@@ -4692,9 +4865,63 @@ def publish_v1_clients_once(cfg):
     workspaces = {}
     for (workspace, _surface), sources in destinations.items():
         workspaces.setdefault(workspace, set()).update(sources)
-    reconcile_v1_legacy_sidebar(cfg, state, load_remote_state())
-    reconcile_v1_sidebar(cfg, state, workspaces)
+
+    def permitted(target):
+        if eligibility_check is None:
+            return True
+        current_scope = eligibility_check()
+        return current_scope is None or target in current_scope
+
+    def workspace_permitted(workspace):
+        if workspace_check is not None and not workspace_check(workspace):
+            return False
+        targets = [target for target in destinations if target[0] == workspace]
+        if (
+            not targets
+            and eligibility_check is not None
+            and eligibility_check() is not None
+        ):
+            return False
+        return all(
+            permitted(target) for target in targets
+        ) and v1_workspace_inputs_current(state, workspace)
+
+    if eligible_destinations is None:
+        if eligibility_check is None:
+            reconcile_v1_legacy_sidebar(cfg, state, load_remote_state())
+            reconcile_v1_sidebar(cfg, state, workspaces)
+        else:
+            if eligibility_check() is None:
+                reconcile_v1_legacy_sidebar(
+                    cfg,
+                    state,
+                    load_remote_state(),
+                    is_current=lambda: eligibility_check() is None,
+                )
+            reconcile_v1_sidebar(cfg, state, workspaces, is_current=workspace_permitted)
+    else:
+        allowed = {
+            workspace
+            for workspace in workspaces
+            if all(
+                target in eligible_destinations
+                for target in destinations
+                if target[0] == workspace
+            )
+        }
+        reconcile_v1_sidebar(
+            cfg,
+            state,
+            {w: workspaces[w] for w in allowed},
+            allowed=allowed,
+            **({"is_current": workspace_permitted} if eligibility_check else {}),
+        )
     for (workspace, surface), sources in destinations.items():
+        if (
+            eligible_destinations is not None
+            and (workspace, surface) not in eligible_destinations
+        ):
+            continue
         reconcile_v1_destination(
             cfg,
             state,
@@ -4702,14 +4929,19 @@ def publish_v1_clients_once(cfg):
             surface,
             sorted(sources),
             is_current=lambda workspace=workspace, surface=surface: (
-                v1_destination_inputs_current(state, workspace, surface)
+                permitted((workspace, surface))
+                and v1_destination_inputs_current(state, workspace, surface)
             ),
         )
     active = {
         v1_destination_key(workspace, surface) for workspace, surface in destinations
     }
     for key in list(state.get("v1", {}).get("destinations", {})):
-        if key not in active:
+        if (
+            eligible_destinations is None
+            and key not in active
+            and (eligibility_check is None or eligibility_check() is None)
+        ):
             try:
                 workspace, surface = json.loads(key)
             except (TypeError, ValueError):
@@ -4719,7 +4951,8 @@ def publish_v1_clients_once(cfg):
                 state,
                 key,
                 is_current=lambda workspace=workspace, surface=surface: (
-                    v1_destination_inputs_current(state, workspace, surface)
+                    (eligibility_check is None or eligibility_check() is None)
+                    and v1_destination_inputs_current(state, workspace, surface)
                 ),
             )
     with state_lock():
