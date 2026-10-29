@@ -7920,6 +7920,74 @@ def test_v1_focus_acknowledges_only_verified_focused_done():
     assert attention["r"]["status"] == "done"
 
 
+def test_v1_focus_reconciliation_acknowledges_presented_release(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    boot = "a" * 32
+    episode = "generation:t:7"
+    state = {
+        "v1": {
+            "clients": {"c": {"source": "src", "workspace": "w", "surface": "s"}},
+            "sources": {
+                "src": {
+                    "attention": {
+                        "p": {
+                            "status": "done",
+                            "episode": episode,
+                            "generation": "generation",
+                            "server_boot_id": boot,
+                            "terminal_id": "t",
+                            "sequence": 7,
+                        },
+                        "q": {"status": "blocked", "episode": "blocked"},
+                    }
+                }
+            },
+        }
+    }
+    ch.save_state(state)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "v1_cmux_is_foreground", lambda *args: True)
+    observation = {
+        "pid": 42,
+        "instance": "instance",
+        "observation": {
+            "boot_id": boot,
+            "pane_id": "p",
+            "outer_focused": True,
+            "agent_state_change_seq": None,
+            "pane_state": {
+                "terminal_id": "t",
+                "state_change_seq": 11,
+                "released_completion_seq": 7,
+                "agent_present": False,
+            },
+        },
+    }
+    snapshot = {
+        "server_boot_id": boot,
+        "agents": [],
+        "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 11}],
+    }
+    monkeypatch.setattr(
+        ch, "socket_rpc", lambda *args, **kwargs: {"snapshot": snapshot}
+    )
+    monkeypatch.setattr(ch, "v1_surface_observation", lambda *args: observation)
+
+    observation["observation"]["pane_state"]["released_completion_seq"] = 9
+    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert (
+        "acknowledged" not in ch.load_state()["v1"]["sources"]["src"]["attention"]["p"]
+    )
+
+    observation["observation"]["pane_state"]["released_completion_seq"] = 7
+    assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    attention = ch.load_state()["v1"]["sources"]["src"]["attention"]
+    assert attention["p"]["acknowledged"] == episode
+    assert attention["q"]["status"] == "blocked"
+    assert "acknowledged" not in attention["q"]
+
+
 def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
     monkeypatch, tmp_path
 ):
