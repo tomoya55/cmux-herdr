@@ -2423,6 +2423,8 @@ def v1_discovered_targets(inventory):
                 "connection_generation": source["connection_generation"],
                 "target": target,
             }
+            if "native_ownership" in client:
+                targets[key]["native_ownership"] = client["native_ownership"]
     return targets
 
 
@@ -2671,17 +2673,82 @@ def v1_surface_observation(cfg, workspace_id, surface_id):
         )
         if proc.returncode:
             return None
-        processes = v1_foreground_surface_processes(
-            json.loads(proc.stdout), workspace_id, surface_id
-        )
+        tree = json.loads(proc.stdout)
+        processes = v1_foreground_surface_processes(tree, workspace_id, surface_id)
         state_home = Path(
             os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state"
         )
         directories = [
             state_home / name / "client-observers" for name in ("herdr", "herdr-dev")
         ]
-        return v1_foreground_observation(processes, directories)
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        observation = v1_foreground_observation(processes, directories)
+        if not observation:
+            return None
+
+        def matches(node, identity):
+            return (
+                isinstance(node, dict)
+                and isinstance(identity, str)
+                and any(
+                    isinstance(node.get(key), str)
+                    and node[key].casefold() == identity.casefold()
+                    for key in ("id", "ref")
+                )
+            )
+
+        surfaces = [
+            surface
+            for window in tree["windows"]
+            for workspace in window["workspaces"]
+            if matches(workspace, workspace_id)
+            for pane in workspace["panes"]
+            for surface in pane["surfaces"]
+            if matches(surface, surface_id)
+        ]
+        if len(surfaces) != 1:
+            return None
+        scoped = {
+            "windows": [
+                {
+                    "workspaces": [
+                        {
+                            "id": workspace_id,
+                            "panes": [
+                                {"surfaces": [{**surfaces[0], "id": surface_id}]}
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+        scan = v1_discover_clients_in_tree(scoped, directories)
+        if not scan or not scan["complete"]:
+            return None
+        matches = [
+            client
+            for client in scan["clients"]
+            if client["pid"] == observation.get("pid")
+            and client["instance"] == observation.get("instance")
+            and client["workspace"].casefold() == workspace_id.casefold()
+            and client["surface"].casefold() == surface_id.casefold()
+        ]
+        if len(matches) != 1:
+            return None
+        if "native_ownership" in matches[0]:
+            observation = {
+                **observation,
+                "native_ownership": matches[0]["native_ownership"],
+            }
+        return observation
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        RecursionError,
+        subprocess.TimeoutExpired,
+    ):
         return None
 
 
@@ -2727,6 +2794,7 @@ def v1_reconcile_focus(cfg, client_id, source_id, workspace_id, surface_id, sock
                 or observation.get("connection_generation")
                 != client["connection_generation"]
                 or observation.get("boot_id") != client["server_boot_id"]
+                or after.get("native_ownership") != client.get("native_ownership")
             ):
                 return False
             episode = v1_verified_focus_episode(state, source_id, observation, snapshot)
@@ -3342,6 +3410,8 @@ def reconcile_v1_supervised_bindings(
             "observed_client_instance": spec.get("observed_client_instance"),
             "endpoint": spec.get("endpoint"),
         }
+        if "native_ownership" in spec:
+            record["native_ownership"] = spec["native_ownership"]
         target = spec["target"]
         if target.get("remote") and target.get("session"):
             record["legacy_target"] = {
@@ -3615,6 +3685,7 @@ def v1_supervisor_bindings_match(desired):
             and clients[key].get("observed_client_instance")
             == spec.get("observed_client_instance")
             and clients[key].get("endpoint") == spec.get("endpoint")
+            and clients[key].get("native_ownership") == spec.get("native_ownership")
             for key, spec in desired.items()
         )
 

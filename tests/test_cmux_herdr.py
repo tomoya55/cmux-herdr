@@ -1973,6 +1973,21 @@ def test_v1_discovered_targets_preserve_client_source_and_boot():
         "local",
         "ssh:" + "b" * 32,
     }
+    ownership = {"connection_id": "bound"}
+    inventory["clients"][0]["native_ownership"] = ownership
+    native_targets = ch.v1_discovered_targets(inventory)
+    assert all(
+        spec["native_ownership"] == ownership for spec in native_targets.values()
+    )
+    state = {"v1": {"clients": {}}}
+    ch.reconcile_v1_supervised_bindings(
+        state, native_targets, native_targets, complete=True, supervisor_pid=1
+    )
+    assert all(
+        record["native_ownership"] == ownership
+        for record in state["v1"]["clients"].values()
+    )
+    del inventory["clients"][0]["native_ownership"]
     same = ch.v1_discovered_targets(inventory)
     assert targets == same
     inventory["clients"][0]["instance"] = "client-b"
@@ -5006,6 +5021,81 @@ def test_v1_surface_observation_requests_both_cmux_ids(monkeypatch):
         "--id-format" in calls[0]
         and calls[0][calls[0].index("--id-format") + 1] == "both"
     )
+
+
+def test_v1_surface_observation_requires_current_native_ownership(monkeypatch):
+    tree = {
+        "windows": [
+            {"workspaces": [{"id": "w", "panes": [{"surfaces": [{"id": "s"}]}]}]}
+        ]
+    }
+    monkeypatch.setattr(
+        ch,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(tree)),
+    )
+    monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
+    observation = {"pid": 42, "instance": "i", "observation": {}}
+    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args: observation)
+    record = {"connection_id": "bound"}
+    client = {
+        "pid": 42,
+        "instance": "i",
+        "workspace": "w",
+        "surface": "s",
+        "native_ownership": record,
+    }
+    scan = {"complete": True, "clients": [client]}
+    monkeypatch.setattr(ch, "v1_discover_clients_in_tree", lambda *args: scan)
+    assert ch.v1_surface_observation({}, "w", "s") == {
+        **observation,
+        "native_ownership": record,
+    }
+    scan["complete"] = False
+    assert ch.v1_surface_observation({}, "w", "s") is None
+    scan["complete"] = True
+    client["instance"] = "different"
+    assert ch.v1_surface_observation({}, "w", "s") is None
+
+
+def test_v1_surface_observation_ignores_unrelated_surfaces(monkeypatch):
+    surface = {"id": "s", "type": "terminal", "tty": "tty", "processes": []}
+    other = {
+        "id": "other",
+        "type": "terminal",
+        "tty": "tty2",
+        "processes": [{"pid": 99, "name": "ssh", "children": []}],
+    }
+    tree = {
+        "windows": [
+            {"workspaces": [{"id": "w", "panes": [{"surfaces": [surface, other]}]}]}
+        ]
+    }
+    observation = {"pid": 42, "instance": "i", "observation": {}}
+    client = {"pid": 42, "instance": "i", "workspace": "w", "surface": "s"}
+    monkeypatch.setattr(
+        ch,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(tree)),
+    )
+    monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
+    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args: observation)
+
+    def scan(value, directories):
+        surfaces = [
+            s
+            for w in value["windows"]
+            for ws in w["workspaces"]
+            for pane in ws["panes"]
+            for s in pane["surfaces"]
+        ]
+        return {
+            "complete": len(surfaces) == 1 and surfaces[0]["id"] == "s",
+            "clients": [client],
+        }
+
+    monkeypatch.setattr(ch, "v1_discover_clients_in_tree", scan)
+    assert ch.v1_surface_observation({}, "w", "s") == observation
 
 
 def test_v1_surface_processes_reject_ambiguous_surface():
@@ -9384,6 +9474,15 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
     ):
         observed[:] = [wrong, wrong]
         assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    ownership = {"connection_id": "original"}
+    state["v1"]["clients"]["c"]["native_ownership"] = ownership
+    ch.save_state(state)
+    observed[:] = [observation, observation]
+    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    wrong = {**observation, "native_ownership": {"connection_id": "replacement"}}
+    observed[:] = [wrong, wrong]
+    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    observation["native_ownership"] = ownership
     observed[:] = [observation, observation]
     assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     attention = ch.load_state()["v1"]["sources"]["src"]["attention"]
@@ -9469,6 +9568,7 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
     }
     surface = {
         "id": "s",
+        "type": "terminal",
         "tty": "/dev/ttys001",
         "processes": [
             {
@@ -9506,7 +9606,22 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
     monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 12)
     monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 100)
     monkeypatch.setattr(
-        ch, "v1_observer_socket_exists", lambda path: path.parent.parent.name == "herdr"
+        ch,
+        "v1_observer_socket_exists",
+        lambda path: (
+            path.parent.name == "client-observers"
+            and path.parent.parent.name == "herdr"
+        ),
+    )
+    monkeypatch.setattr(
+        ch,
+        "v1_client_source_inventory",
+        lambda *args, **kwargs: {
+            "pid": 20,
+            "instance": "i",
+            "sources_complete": True,
+            "sources": [],
+        },
     )
     observation = {
         "pid": 20,
