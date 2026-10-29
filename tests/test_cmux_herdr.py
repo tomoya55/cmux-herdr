@@ -4449,6 +4449,30 @@ def test_v1_focus_episode_after_agent_release_requires_presented_release():
         ch.v1_verified_focus_episode(state, "source", observation, snapshot)
         == "gen:t:7"
     )
+    simultaneous = {
+        **observation,
+        "pane_state": {**observation["pane_state"], "state_change_seq": 7},
+    }
+    simultaneous_snapshot = {
+        **snapshot,
+        "panes": [{**snapshot["panes"][0], "state_change_seq": 7}],
+    }
+    assert (
+        ch.v1_verified_focus_episode(
+            state, "source", simultaneous, simultaneous_snapshot
+        )
+        == "gen:t:7"
+    )
+    missing_provenance = {
+        **simultaneous,
+        "pane_state": {**simultaneous["pane_state"], "released_completion_seq": None},
+    }
+    assert (
+        ch.v1_verified_focus_episode(
+            state, "source", missing_provenance, simultaneous_snapshot
+        )
+        is None
+    )
     for pane_state in (
         None,
         {**observation["pane_state"], "agent_present": True},
@@ -8193,7 +8217,10 @@ def test_v1_focus_acknowledges_only_verified_focused_done():
     assert attention["r"]["status"] == "done"
 
 
-def test_v1_focus_reconciliation_acknowledges_presented_release(monkeypatch, tmp_path):
+@pytest.mark.parametrize("release_sequence", [7, 11])
+def test_v1_focus_reconciliation_acknowledges_presented_release(
+    monkeypatch, tmp_path, release_sequence
+):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     boot = "a" * 32
@@ -8231,7 +8258,7 @@ def test_v1_focus_reconciliation_acknowledges_presented_release(monkeypatch, tmp
             "agent_state_change_seq": None,
             "pane_state": {
                 "terminal_id": "t",
-                "state_change_seq": 11,
+                "state_change_seq": release_sequence,
                 "released_completion_seq": 7,
                 "agent_present": False,
             },
@@ -8240,7 +8267,9 @@ def test_v1_focus_reconciliation_acknowledges_presented_release(monkeypatch, tmp
     snapshot = {
         "server_boot_id": boot,
         "agents": [],
-        "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 11}],
+        "panes": [
+            {"pane_id": "p", "terminal_id": "t", "state_change_seq": release_sequence}
+        ],
     }
     monkeypatch.setattr(
         ch, "socket_rpc", lambda *args, **kwargs: {"snapshot": snapshot}

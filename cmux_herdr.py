@@ -2109,7 +2109,7 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
             or pane.get("terminal_id") != terminal
             or presented.get("terminal_id") != terminal
             or type(release_sequence) is not int
-            or release_sequence <= sequence
+            or release_sequence < sequence
             or type(presented.get("released_completion_seq")) is not int
             or presented["released_completion_seq"] != sequence
             or type(presented.get("state_change_seq")) is not int
