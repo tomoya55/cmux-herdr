@@ -160,16 +160,19 @@ class state_lock:
 class v1_source_leader:
     """Allow one process to consume a source's ordered event stream."""
 
-    def __init__(self, source_id):
+    def __init__(self, source_id, *, blocking=False):
         digest = hashlib.sha256(source_id.encode()).hexdigest()
         self.path = state_dir / f"v1-source-{digest}.lock"
         self._lock = None
+        self.blocking = blocking
 
     def __enter__(self):
         state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = self.path.open("a")
         try:
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(
+                self._lock, fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB)
+            )
         except BlockingIOError:
             self._lock.close()
             self._lock = None
@@ -3620,12 +3623,16 @@ class V1SupervisedSourceProcess:
         self._buffer = b""
         self._ready = False
         self._closed = False
+        self._protocol_failed = False
 
     @property
     def alive(self):
         if self._closed:
             return False
-        if not self._ready and time.monotonic() >= self._deadline and not self.ready:
+        ready = self.ready
+        if getattr(self, "_protocol_failed", False):
+            return False
+        if not ready and time.monotonic() >= self._deadline:
             return False
         try:
             return v1_wait_child_state(self._process.pid) is None
@@ -3634,18 +3641,38 @@ class V1SupervisedSourceProcess:
 
     @property
     def ready(self):
-        if self._closed or self._ready:
-            return self._ready and not self._closed
+        if self._closed or getattr(self, "_protocol_failed", False):
+            return False
         stream = self._process.stdout
         try:
-            if not select.select([stream], [], [], 0)[0]:
+            for _ in range(64):
+                if not select.select([stream], [], [], 0)[0]:
+                    break
+                data = os.read(stream.fileno(), 1024)
+                if not data:
+                    self._protocol_failed = True
+                    return False
+                self._buffer += data
+                while b"\n" in self._buffer:
+                    frame, self._buffer = self._buffer.split(b"\n", 1)
+                    if frame == b"ready":
+                        self._ready = True
+                    elif frame == b"not-ready":
+                        if self._ready:
+                            self._deadline = time.monotonic() + 20
+                        self._ready = False
+                    else:
+                        self._protocol_failed = True
+                        return False
+                if len(self._buffer) > 16:
+                    self._protocol_failed = True
+                    return False
+            else:
+                self._protocol_failed = True
                 return False
-            self._buffer += os.read(stream.fileno(), 64)
-            if len(self._buffer) > 16:
-                return False
-            self._ready = self._buffer == b"ready\n"
             return self._ready
         except OSError:
+            self._protocol_failed = True
             return False
 
     def stop(self):
@@ -4450,10 +4477,12 @@ def find_v1_legacy_notification(state, source_ids, workspace, surface, notificat
     return matches[0] if len(matches) == 1 else None
 
 
-def reconcile_v1_destination(cfg, state, workspace_id, surface_id, source_ids):
+def reconcile_v1_destination(
+    cfg, state, workspace_id, surface_id, source_ids, *, is_current=lambda: True
+):
     """Combine attention for a destination and track the aggregate's ID."""
     notifications = cmux_notifications_checked(cfg)
-    if notifications is None:
+    if notifications is None or not is_current():
         return False
     v1 = state.setdefault("v1", {})
     sources = v1.setdefault("sources", {})
@@ -4485,7 +4514,7 @@ def reconcile_v1_destination(cfg, state, workspace_id, surface_id, source_ids):
     return True
 
 
-def retire_v1_destination(cfg, state, key):
+def retire_v1_destination(cfg, state, key, *, is_current=lambda: True):
     destinations = state.get("v1", {}).get("destinations", {})
     destination = destinations.get(key)
     if destination is None:
@@ -4495,7 +4524,7 @@ def retire_v1_destination(cfg, state, key):
     except (TypeError, ValueError):
         return False
     notifications = cmux_notifications_checked(cfg)
-    if notifications is None:
+    if notifications is None or not is_current():
         return False
     owned = next(
         (
@@ -4593,35 +4622,124 @@ def reconcile_v1_sidebar(cfg, state, workspaces):
             tracked.pop(workspace, None)
 
 
-def publish_v1_clients(cfg):
+def v1_destination_inputs_current(snapshot, workspace, surface):
+    """Reject a stale destination plan before sending its cmux notification."""
+
+    def relevant(state):
+        v1 = state.get("v1", {})
+        clients = {
+            key: value
+            for key, value in v1.get("clients", {}).items()
+            if value.get("workspace") == workspace and value.get("surface") == surface
+        }
+        sources = {}
+        for client in clients.values():
+            source_id = client.get("source")
+            source = v1.get("sources", {}).get(source_id)
+            sources[source_id] = (
+                {
+                    key: value
+                    for key, value in source.items()
+                    if key != "published_tokens"
+                }
+                if isinstance(source, dict)
+                else source
+            )
+        return (
+            clients,
+            sources,
+            v1.get("destinations", {}).get(v1_destination_key(workspace, surface)),
+        )
+
+    with state_lock():
+        return relevant(snapshot) == relevant(load_state())
+
+
+def publish_v1_clients(cfg, *, wait=False):
     """Reconcile each registered surface once using all of its sources."""
-    if not retire_v1_legacy_daemons():
-        return
+    with v1_source_leader("publication", blocking=wait) as leader:
+        if not leader or not retire_v1_legacy_daemons():
+            return
+        for _ in range(3):
+            if not publish_v1_clients_once(cfg):
+                break
+
+
+def v1_publication_inputs(state):
+    """Capture the client and source data used to produce notifications."""
+    v1 = state.get("v1", {})
+    sources = copy.deepcopy(v1.get("sources", {}))
+    for source in sources.values():
+        if isinstance(source, dict):
+            source.pop("published_tokens", None)
+    return copy.deepcopy(v1.get("clients", {})), sources
+
+
+def publish_v1_clients_once(cfg):
     with state_lock():
         state = load_state()
         prune_v1_clients(state)
-        destinations = {}
-        for client in state.get("v1", {}).get("clients", {}).values():
-            workspace = client.get("workspace")
-            surface = client.get("surface")
-            source = client.get("source")
-            if workspace and surface and source:
-                destinations.setdefault((workspace, surface), set()).add(source)
-        workspaces = {}
-        for (workspace, _surface), sources in destinations.items():
-            workspaces.setdefault(workspace, set()).update(sources)
-        reconcile_v1_legacy_sidebar(cfg, state, load_remote_state())
-        reconcile_v1_sidebar(cfg, state, workspaces)
-        for (workspace, surface), sources in destinations.items():
-            reconcile_v1_destination(cfg, state, workspace, surface, sorted(sources))
-        active = {
-            v1_destination_key(workspace, surface)
-            for workspace, surface in destinations
-        }
-        for key in list(state.get("v1", {}).get("destinations", {})):
-            if key not in active:
-                retire_v1_destination(cfg, state, key)
         save_state(state)
+    baseline = copy.deepcopy(state.get("v1", {}))
+    inputs = v1_publication_inputs(state)
+    destinations = {}
+    for client in state.get("v1", {}).get("clients", {}).values():
+        workspace = client.get("workspace")
+        surface = client.get("surface")
+        source = client.get("source")
+        if workspace and surface and source:
+            destinations.setdefault((workspace, surface), set()).add(source)
+    workspaces = {}
+    for (workspace, _surface), sources in destinations.items():
+        workspaces.setdefault(workspace, set()).update(sources)
+    reconcile_v1_legacy_sidebar(cfg, state, load_remote_state())
+    reconcile_v1_sidebar(cfg, state, workspaces)
+    for (workspace, surface), sources in destinations.items():
+        reconcile_v1_destination(
+            cfg,
+            state,
+            workspace,
+            surface,
+            sorted(sources),
+            is_current=lambda workspace=workspace, surface=surface: (
+                v1_destination_inputs_current(state, workspace, surface)
+            ),
+        )
+    active = {
+        v1_destination_key(workspace, surface) for workspace, surface in destinations
+    }
+    for key in list(state.get("v1", {}).get("destinations", {})):
+        if key not in active:
+            try:
+                workspace, surface = json.loads(key)
+            except (TypeError, ValueError):
+                continue
+            retire_v1_destination(
+                cfg,
+                state,
+                key,
+                is_current=lambda workspace=workspace, surface=surface: (
+                    v1_destination_inputs_current(state, workspace, surface)
+                ),
+            )
+    with state_lock():
+        current = load_state()
+        live_v1 = current.setdefault("v1", {})
+        planned_v1 = state.get("v1", {})
+        missing = object()
+        for field in ("sidebar_keys", "destinations"):
+            before = baseline.get(field, {})
+            after = planned_v1.get(field, {})
+            live = live_v1.setdefault(field, {})
+            for key in set(before) | set(after):
+                if live.get(key, missing) != before.get(key, missing):
+                    continue
+                if key in after:
+                    live[key] = after[key]
+                else:
+                    live.pop(key, None)
+        save_state(current)
+        return inputs != v1_publication_inputs(current)
 
 
 def sweep_orphan_pills(cfg, state):
@@ -6386,6 +6504,19 @@ def open_subscription(sock_path, subscriptions):
     return conn
 
 
+V1_SUBSCRIPTION_IDLE_TIMEOUT = 10
+
+
+def open_v1_subscription(sock_path, subscriptions):
+    conn = open_subscription(sock_path, subscriptions)
+    try:
+        conn.settimeout(V1_SUBSCRIPTION_IDLE_TIMEOUT)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def list_pane_ids(sock_path):
     panes = socket_rpc(sock_path, "pane.list", {}).get("panes", [])
     return [p["pane_id"] for p in panes if p.get("pane_id")]
@@ -6402,7 +6533,7 @@ def v1_watch_connection(
 ):
     """Observe status transitions in order and rebuild when panes change."""
     pane_ids = list_pane_ids(sock_path)
-    conn = open_subscription(sock_path, v1_subscriptions(pane_ids))
+    conn = open_v1_subscription(sock_path, v1_subscriptions(pane_ids))
     try:
         stream = conn.makefile("rb")
         ack = json.loads(stream.readline())
@@ -6526,7 +6657,7 @@ def observe_v1_source(cfg, source_id, generation, sock_path):
         return True
 
 
-def v1_watch_supervised_source(source_id, target, on_ready):
+def v1_watch_supervised_source(source_id, target, on_ready, *, on_not_ready=None):
     """Prepare one source without publishing to cmux before handoff."""
     name = "v1-" + hashlib.sha256(source_id.encode()).hexdigest()[:16]
     entry, procs = {}, {}
@@ -6535,6 +6666,7 @@ def v1_watch_supervised_source(source_id, target, on_ready):
             return False
         token_stop = threading.Event()
         token_worker = None
+        notified = False
         try:
             if target.get("remote"):
                 sock = ensure_forward(name, v1_remote_config(target), entry, procs)
@@ -6544,7 +6676,6 @@ def v1_watch_supervised_source(source_id, target, on_ready):
             else:
                 sock = target["socket_path"]
                 generation = v1_local_generation(sock)
-            notified = False
 
             def on_change():
                 nonlocal notified, token_worker
@@ -6567,6 +6698,8 @@ def v1_watch_supervised_source(source_id, target, on_ready):
             )
             return True
         finally:
+            if notified and on_not_ready is not None:
+                on_not_ready()
             token_stop.set()
             if token_worker is not None:
                 token_worker.join()
@@ -6587,6 +6720,44 @@ def v1_supervised_token_loop(source_id, socket_path, expected_boot, stop):
         except (OSError, ValueError, KeyError, TypeError) as error:
             log(f"v1 supervised token sync failed: {error}")
         stop.wait(1)
+
+
+def run_v1_supervised_source(
+    source_id, target, on_ready, stop, *, on_not_ready=lambda: None
+):
+    """Rebuild silent or disconnected subscriptions without waiting for discovery."""
+    ready = False
+
+    def ready_once():
+        nonlocal ready
+        if not ready:
+            on_ready()
+            ready = True
+
+    def not_ready():
+        nonlocal ready
+        if ready:
+            ready = False
+            on_not_ready()
+
+    while not stop.is_set():
+        try:
+            if not v1_watch_supervised_source(
+                source_id, target, ready_once, on_not_ready=not_ready
+            ):
+                return False
+        except (
+            SocketError,
+            OSError,
+            ValueError,
+            KeyError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            log(f"v1 supervised source reconnecting: {error}")
+        finally:
+            not_ready()
+        stop.wait(1)
+    return True
 
 
 def observe_v1_remote(cfg, source_id, target, entry, procs):
@@ -6850,7 +7021,7 @@ def run_v1_client_with_lease(cfg, target, workspace_id, surface_id, stop, client
                 worker.join(timeout=2)
         remove_v1_client(client_id)
         if activated:
-            publish_v1_clients(cfg)
+            publish_v1_clients(cfg, wait=True)
 
 
 def watch_connection(cfg, sock_path, *, on_ready=None):
@@ -7006,8 +7177,12 @@ def main():
             target=v1_watch_parent, args=(parent_pid, stop), daemon=True
         ).start()
         try:
-            watched = v1_watch_supervised_source(
-                source_id, target, lambda: print("ready", flush=True)
+            watched = run_v1_supervised_source(
+                source_id,
+                target,
+                lambda: print("ready", flush=True),
+                stop,
+                on_not_ready=lambda: print("not-ready", flush=True),
             )
             return 0 if watched else 1
         except (

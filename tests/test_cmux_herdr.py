@@ -2626,7 +2626,7 @@ def test_v1_supervisor_publishes_while_discovery_is_stalled(monkeypatch, tmp_pat
         ch, "v1_supervisor_bindings_match", lambda *args, **kwargs: True
     )
     monkeypatch.setattr(ch, "v1_discover_clients", discover)
-    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg: published.set())
+    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg, **kwargs: published.set())
     worker = threading.Thread(target=ch.v1_run_supervisor, args=({}, stop))
     worker.start()
     try:
@@ -7378,7 +7378,7 @@ def test_v1_watch_subscribes_then_processes_ordered_events(monkeypatch):
 
     order = []
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: ["p"])
-    monkeypatch.setattr(ch, "open_subscription", lambda path, subs: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda path, subs: Connection())
     monkeypatch.setattr(
         ch,
         "sync_v1_source",
@@ -7416,7 +7416,7 @@ def test_v1_watch_retries_release_snapshot_without_losing_buffered_events(monkey
         return True
 
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: ["p"])
-    monkeypatch.setattr(ch, "open_subscription", lambda path, subs: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda path, subs: Connection())
     monkeypatch.setattr(ch, "sync_v1_source", sync)
     monkeypatch.setattr(ch.time, "sleep", lambda delay: None)
     monkeypatch.setattr(
@@ -7448,7 +7448,7 @@ def test_v1_watch_refreshes_on_agent_release_without_trusting_payload(monkeypatc
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: ["p"])
     monkeypatch.setattr(
         ch,
-        "open_subscription",
+        "open_v1_subscription",
         lambda path, subs: subscriptions.extend(subs) or Connection(),
     )
     monkeypatch.setattr(
@@ -7482,7 +7482,7 @@ def test_v1_watch_reconnects_if_subscription_and_snapshot_servers_differ(monkeyp
             pass
 
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: [])
-    monkeypatch.setattr(ch, "open_subscription", lambda *args: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda *args: Connection())
     monkeypatch.setattr(ch, "sync_v1_source", lambda *args, **kwargs: True)
     monkeypatch.setattr(ch, "v1_subscription_matches_source", lambda *args: False)
     with pytest.raises(ch.SocketError):
@@ -7512,7 +7512,7 @@ def test_v1_supervisor_watch_rejects_changed_boot_before_ready(monkeypatch):
             pass
 
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: [])
-    monkeypatch.setattr(ch, "open_subscription", lambda *args: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda *args: Connection())
     monkeypatch.setattr(
         ch,
         "sync_v1_source",
@@ -7548,7 +7548,7 @@ def test_v1_supervisor_watch_does_not_report_ready_for_stale_pane_set(monkeypatc
 
     panes = iter([["p"], ["p", "q"]])
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: next(panes))
-    monkeypatch.setattr(ch, "open_subscription", lambda *args: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda *args: Connection())
     monkeypatch.setattr(ch, "sync_v1_source", lambda *args, **kwargs: True)
     monkeypatch.setattr(ch, "v1_subscription_matches_source", lambda *args: True)
     ready = []
@@ -7580,6 +7580,55 @@ def test_v1_supervisor_source_reports_ready_only_once_after_subscription(
     assert ch.v1_watch_supervised_source("source", target, lambda: ready.append(True))
     assert ready == [True]
     assert calls == [("source", "generation", "/source.sock", "a" * 32)]
+
+
+def test_v1_subscription_reconnects_after_silent_stream(monkeypatch):
+    client, server = socket.socketpair()
+    monkeypatch.setattr(ch, "V1_SUBSCRIPTION_IDLE_TIMEOUT", 0.1)
+    monkeypatch.setattr(ch, "open_subscription", lambda *args: client)
+    monkeypatch.setattr(ch, "list_pane_ids", lambda path: [])
+    monkeypatch.setattr(ch, "sync_v1_source", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ch, "v1_subscription_matches_source", lambda *args: True)
+    server.sendall(
+        (
+            json.dumps(
+                {"result": {"type": "subscription_started", "server_boot_id": "a" * 32}}
+            )
+            + "\n"
+        ).encode()
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            ch.v1_watch_connection(
+                "source", "generation", "/socket", expected_boot="a" * 32
+            )
+    finally:
+        server.close()
+
+
+def test_v1_supervised_source_retries_after_subscription_timeout(monkeypatch):
+    stop = ch.threading.Event()
+    attempts, ready = [], []
+
+    def watch(source, target, on_ready, *, on_not_ready):
+        attempts.append(source)
+        if len(attempts) == 1:
+            on_ready()
+            raise TimeoutError("silent subscription")
+        on_ready()
+        stop.set()
+        return True
+
+    monkeypatch.setattr(ch, "v1_watch_supervised_source", watch)
+    assert ch.run_v1_supervised_source(
+        "source",
+        {},
+        lambda: ready.append(True),
+        stop,
+        on_not_ready=lambda: ready.append(False),
+    )
+    assert attempts == ["source", "source"]
+    assert ready == [True, False, True, False]
 
 
 @pytest.mark.parametrize("marker", ["pending", "enabled"])
@@ -7627,12 +7676,12 @@ def test_v1_supervisor_source_entrypoint_reports_readiness(
     )
     monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
 
-    def watch(source, given_target, ready):
+    def watch(source, given_target, ready, stop, **kwargs):
         assert source == source_id and given_target == target
         ready()
         return True
 
-    monkeypatch.setattr(ch, "v1_watch_supervised_source", watch)
+    monkeypatch.setattr(ch, "run_v1_supervised_source", watch)
     assert ch.main() == 0
     assert capsys.readouterr().out == "ready\n"
 
@@ -7652,7 +7701,7 @@ def test_v1_supervisor_source_entrypoint_monitors_parent(monkeypatch, tmp_path):
         ],
     )
     monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
-    monkeypatch.setattr(ch, "v1_watch_supervised_source", lambda *args: True)
+    monkeypatch.setattr(ch, "run_v1_supervised_source", lambda *args, **kwargs: True)
     started = []
 
     class Thread:
@@ -7696,6 +7745,10 @@ def test_v1_supervisor_source_process_requires_ready_and_stops_group(
         assert source.alive and not source.ready
         os.write(write_fd, b"ready\n")
         assert source.ready
+        os.write(write_fd, b"not-ready\n")
+        assert not source.ready
+        os.write(write_fd, b"ready\n")
+        assert source.ready
         source.stop()
         assert not source.alive
         assert calls == [ch.signal.SIGTERM, ch.signal.SIGKILL, "reap"]
@@ -7724,7 +7777,7 @@ def test_v1_watch_reconnects_when_done_refresh_fails(monkeypatch):
 
     calls = iter([True, False])
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: ["p"])
-    monkeypatch.setattr(ch, "open_subscription", lambda *args: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda *args: Connection())
     monkeypatch.setattr(ch, "sync_v1_source", lambda *args, **kwargs: next(calls))
     monkeypatch.setattr(ch, "persist_v1_status_event", lambda *args: True)
     with pytest.raises(ch.SocketError):
@@ -8402,7 +8455,7 @@ def test_v1_watch_confirms_done_from_snapshot_before_acknowledgment(monkeypatch)
 
     order = []
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: ["p"])
-    monkeypatch.setattr(ch, "open_subscription", lambda path, subs: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda path, subs: Connection())
     monkeypatch.setattr(
         ch,
         "sync_v1_source",
@@ -8465,7 +8518,7 @@ def test_v1_watch_notifies_observer_after_each_state_change(monkeypatch):
 
     changes = []
     monkeypatch.setattr(ch, "list_pane_ids", lambda path: ["p"])
-    monkeypatch.setattr(ch, "open_subscription", lambda path, subs: Connection())
+    monkeypatch.setattr(ch, "open_v1_subscription", lambda path, subs: Connection())
     monkeypatch.setattr(ch, "sync_v1_source", lambda *args, **kwargs: True)
     monkeypatch.setattr(ch, "persist_v1_status_event", lambda *args: True)
     monkeypatch.setattr(ch, "persist_v1_ack_event", lambda *args: True)
@@ -8489,7 +8542,7 @@ def test_v1_publish_uses_registered_destinations_and_combines_sources(
     monkeypatch.setattr(
         ch,
         "reconcile_v1_destination",
-        lambda cfg, current, workspace, surface, sources: (
+        lambda cfg, current, workspace, surface, sources, **kwargs: (
             calls.append((workspace, surface, set(sources))) or True
         ),
     )
@@ -8509,7 +8562,9 @@ def test_v1_source_observer_publishes_on_change_and_respects_leader(
 ):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     calls = []
-    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg: calls.append("publish"))
+    monkeypatch.setattr(
+        ch, "publish_v1_clients", lambda cfg, **kwargs: calls.append("publish")
+    )
     monkeypatch.setattr(
         ch,
         "v1_watch_connection",
@@ -8598,7 +8653,9 @@ def test_v1_client_registers_observes_and_unregisters(monkeypatch, tmp_path):
     stop = ch.threading.Event()
     calls = []
     monkeypatch.setattr(ch, "v1_publish_loop", lambda cfg, event: None)
-    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg: calls.append("publish"))
+    monkeypatch.setattr(
+        ch, "publish_v1_clients", lambda cfg, **kwargs: calls.append("publish")
+    )
     monkeypatch.setattr(ch, "v1_local_socket", lambda session: "/socket")
     monkeypatch.setattr(ch, "v1_local_generation", lambda path: "boot")
     monkeypatch.setattr(ch, "v1_probe_source", lambda target: True)
@@ -8625,7 +8682,7 @@ def test_v1_client_unregisters_when_worker_start_fails(monkeypatch):
     monkeypatch.setattr(ch, "v1_probe_source", lambda target: True)
     monkeypatch.setattr(ch, "activate_v1_client", lambda *args: True)
     monkeypatch.setattr(ch, "remove_v1_client", lambda client: calls.append(client))
-    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg: None)
+    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg, **kwargs: None)
     monkeypatch.setattr(
         ch.threading.Thread,
         "start",
@@ -8654,7 +8711,9 @@ def test_v1_client_unregisters_if_activation_is_interrupted(monkeypatch):
     )
     monkeypatch.setattr(ch, "remove_v1_client", lambda client: calls.append(client))
     monkeypatch.setattr(
-        ch, "publish_v1_clients", lambda cfg: pytest.fail("published after rollback")
+        ch,
+        "publish_v1_clients",
+        lambda cfg, **kwargs: pytest.fail("published after rollback"),
     )
     with pytest.raises(SystemExit):
         ch.run_v1_client_with_lease(
@@ -8675,7 +8734,7 @@ def test_v1_client_retries_remote_timeout(monkeypatch):
     monkeypatch.setattr(ch, "v1_probe_source", lambda target: True)
     monkeypatch.setattr(ch, "activate_v1_client", lambda *args: True)
     monkeypatch.setattr(ch, "remove_v1_client", lambda client: None)
-    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg: None)
+    monkeypatch.setattr(ch, "publish_v1_clients", lambda cfg, **kwargs: None)
     monkeypatch.setattr(ch, "v1_publish_loop", lambda *args: None)
     monkeypatch.setattr(ch, "v1_focus_loop", lambda *args: None)
 
@@ -9062,6 +9121,201 @@ def test_v1_slow_source_refresh_does_not_lock_other_updates(
     assert result == [changed_source != "a"]
     if changed_source == "b":
         assert state["a"]["value"] == 2
+
+
+def test_v1_slow_publisher_does_not_hold_shared_state_lock(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state({"v1": {"sources": {"a": {"value": 1}}, "clients": {}}})
+    entered, release, updated = threading.Event(), threading.Event(), threading.Event()
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+
+    def sidebar(cfg, state, workspaces):
+        entered.set()
+        assert release.wait(5)
+        state["v1"]["sidebar_keys"] = {"w": ["herdr.v1.test"]}
+
+    monkeypatch.setattr(ch, "reconcile_v1_sidebar", sidebar)
+    worker = threading.Thread(target=lambda: ch.publish_v1_clients({}))
+
+    def update():
+        with ch.state_lock():
+            state = ch.load_state()
+            state["v1"]["sources"]["a"]["value"] = 2
+            ch.save_state(state)
+        updated.set()
+
+    writer = threading.Thread(target=update)
+    worker.start()
+    try:
+        assert entered.wait(3)
+        writer.start()
+        assert updated.wait(1), "cmux publication held the shared state lock"
+    finally:
+        release.set()
+        worker.join(5)
+        if writer.ident is not None:
+            writer.join(5)
+    state = ch.load_state()
+    assert state["v1"]["sources"]["a"]["value"] == 2
+    assert state["v1"]["sidebar_keys"] == {"w": ["herdr.v1.test"]}
+
+
+def test_v1_publisher_does_not_restore_acknowledged_attention_from_stale_snapshot(
+    monkeypatch, tmp_path
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    key = ch.v1_destination_key("w", "s")
+    ch.save_state(
+        {
+            "v1": {
+                "sources": {
+                    "a": {"attention": {"p": {"status": "done", "episode": "old"}}}
+                },
+                "clients": {"c": {"workspace": "w", "surface": "s", "source": "a"}},
+                "destinations": {key: {"notification_id": "owned"}},
+            }
+        }
+    )
+    entered, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+
+    def sidebar(*args):
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(ch, "reconcile_v1_sidebar", sidebar)
+    monkeypatch.setattr(
+        ch,
+        "cmux_notifications_checked",
+        lambda cfg: [
+            {"id": "owned", "workspace_id": "w", "surface_id": "s", "is_read": True}
+        ],
+    )
+    creates = []
+    monkeypatch.setattr(
+        ch,
+        "run",
+        lambda *args, **kwargs: (
+            creates.append(True)
+            or SimpleNamespace(returncode=0, stdout='{"id":"new"}', stderr="")
+        ),
+    )
+    worker = threading.Thread(target=lambda: ch.publish_v1_clients({}))
+    worker.start()
+    try:
+        assert entered.wait(3)
+        with ch.state_lock():
+            state = ch.load_state()
+            state["v1"]["sources"]["a"]["attention"].clear()
+            ch.save_state(state)
+    finally:
+        release.set()
+        worker.join(5)
+    assert not creates
+
+
+def test_v1_publisher_repairs_attention_acknowledged_during_notification_creation(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state(
+        {
+            "v1": {
+                "sources": {"a": {"attention": {"p": {"status": "done"}}}},
+                "clients": {"c": {"workspace": "w", "surface": "s", "source": "a"}},
+            }
+        }
+    )
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+    monkeypatch.setattr(ch, "reconcile_v1_sidebar", lambda *args: None)
+    notices = []
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: list(notices))
+
+    def legacy(*args):
+        with ch.state_lock():
+            live = ch.load_state()
+            live["v1"]["sources"]["a"]["attention"].clear()
+            ch.save_state(live)
+        return None
+
+    monkeypatch.setattr(ch, "find_v1_legacy_notification", legacy)
+
+    def run(cmd, **kwargs):
+        notices.append(
+            {"id": "new", "workspace_id": "w", "surface_id": "s", "is_read": False}
+        )
+        return SimpleNamespace(returncode=0, stdout='{"id":"new"}', stderr="")
+
+    monkeypatch.setattr(ch, "run", run)
+    monkeypatch.setattr(
+        ch, "cmux_cli", lambda cfg, cmd: notices[0].update(is_read=True) or True
+    )
+    ch.publish_v1_clients({})
+    assert not notices or notices[0]["is_read"]
+
+
+def test_v1_final_publisher_waits_for_inflight_publication(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state(
+        {
+            "v1": {
+                "sources": {"a": {}},
+                "clients": {"c": {"workspace": "w", "surface": "s", "source": "a"}},
+            }
+        }
+    )
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
+    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+
+    def sidebar(cfg, state, workspaces):
+        seen.append(set(workspaces))
+        if len(seen) == 1:
+            entered.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(ch, "reconcile_v1_sidebar", sidebar)
+    monkeypatch.setattr(ch, "reconcile_v1_destination", lambda *args, **kwargs: True)
+    first = threading.Thread(target=lambda: ch.publish_v1_clients({}))
+    final = threading.Thread(target=lambda: ch.publish_v1_clients({}, wait=True))
+    first.start()
+    try:
+        assert entered.wait(3)
+        with ch.state_lock():
+            state = ch.load_state()
+            state["v1"]["clients"].clear()
+            ch.save_state(state)
+        final.start()
+        release.set()
+        final.join(5)
+    finally:
+        release.set()
+        first.join(5)
+        if final.ident is not None:
+            final.join(5)
+    assert seen == [{"w"}, set(), set()]
 
 
 def test_v1_slow_token_write_does_not_block_updates_or_commit_stale_episode(
