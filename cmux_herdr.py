@@ -3198,27 +3198,59 @@ def sync_v1_source(
     expected_boot=None,
     retry_snapshot_race=False,
 ):
-    """Serialize a successful source refresh with other plugin state updates."""
+    """Commit a remote snapshot only if its source state has not changed."""
     with state_lock():
         state = load_state()
-        if reset_predictions:
-            source = state.get("v1", {}).get("sources", {}).get(source_id, {})
-            for entry in source.get("attention", {}).values():
-                entry.pop("provisional", None)
-                entry.pop("predicted_sequence", None)
-                entry.pop("observed_changes", None)
-        if not refresh_v1_source(
-            state,
-            source_id,
-            generation,
-            socket_path,
-            reconnect=reset_predictions,
-            expected_boot=expected_boot,
-            retry_snapshot_race=retry_snapshot_race,
-        ):
+        baseline = copy.deepcopy(state.get("v1", {}).get("sources", {}).get(source_id))
+    if reset_predictions:
+        source = state.get("v1", {}).get("sources", {}).get(source_id, {})
+        for entry in source.get("attention", {}).values():
+            entry.pop("provisional", None)
+            entry.pop("predicted_sequence", None)
+            entry.pop("observed_changes", None)
+    if not refresh_v1_source(
+        state,
+        source_id,
+        generation,
+        socket_path,
+        reconnect=reset_predictions,
+        expected_boot=expected_boot,
+        retry_snapshot_race=retry_snapshot_race,
+    ):
+        return False
+    updated = state.get("v1", {}).get("sources", {}).get(source_id)
+    if updated is None:
+        return False
+    with state_lock():
+        current = load_state()
+        current_source = current.get("v1", {}).get("sources", {}).get(source_id)
+
+        def snapshot_state(source):
+            if not isinstance(source, dict):
+                return source
+            return {
+                key: value for key, value in source.items() if key != "published_tokens"
+            }
+
+        if snapshot_state(current_source) != snapshot_state(baseline):
+            if retry_snapshot_race:
+                raise V1SnapshotRace("source changed during remote snapshot")
             return False
-        save_state(state)
-        return True
+        if (
+            isinstance(baseline, dict)
+            and isinstance(current_source, dict)
+            and all(
+                updated.get(key) == baseline.get(key)
+                for key in ("cursor_generation", "socket_generation", "server_boot_id")
+            )
+        ):
+            if "published_tokens" in current_source:
+                updated["published_tokens"] = current_source["published_tokens"]
+            else:
+                updated.pop("published_tokens", None)
+        current.setdefault("v1", {}).setdefault("sources", {})[source_id] = updated
+        save_state(current)
+    return True
 
 
 def persist_v1_status_event(source_id, data, event_boot=None):
@@ -3247,39 +3279,52 @@ def persist_v1_ack_event(source_id, data, event_boot=None):
 
 def sync_v1_episode_tokens(source_id, socket_path, *, expected_boot=None):
     """Expose only verified pending completions to a Herdr action."""
-    with state_lock():
-        state = load_state()
-        source = state.get("v1", {}).get("sources", {}).get(source_id)
-        if (
-            not source
-            or expected_boot is not None
-            and source.get("server_boot_id") != expected_boot
-        ):
+
+    def desired_token(source, pane_id):
+        entry = source.get("attention", {}).get(pane_id, {})
+        return (
+            entry.get("episode")
+            if entry.get("status") == "done" and not entry.get("provisional")
+            else None
+        )
+
+    with v1_source_leader("episode-token:" + source_id) as leader:
+        if not leader:
             return
-        if expected_boot is None:
-            expected_boot = source.get("server_boot_id")
-        published = source.setdefault("published_tokens", {})
-        changed = False
-        attention = source.get("attention", {})
-        panes = source.get("panes", {})
-        for pane_id in sorted(set(attention) | set(published)):
-            if pane_id not in panes:
-                if pane_id in published:
-                    published.pop(pane_id)
-                    changed = True
-                continue
-            entry = attention.get(pane_id, {})
-            desired = (
-                entry.get("episode")
-                if entry.get("status") == "done" and not entry.get("provisional")
-                else None
+        with state_lock():
+            state = load_state()
+            source = state.get("v1", {}).get("sources", {}).get(source_id)
+            if (
+                not source
+                or expected_boot is not None
+                and source.get("server_boot_id") != expected_boot
+            ):
+                return
+            if expected_boot is None:
+                expected_boot = source.get("server_boot_id")
+            pane_ids = sorted(
+                set(source.get("attention", {}))
+                | set(source.get("published_tokens", {}))
             )
-            if published.get(pane_id) == desired:
-                continue
-            # Record uncertainty before the RPC: the server may apply a write
-            # even if its response or this process is lost.
-            published[pane_id] = {"pending": True}
-            save_state(state)
+        for pane_id in pane_ids:
+            with state_lock():
+                state = load_state()
+                source = state.get("v1", {}).get("sources", {}).get(source_id)
+                if not source or source.get("server_boot_id") != expected_boot:
+                    return
+                published = source.setdefault("published_tokens", {})
+                if pane_id not in source.get("panes", {}):
+                    if pane_id in published:
+                        published.pop(pane_id)
+                        save_state(state)
+                    continue
+                desired = desired_token(source, pane_id)
+                if published.get(pane_id) == desired:
+                    continue
+                generation = source.get("socket_generation")
+                pending = {"pending": True, "id": uuid.uuid4().hex}
+                published[pane_id] = pending
+                save_state(state)
             try:
                 params = {
                     "pane_id": pane_id,
@@ -3298,13 +3343,27 @@ def sync_v1_episode_tokens(source_id, socket_path, *, expected_boot=None):
             except (SocketError, OSError, ValueError) as e:
                 log(f"v1 episode token update failed: {e}")
                 continue
-            if desired is None:
-                published.pop(pane_id, None)
-            else:
-                published[pane_id] = desired
-            changed = True
-        if changed:
-            save_state(state)
+            with state_lock():
+                state = load_state()
+                source = state.get("v1", {}).get("sources", {}).get(source_id)
+                if (
+                    not source
+                    or source.get("server_boot_id") != expected_boot
+                    or source.get("socket_generation") != generation
+                ):
+                    continue
+                published = source.get("published_tokens", {})
+                if (
+                    published.get(pane_id) != pending
+                    or pane_id not in source.get("panes", {})
+                    or desired_token(source, pane_id) != desired
+                ):
+                    continue
+                if desired is None:
+                    published.pop(pane_id, None)
+                else:
+                    published[pane_id] = desired
+                save_state(state)
 
 
 def sidebar_panes(panes, attention):
@@ -3670,20 +3729,6 @@ class V1SupervisedSources:
         if not candidate.get("remote"):
             candidate["socket_path"] = os.path.realpath(candidate["socket_path"])
         return prepared.copy() if prepared == candidate else None
-
-    def sync_tokens(self):
-        for source_id, entry in self._workers.items():
-            worker, target = entry["worker"], entry["target"]
-            if not worker.alive or not worker.ready:
-                continue
-            if target.get("remote"):
-                name = "v1-" + hashlib.sha256(source_id.encode()).hexdigest()[:16]
-                sock_path = remote_sock_path(name)
-            else:
-                sock_path = target["socket_path"]
-            sync_v1_episode_tokens(
-                source_id, sock_path, expected_boot=target["server_boot_id"]
-            )
 
     def close(self):
         for entry in self._workers.values():
@@ -4290,10 +4335,8 @@ def v1_run_supervisor(cfg, stop):
                     enabled = (state_dir / "v1-enabled").read_text() == "enabled"
                 except FileNotFoundError:
                     enabled = False
-                if enabled:
-                    sources.sync_tokens()
-                    if desired is not None:
-                        v1_supervisor_focus_tick(cfg, desired, ready)
+                if enabled and desired is not None:
+                    v1_supervisor_focus_tick(cfg, desired, ready)
             except (
                 OSError,
                 ValueError,
@@ -6490,6 +6533,8 @@ def v1_watch_supervised_source(source_id, target, on_ready):
     with v1_source_leader(source_id) as leader:
         if not leader:
             return False
+        token_stop = threading.Event()
+        token_worker = None
         try:
             if target.get("remote"):
                 sock = ensure_forward(name, v1_remote_config(target), entry, procs)
@@ -6502,10 +6547,16 @@ def v1_watch_supervised_source(source_id, target, on_ready):
             notified = False
 
             def on_change():
-                nonlocal notified
+                nonlocal notified, token_worker
                 if not notified:
                     on_ready()
                     notified = True
+                    token_worker = threading.Thread(
+                        target=v1_supervised_token_loop,
+                        args=(source_id, sock, target["server_boot_id"], token_stop),
+                        daemon=True,
+                    )
+                    token_worker.start()
 
             v1_watch_connection(
                 source_id,
@@ -6516,8 +6567,26 @@ def v1_watch_supervised_source(source_id, target, on_ready):
             )
             return True
         finally:
+            token_stop.set()
+            if token_worker is not None:
+                token_worker.join()
             if target.get("remote"):
                 drop_forward(name, entry, procs)
+
+
+def v1_supervised_token_loop(source_id, socket_path, expected_boot, stop):
+    """Synchronize force-read tokens without waiting for discovery."""
+    while not stop.is_set():
+        try:
+            if (state_dir / "v1-enabled").read_text() == "enabled":
+                sync_v1_episode_tokens(
+                    source_id, socket_path, expected_boot=expected_boot
+                )
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            log(f"v1 supervised token sync failed: {error}")
+        stop.wait(1)
 
 
 def observe_v1_remote(cfg, source_id, target, entry, procs):

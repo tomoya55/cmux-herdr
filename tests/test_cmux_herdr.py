@@ -2391,48 +2391,6 @@ def test_v1_supervisor_sources_retains_handle_if_stop_fails():
     assert not worker.alive
 
 
-def test_v1_supervisor_sources_syncs_tokens_only_for_ready_worker(monkeypatch):
-    class Worker:
-        ready = False
-        alive = True
-
-        def stop(self):
-            self.alive = False
-
-    worker = Worker()
-    manager = ch.V1SupervisedSources(lambda *args: worker)
-    spec = {
-        "workspace": "w",
-        "surface": "s",
-        "target": {
-            "remote": None,
-            "socket_path": "/tmp/source.sock",
-            "server_boot_id": "a" * 32,
-        },
-        "connection_generation": 1,
-    }
-    calls = []
-    monkeypatch.setattr(
-        ch,
-        "sync_v1_episode_tokens",
-        lambda source, sock, **kwargs: calls.append((source, sock)),
-    )
-    try:
-        manager.reconcile({"c": spec}, complete=True)
-        manager.sync_tokens()
-        assert not calls
-        worker.ready = True
-        manager.sync_tokens()
-        assert calls == [
-            (
-                ch.v1_supervised_source_key(spec["target"]),
-                os.path.realpath("/tmp/source.sock"),
-            )
-        ]
-    finally:
-        manager.close()
-
-
 def test_v1_supervisor_focus_checks_only_prepared_bindings(monkeypatch):
     local = {
         "workspace": "w",
@@ -2612,7 +2570,7 @@ def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
     ch.v1_run_supervisor({}, Stop())
     assert calls[0] == "reclaim"
     assert calls[-2:] == ["sources closed", "leases closed"]
-    assert sorted(calls[1:-2]) == sorted(["reconcile", "tokens", "focus", "publish"])
+    assert sorted(calls[1:-2]) == sorted(["reconcile", "focus", "publish"])
 
 
 def test_v1_supervisor_publishes_while_discovery_is_stalled(monkeypatch, tmp_path):
@@ -7624,6 +7582,37 @@ def test_v1_supervisor_source_reports_ready_only_once_after_subscription(
     assert calls == [("source", "generation", "/source.sock", "a" * 32)]
 
 
+@pytest.mark.parametrize("marker", ["pending", "enabled"])
+def test_v1_supervised_source_syncs_tokens_without_supervisor_discovery(
+    monkeypatch, tmp_path, marker
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text(marker)
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "generation")
+    synced = threading.Event()
+    calls = []
+
+    def sync(source, path, *, expected_boot):
+        calls.append((source, path, expected_boot))
+        synced.set()
+
+    monkeypatch.setattr(ch, "sync_v1_episode_tokens", sync)
+
+    def watch(source, generation, path, *, on_change, expected_boot):
+        on_change()
+        if marker == "pending":
+            assert not synced.wait(0.2)
+            (tmp_path / "v1-enabled").write_text("enabled")
+        assert synced.wait(3), "token synchronization depended on supervisor discovery"
+
+    monkeypatch.setattr(ch, "v1_watch_connection", watch)
+    target = {"remote": None, "socket_path": "/source.sock", "server_boot_id": "a" * 32}
+    assert ch.v1_watch_supervised_source("source", target, lambda: None)
+    assert calls and calls[0] == ("source", "/source.sock", "a" * 32)
+
+
 def test_v1_supervisor_source_entrypoint_reports_readiness(
     monkeypatch, tmp_path, capsys
 ):
@@ -9025,6 +9014,174 @@ def test_v1_force_read_rejects_missing_or_restarted_server_identity(monkeypatch)
 
     monkeypatch.setattr(ch, "socket_rpc", restarted)
     assert not ch.v1_force_read_action()
+
+
+@pytest.mark.parametrize("changed_source", ["a", "b"])
+def test_v1_slow_source_refresh_does_not_lock_other_updates(
+    monkeypatch, tmp_path, changed_source
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state({"v1": {"sources": {"a": {"value": 1}, "b": {"value": 1}}}})
+    entered, release, updated = threading.Event(), threading.Event(), threading.Event()
+
+    def refresh(state, *args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        state["v1"]["sources"]["a"]["value"] = 2
+        return True
+
+    monkeypatch.setattr(ch, "refresh_v1_source", refresh)
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(ch.sync_v1_source("a", "g", "/socket"))
+    )
+
+    def update():
+        with ch.state_lock():
+            state = ch.load_state()
+            state["v1"]["sources"][changed_source]["value"] = 3
+            ch.save_state(state)
+        updated.set()
+
+    writer = threading.Thread(target=update)
+    worker.start()
+    try:
+        assert entered.wait(3)
+        writer.start()
+        assert updated.wait(1), "remote refresh held the shared state lock"
+    finally:
+        release.set()
+        worker.join(5)
+        if writer.ident is not None:
+            writer.join(5)
+    state = ch.load_state()["v1"]["sources"]
+    assert state[changed_source]["value"] == 3
+    assert result == [changed_source != "a"]
+    if changed_source == "b":
+        assert state["a"]["value"] == 2
+
+
+def test_v1_slow_token_write_does_not_block_updates_or_commit_stale_episode(
+    monkeypatch, tmp_path
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state(
+        {
+            "v1": {
+                "sources": {
+                    "a": {
+                        "server_boot_id": "boot",
+                        "attention": {"p": {"status": "done", "episode": "old"}},
+                        "panes": {"p": {}},
+                    },
+                    "b": {"value": 1},
+                }
+            }
+        }
+    )
+    entered, release, updated = threading.Event(), threading.Event(), threading.Event()
+    writes = []
+
+    def rpc(path, method, params):
+        value = params["tokens"]["cmux_herdr_done"]
+        if value == "old":
+            entered.set()
+            assert release.wait(5)
+        writes.append(value)
+        return {}
+
+    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    worker = threading.Thread(
+        target=lambda: ch.sync_v1_episode_tokens("a", "/socket", expected_boot="boot")
+    )
+
+    def update():
+        with ch.state_lock():
+            state = ch.load_state()
+            state["v1"]["sources"]["a"]["attention"]["p"]["episode"] = "new"
+            state["v1"]["sources"]["b"]["value"] = 2
+            ch.save_state(state)
+        updated.set()
+
+    writer = threading.Thread(target=update)
+    worker.start()
+    try:
+        assert entered.wait(3)
+        writer.start()
+        assert updated.wait(1), "remote token write held the shared state lock"
+    finally:
+        release.set()
+        worker.join(5)
+        if writer.ident is not None:
+            writer.join(5)
+    state = ch.load_state()["v1"]["sources"]
+    assert state["b"]["value"] == 2
+    assert state["a"]["published_tokens"]["p"] != "old"
+    ch.sync_v1_episode_tokens("a", "/socket", expected_boot="boot")
+    assert writes == ["old", "new"]
+    assert ch.load_state()["v1"]["sources"]["a"]["published_tokens"]["p"] == "new"
+
+
+@pytest.mark.parametrize("new_generation", [False, True])
+def test_v1_source_refresh_merges_concurrent_token_bookkeeping(
+    monkeypatch, tmp_path, new_generation
+):
+    import threading
+
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    ch.save_state(
+        {
+            "v1": {
+                "sources": {
+                    "a": {
+                        "value": 1,
+                        "cursor_generation": "g",
+                        "published_tokens": {"p": {"pending": True, "id": "old"}},
+                    }
+                }
+            }
+        }
+    )
+    entered, release = threading.Event(), threading.Event()
+
+    def refresh(state, *args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        state["v1"]["sources"]["a"]["value"] = 2
+        if new_generation:
+            state["v1"]["sources"]["a"]["cursor_generation"] = "next"
+            state["v1"]["sources"]["a"].pop("published_tokens")
+        return True
+
+    monkeypatch.setattr(ch, "refresh_v1_source", refresh)
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(ch.sync_v1_source("a", "g", "/socket"))
+    )
+    worker.start()
+    try:
+        assert entered.wait(3)
+        with ch.state_lock():
+            state = ch.load_state()
+            state["v1"]["sources"]["a"]["published_tokens"]["p"]["id"] = "new"
+            ch.save_state(state)
+    finally:
+        release.set()
+        worker.join(5)
+    assert result == [True]
+    source = ch.load_state()["v1"]["sources"]["a"]
+    assert source["value"] == 2
+    if new_generation:
+        assert "published_tokens" not in source
+    else:
+        assert source["published_tokens"]["p"]["id"] == "new"
 
 
 def test_v1_episode_tokens_publish_only_confirmed_completions(monkeypatch, tmp_path):
