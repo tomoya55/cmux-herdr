@@ -2128,9 +2128,11 @@ def v1_force_read_action():
         if not isinstance(pane_id, str) or not pane_id or not sock_path:
             return False
         pane = socket_rpc(sock_path, "pane.get", {"pane_id": pane_id}).get("pane", {})
-        if pane.get("pane_id") != pane_id or pane.get("agent_status") not in (
-            "done",
-            "idle",
+        status = pane.get("agent_status")
+        if pane.get("pane_id") != pane_id or not (
+            status in ("done", "idle")
+            or status == "unknown"
+            and pane.get("agent") is None
         ):
             return False
         token = (pane.get("tokens") or {}).get("cmux_herdr_done")

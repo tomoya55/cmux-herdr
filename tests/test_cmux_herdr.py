@@ -7435,6 +7435,51 @@ def test_v1_force_read_action_does_not_acknowledge_blocked(monkeypatch):
     assert calls == ["pane.get"]
 
 
+def test_v1_force_read_action_accepts_retained_completion_after_agent_exit(monkeypatch):
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
+    )
+    monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
+    calls = []
+
+    def rpc(path, method, params):
+        calls.append((method, params))
+        if method == "pane.get":
+            return {
+                "pane": {
+                    "pane_id": "p",
+                    "agent": None,
+                    "agent_status": "unknown",
+                    "tokens": {"cmux_herdr_done": "episode"},
+                }
+            }
+        return {"type": "ok"}
+
+    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    assert ch.v1_force_read_action()
+    assert calls[-1][1]["tokens"] == {"cmux_herdr_ack": "episode"}
+
+
+def test_v1_force_read_action_rejects_unknown_state_for_present_agent(monkeypatch):
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
+    )
+    monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
+    monkeypatch.setattr(
+        ch,
+        "socket_rpc",
+        lambda *args: {
+            "pane": {
+                "pane_id": "p",
+                "agent": "codex",
+                "agent_status": "unknown",
+                "tokens": {"cmux_herdr_done": "old"},
+            }
+        },
+    )
+    assert not ch.v1_force_read_action()
+
+
 def test_v1_episode_tokens_publish_only_confirmed_completions(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
