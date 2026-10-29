@@ -8765,6 +8765,36 @@ def test_v1_force_read_main_dispatches_without_loading_config(monkeypatch):
     assert calls == ["ack"]
 
 
+def test_v1_force_read_action_selects_supported_python(tmp_path):
+    manifest = ch.tomllib.loads(
+        (Path(ch.__file__).parent / "herdr-plugin.toml").read_text()
+    )
+    action = next(
+        item for item in manifest["actions"] if item["id"] == "mark-agent-read"
+    )
+    old = tmp_path / "python3"
+    old.write_text("#!/bin/sh\nexit 1\n")
+    old.chmod(0o755)
+    supported = tmp_path / "python3.12"
+    supported.write_text(
+        '#!/bin/sh\nif [ "$1" = -c ]; then exit 0; fi\nprintf \'%s\\n\' "$@"\n'
+    )
+    supported.chmod(0o755)
+    proc = subprocess.run(
+        action["command"],
+        env={
+            "PATH": str(tmp_path),
+            "ZDOTDIR": str(tmp_path),
+            "HERDR_PLUGIN_ROOT": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.splitlines() == [str(tmp_path / "cmux_herdr.py"), "force-read"]
+
+
 def test_v1_focus_acknowledges_only_verified_focused_done():
     state = {
         "v1": {
