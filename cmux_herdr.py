@@ -1534,7 +1534,7 @@ def v1_read_client_response(path, expected_peer=None, *, timeout=2):
 
 
 def v1_client_observation(path, pid):
-    response = v1_read_client_response(path)
+    response = v1_read_client_response(path, expected_peer=pid)
     return response if valid_v1_client_observation(response, pid) else None
 
 
@@ -2082,6 +2082,9 @@ def v1_discovered_targets(inventory):
             targets[key] = {
                 "workspace": client["workspace"],
                 "surface": client["surface"],
+                "observed_client_pid": client["pid"],
+                "observed_client_instance": client["instance"],
+                "endpoint": source["endpoint"],
                 "connection_generation": source["connection_generation"],
                 "target": target,
             }
@@ -2373,6 +2376,22 @@ def v1_reconcile_focus(cfg, client_id, source_id, workspace_id, surface_id, sock
                     ("workspace", workspace_id),
                     ("surface", surface_id),
                 )
+            ):
+                return False
+            if (
+                type(client.get("observed_client_pid")) is not int
+                or not isinstance(client.get("observed_client_instance"), str)
+                or not client["observed_client_instance"]
+                or not isinstance(client.get("endpoint"), str)
+                or not client["endpoint"]
+                or type(client.get("connection_generation")) is not int
+                or not isinstance(client.get("server_boot_id"), str)
+                or after.get("pid") != client["observed_client_pid"]
+                or after.get("instance") != client["observed_client_instance"]
+                or observation.get("endpoint") != client["endpoint"]
+                or observation.get("connection_generation")
+                != client["connection_generation"]
+                or observation.get("boot_id") != client["server_boot_id"]
             ):
                 return False
             episode = v1_verified_focus_episode(state, source_id, observation, snapshot)
@@ -2984,6 +3003,9 @@ def reconcile_v1_supervised_bindings(
             "supervised": True,
             "server_boot_id": spec["target"]["server_boot_id"],
             "connection_generation": spec["connection_generation"],
+            "observed_client_pid": spec.get("observed_client_pid"),
+            "observed_client_instance": spec.get("observed_client_instance"),
+            "endpoint": spec.get("endpoint"),
         }
         target = spec["target"]
         if target.get("remote") and target.get("session"):
@@ -3253,6 +3275,11 @@ def v1_supervisor_bindings_match(desired):
             and clients[key].get("server_boot_id") == spec["target"]["server_boot_id"]
             and clients[key].get("connection_generation")
             == spec["connection_generation"]
+            and clients[key].get("observed_client_pid")
+            == spec.get("observed_client_pid")
+            and clients[key].get("observed_client_instance")
+            == spec.get("observed_client_instance")
+            and clients[key].get("endpoint") == spec.get("endpoint")
             for key, spec in desired.items()
         )
 

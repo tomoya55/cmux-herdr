@@ -1497,6 +1497,7 @@ def test_socket_rpc_error_raises():
     t.join(5)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS socket peer PID")
 def test_v1_client_observation_reads_and_validates_private_socket():
     import threading
 
@@ -1504,7 +1505,7 @@ def test_v1_client_observation_reads_and_validates_private_socket():
     ready = threading.Event()
     payload = {
         "version": 1,
-        "pid": 42,
+        "pid": os.getpid(),
         "instance": "client-instance",
         "status": "ok",
         "observation": {
@@ -1530,9 +1531,20 @@ def test_v1_client_observation_reads_and_validates_private_socket():
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     assert ready.wait(5)
-    assert ch.v1_client_observation(path, 42) == payload
+    assert ch.v1_client_observation(path, os.getpid()) == payload
     thread.join(5)
     path.unlink(missing_ok=True)
+
+
+def test_v1_focus_observation_requires_matching_socket_peer(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        ch,
+        "v1_read_client_response",
+        lambda path, expected_peer=None: seen.append(expected_peer),
+    )
+    assert ch.v1_client_observation("/tmp/client.sock", 42) is None
+    assert seen == [42]
 
 
 @pytest.mark.parametrize(
@@ -1870,6 +1882,15 @@ def test_v1_discovered_targets_preserve_client_source_and_boot():
         entry["workspace"] == "w" and entry["surface"] == "s"
         for entry in targets.values()
     )
+    assert all(
+        entry["observed_client_pid"] == 20
+        and entry["observed_client_instance"] == "client-a"
+        for entry in targets.values()
+    )
+    assert {entry["endpoint"] for entry in targets.values()} == {
+        "local",
+        "ssh:" + "b" * 32,
+    }
     same = ch.v1_discovered_targets(inventory)
     assert targets == same
     inventory["clients"][0]["instance"] = "client-b"
@@ -8951,7 +8972,18 @@ def test_v1_focus_reconciliation_acknowledges_presented_release(
     episode = "generation:t:7"
     state = {
         "v1": {
-            "clients": {"c": {"source": "src", "workspace": "w", "surface": "s"}},
+            "clients": {
+                "c": {
+                    "source": "src",
+                    "workspace": "w",
+                    "surface": "s",
+                    "observed_client_pid": 42,
+                    "observed_client_instance": "instance",
+                    "endpoint": "local",
+                    "connection_generation": 4,
+                    "server_boot_id": boot,
+                }
+            },
             "sources": {
                 "src": {
                     "attention": {
@@ -8977,6 +9009,8 @@ def test_v1_focus_reconciliation_acknowledges_presented_release(
         "instance": "instance",
         "observation": {
             "boot_id": boot,
+            "endpoint": "local",
+            "connection_generation": 4,
             "pane_id": "p",
             "outer_focused": True,
             "agent_state_change_seq": None,
@@ -9023,7 +9057,18 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
     episode = "generation:t:7"
     state = {
         "v1": {
-            "clients": {"c": {"source": "src", "workspace": "w", "surface": "s"}},
+            "clients": {
+                "c": {
+                    "source": "src",
+                    "workspace": "w",
+                    "surface": "s",
+                    "observed_client_pid": 42,
+                    "observed_client_instance": "instance",
+                    "endpoint": "local",
+                    "connection_generation": 4,
+                    "server_boot_id": boot,
+                }
+            },
             "sources": {
                 "src": {
                     "attention": {
@@ -9049,12 +9094,14 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
         "instance": "instance",
         "observation": {
             "boot_id": boot,
+            "endpoint": "local",
+            "connection_generation": 4,
             "pane_id": "p",
             "outer_focused": True,
             "agent_state_change_seq": 7,
         },
     }
-    observed = [observation, observation]
+    observed = []
     monkeypatch.setattr(ch, "v1_surface_observation", lambda *args: observed.pop(0))
     monkeypatch.setattr(
         ch,
@@ -9073,6 +9120,24 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
             }
         },
     )
+    for wrong in (
+        {**observation, "pid": 43},
+        {**observation, "instance": "other"},
+        {
+            **observation,
+            "observation": {
+                **observation["observation"],
+                "endpoint": "ssh:" + "b" * 32,
+            },
+        },
+        {
+            **observation,
+            "observation": {**observation["observation"], "connection_generation": 5},
+        },
+    ):
+        observed[:] = [wrong, wrong]
+        assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    observed[:] = [observation, observation]
     assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     attention = ch.load_state()["v1"]["sources"]["src"]["attention"]
     assert attention["p"]["acknowledged"] == episode
@@ -9112,7 +9177,18 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
     boot = "a" * 32
     state = {
         "v1": {
-            "clients": {"c": {"source": "src", "workspace": "w", "surface": "s"}},
+            "clients": {
+                "c": {
+                    "source": "src",
+                    "workspace": "w",
+                    "surface": "s",
+                    "observed_client_pid": 20,
+                    "observed_client_instance": "i",
+                    "endpoint": "local",
+                    "connection_generation": 4,
+                    "server_boot_id": boot,
+                }
+            },
             "sources": {
                 "src": {
                     "attention": {
@@ -9190,6 +9266,8 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
         "instance": "i",
         "observation": {
             "boot_id": boot,
+            "endpoint": "local",
+            "connection_generation": 4,
             "pane_id": "p",
             "outer_focused": None,
             "agent_state_change_seq": 7,
