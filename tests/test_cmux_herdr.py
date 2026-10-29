@@ -389,19 +389,24 @@ def test_v1_publisher_resume_retries_same_request_and_persists_new_epoch(tmp_pat
     pending = ch.v1_publisher_prepare_resume(
         path, store_id, expected_epoch=identity["epoch"]
     )
-    assert ch.v1_publisher_prepare_resume(
-        path, store_id, expected_epoch=identity["epoch"]
-    ) == pending
+    assert (
+        ch.v1_publisher_prepare_resume(path, store_id, expected_epoch=identity["epoch"])
+        == pending
+    )
     assert json.loads(pending)["expected_epoch"] == identity["epoch"]
     new_epoch = str(uuid.uuid4())
     with pytest.raises(ValueError, match="resumed state"):
         ch.v1_publisher_ack_resume(
-            path, store_id, pending,
+            path,
+            store_id,
+            pending,
             {"epoch": new_epoch, "revision": "1", "destinations": []},
         )
     assert ch.v1_publisher_identity(path, store_id, create=False)["pending"] is not None
     ch.v1_publisher_ack_resume(
-        path, store_id, pending,
+        path,
+        store_id,
+        pending,
         {"epoch": new_epoch, "revision": "0", "destinations": []},
     )
     journal = ch.v1_publisher_identity(path, store_id, create=False)
@@ -448,9 +453,7 @@ def test_v1_publisher_fences_rejected_pending_set_before_recovery(tmp_path):
     identity = ch.v1_publisher_identity(path, store_id, create=True)
     registration = ch.v1_publisher_prepare_register(path, store_id)
     ch.v1_publisher_ack_register(path, store_id, registration)
-    ch.v1_publisher_prepare_set(
-        path, store_id, [], expected_epoch=identity["epoch"]
-    )
+    ch.v1_publisher_prepare_set(path, store_id, [], expected_epoch=identity["epoch"])
     new_epoch = str(uuid.uuid4())
     sent = []
 
@@ -532,8 +535,10 @@ def test_v1_owned_publisher_holds_lease_and_skips_unchanged_state(
         return {"state": None}
 
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "one",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "one",
     }
     with ch.v1_owned_publisher(path, store_id, send) as publisher:
         assert publisher is not None
@@ -709,8 +714,10 @@ def test_v1_owned_publisher_rejects_reentrant_publish(tmp_path):
         return {"state": None}
 
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     with ch.v1_owned_publisher(path, store_id, send) as publisher:
         holder.append(publisher)
@@ -723,8 +730,10 @@ def test_v1_owned_publisher_uses_guarded_send_for_updates(tmp_path):
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     calls = []
 
@@ -748,8 +757,10 @@ def test_v1_owned_publisher_uses_guarded_send_for_updates(tmp_path):
     with ch.v1_owned_publisher(path, store_id, send, send_guarded=send_guarded) as p:
         assert p.publish([destination], send_guard=guard)
     assert calls == [
-        ("plain", "register"), ("guard", "enter"),
-        ("guarded", "set"), ("guard", "exit"),
+        ("plain", "register"),
+        ("guard", "enter"),
+        ("guarded", "set"),
+        ("guard", "exit"),
     ]
 
 
@@ -758,8 +769,10 @@ def test_v1_owned_publisher_recovers_rejected_guard_without_stale_send(tmp_path)
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     actions = []
     new_epoch = str(uuid.uuid4())
@@ -794,9 +807,12 @@ def test_v1_owned_publisher_serializes_baseline_and_publication(tmp_path):
     path = tmp_path / "publisher.json"
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
+
     def send(_data):
         return {"state": None}
+
     with ch.v1_owned_publisher(path, store_id, send, send_guarded=send) as publisher:
+
         def prepare():
             assert publisher.current_destinations() == []
             with pytest.raises(ValueError, match="already publishing"):
@@ -840,8 +856,11 @@ def test_v1_owned_publisher_returns_durable_initial_publication_receipt(tmp_path
             lambda: ([], nullcontext), force=True, receipt=True
         )
         assert receipt == {
-            "store_id": store_id, "producer": identity["producer"],
-            "epoch": p.epoch, "revision": "1", "destinations": [],
+            "store_id": store_id,
+            "producer": identity["producer"],
+            "epoch": p.epoch,
+            "revision": "1",
+            "destinations": [],
         }
         assert p.receipt_is_current(receipt)
         assert p.publish([], force=True)
@@ -854,8 +873,10 @@ def test_v1_owned_verified_publication_recovers_pending_in_same_lease(tmp_path):
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     actions = []
     new_epoch = str(uuid.uuid4())
@@ -888,8 +909,10 @@ def test_v1_owned_publisher_fences_uncertain_set_before_new_state(tmp_path):
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     new_epoch = str(uuid.uuid4())
     actions = []
@@ -915,8 +938,10 @@ def test_v1_owned_publisher_reconciles_uncertain_committed_set(tmp_path):
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     new_epoch = str(uuid.uuid4())
     requests = []
@@ -924,14 +949,19 @@ def test_v1_owned_publisher_reconciles_uncertain_committed_set(tmp_path):
     def send(data):
         request = json.loads(data)
         requests.append(request)
-        if request["action"] == "set" and sum(
-            item["action"] == "set" for item in requests
-        ) == 1:
+        if (
+            request["action"] == "set"
+            and sum(item["action"] == "set" for item in requests) == 1
+        ):
             raise OSError("response lost after commit")
         if request["action"] == "resume":
-            return {"state": {
-                "epoch": new_epoch, "revision": "0", "destinations": [destination]
-            }}
+            return {
+                "state": {
+                    "epoch": new_epoch,
+                    "revision": "0",
+                    "destinations": [destination],
+                }
+            }
         return {"state": None}
 
     with ch.v1_owned_publisher(path, store_id, send) as publisher:
@@ -939,7 +969,10 @@ def test_v1_owned_publisher_reconciles_uncertain_committed_set(tmp_path):
             publisher.publish([destination])
         assert publisher.publish([])
     assert [request["action"] for request in requests] == [
-        "register", "set", "resume", "set"
+        "register",
+        "set",
+        "resume",
+        "set",
     ]
     assert requests[-1]["epoch"] == new_epoch
     assert requests[-1]["destinations"] == []
@@ -950,8 +983,10 @@ def test_v1_owned_publisher_fences_denied_update_and_can_publish_again(tmp_path)
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     new_epoch = str(uuid.uuid4())
     actions = []
@@ -978,8 +1013,10 @@ def test_v1_owned_publisher_retries_interrupted_fence_without_new_request(tmp_pa
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     epoch = str(uuid.uuid4())
     requests = []
@@ -1001,7 +1038,11 @@ def test_v1_owned_publisher_retries_interrupted_fence_without_new_request(tmp_pa
         assert publisher.publish([destination])
     assert requests[2] == requests[3]
     assert [json.loads(data)["action"] for data in requests] == [
-        "register", "set", "resume", "resume", "set"
+        "register",
+        "set",
+        "resume",
+        "resume",
+        "set",
     ]
 
 
@@ -1012,8 +1053,10 @@ def test_v1_owned_publisher_recovers_after_resume_journal_sync_failure(
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     epoch = str(uuid.uuid4())
     calls = []
@@ -1031,9 +1074,9 @@ def test_v1_owned_publisher_recovers_after_resume_journal_sync_failure(
         if action == "set" and not calls:
             raise ch.OwnedSocketError("target_denied")
         if action == "resume":
-            return {"state": {
-                "epoch": epoch.upper(), "revision": "0", "destinations": []
-            }}
+            return {
+                "state": {"epoch": epoch.upper(), "revision": "0", "destinations": []}
+            }
         return {"state": None}
 
     with ch.v1_owned_publisher(path, store_id, send) as publisher:
@@ -1050,8 +1093,10 @@ def test_v1_owned_publisher_retries_resume_ack_before_journal_write(
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
     destination = {
-        "workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-        "title": "Waiting", "body": "",
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
     }
     epoch = str(uuid.uuid4())
     failed = []
@@ -1082,8 +1127,12 @@ def test_v1_owned_publisher_retries_invalid_resume_response(tmp_path):
     path = tmp_path / "publisher.json"
     store_id = str(uuid.uuid4())
     ch.v1_publisher_identity(path, store_id, create=True)
-    target = {"workspace_id": str(uuid.uuid4()), "surface_id": str(uuid.uuid4()),
-              "title": "Waiting", "body": ""}
+    target = {
+        "workspace_id": str(uuid.uuid4()),
+        "surface_id": str(uuid.uuid4()),
+        "title": "Waiting",
+        "body": "",
+    }
     attempts = []
     epoch = str(uuid.uuid4())
 
@@ -1107,25 +1156,31 @@ def test_v1_owned_publisher_retries_invalid_resume_response(tmp_path):
 
 def test_v1_owned_destinations_aggregate_sources_by_surface():
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"v1": {
-        "clients": {
-            "one": {"workspace": workspace, "surface": surface, "source": "a"},
-            "two": {
-                "workspace": workspace.upper(),
-                "surface": surface.upper(),
-                "source": "b",
+    state = {
+        "v1": {
+            "clients": {
+                "one": {"workspace": workspace, "surface": surface, "source": "a"},
+                "two": {
+                    "workspace": workspace.upper(),
+                    "surface": surface.upper(),
+                    "source": "b",
+                },
+                "three": {"workspace": workspace, "surface": surface, "source": "a"},
             },
-            "three": {"workspace": workspace, "surface": surface, "source": "a"},
-        },
-        "sources": {
-            "a": {"attention": {"p1": {"status": "blocked"}}},
-            "b": {"attention": {"p2": {"status": "done"}}},
-        },
-    }}
-    assert ch.v1_owned_destinations(state) == [{
-        "workspace_id": workspace, "surface_id": surface,
-        "title": "herdr: 1 waiting · 1 finished", "body": "",
-    }]
+            "sources": {
+                "a": {"attention": {"p1": {"status": "blocked"}}},
+                "b": {"attention": {"p2": {"status": "done"}}},
+            },
+        }
+    }
+    assert ch.v1_owned_destinations(state) == [
+        {
+            "workspace_id": workspace,
+            "surface_id": surface,
+            "title": "herdr: 1 waiting · 1 finished",
+            "body": "",
+        }
+    ]
     del state["v1"]["sources"]["b"]
     with pytest.raises(ValueError, match="incomplete"):
         ch.v1_owned_destinations(state)
@@ -1133,10 +1188,14 @@ def test_v1_owned_destinations_aggregate_sources_by_surface():
 
 def test_v1_owned_destinations_rejects_corrupt_attention():
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"v1": {
-        "clients": {"one": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "unexpected"}}}},
-    }}
+    state = {
+        "v1": {
+            "clients": {
+                "one": {"workspace": workspace, "surface": surface, "source": "a"}
+            },
+            "sources": {"a": {"attention": {"p": {"status": "unexpected"}}}},
+        }
+    }
     with pytest.raises(ValueError, match="attention"):
         ch.v1_owned_destinations(state)
     state["v1"]["sources"]["a"]["attention"]["p"] = {"acknowledged": "episode"}
@@ -1149,12 +1208,15 @@ def test_v1_owned_publication_requires_complete_verified_snapshot(
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"sessions": {}, "v1": {
-        "clients": {
-            "client": {"workspace": workspace, "surface": surface, "source": "a"}
+    state = {
+        "sessions": {},
+        "v1": {
+            "clients": {
+                "client": {"workspace": workspace, "surface": surface, "source": "a"}
+            },
+            "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
         },
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }}
+    }
     ch.save_state(state)
     sent = []
     publisher = SimpleNamespace(publish=lambda targets: sent.append(targets))
@@ -1185,18 +1247,29 @@ def test_v1_owned_publication_updates_only_certified_targets(tmp_path, monkeypat
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, first, second = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
-    ch.save_state({"sessions": {}, "v1": {
-        "clients": {
-            "a": {"workspace": workspace, "surface": first, "source": "a"},
-            "b": {"workspace": workspace, "surface": second, "source": "b"},
-        },
-        "sources": {
-            "a": {"attention": {"p": {"status": "blocked"}}},
-            "b": {"attention": {"p": {"status": "done"}}},
-        },
-    }})
-    previous = [{"workspace_id": workspace, "surface_id": second,
-                 "title": "Existing", "body": ""}]
+    ch.save_state(
+        {
+            "sessions": {},
+            "v1": {
+                "clients": {
+                    "a": {"workspace": workspace, "surface": first, "source": "a"},
+                    "b": {"workspace": workspace, "surface": second, "source": "b"},
+                },
+                "sources": {
+                    "a": {"attention": {"p": {"status": "blocked"}}},
+                    "b": {"attention": {"p": {"status": "done"}}},
+                },
+            },
+        }
+    )
+    previous = [
+        {
+            "workspace_id": workspace,
+            "surface_id": second,
+            "title": "Existing",
+            "body": "",
+        }
+    ]
     sent = []
     publisher = SimpleNamespace(
         current_destinations=lambda: previous,
@@ -1216,10 +1289,15 @@ def test_v1_owned_publication_revalidates_after_preparation(tmp_path, monkeypatc
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"sessions": {}, "v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }}
+    state = {
+        "sessions": {},
+        "v1": {
+            "clients": {
+                "c": {"workspace": workspace, "surface": surface, "source": "a"}
+            },
+            "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+        },
+    }
     ch.save_state(state)
     sent = []
 
@@ -1249,10 +1327,15 @@ def test_v1_owned_publication_allows_state_update_during_journal_write(
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"sessions": {}, "v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }}
+    state = {
+        "sessions": {},
+        "v1": {
+            "clients": {
+                "c": {"workspace": workspace, "surface": surface, "source": "a"}
+            },
+            "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+        },
+    }
     ch.save_state(state)
     path = tmp_path / "publisher.json"
     store_id = str(uuid.uuid4())
@@ -1296,12 +1379,15 @@ def test_v1_owned_publication_does_not_send_changed_snapshot(tmp_path, monkeypat
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"sessions": {}, "v1": {
-        "clients": {
-            "client": {"workspace": workspace, "surface": surface, "source": "a"}
+    state = {
+        "sessions": {},
+        "v1": {
+            "clients": {
+                "client": {"workspace": workspace, "surface": surface, "source": "a"}
+            },
+            "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
         },
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }}
+    }
     ch.save_state(state)
     started, updated = threading.Event(), threading.Event()
 
@@ -1333,12 +1419,21 @@ def test_v1_owned_publication_sends_aggregate_over_local_socket(tmp_path, monkey
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    ch.save_state({"sessions": {}, "v1": {
-        "clients": {
-            "client": {"workspace": workspace, "surface": surface, "source": "a"}
-        },
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }})
+    ch.save_state(
+        {
+            "sessions": {},
+            "v1": {
+                "clients": {
+                    "client": {
+                        "workspace": workspace,
+                        "surface": surface,
+                        "source": "a",
+                    }
+                },
+                "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+            },
+        }
+    )
     store_id = str(uuid.uuid4())
     identity_path = tmp_path / "publisher.json"
     sock_path = short_sock_path(uuid.uuid4().hex[:8])
@@ -1360,9 +1455,12 @@ def test_v1_owned_publication_sends_aggregate_over_local_socket(tmp_path, monkey
                         if request["method"] == "notification.state.info"
                         else {"state": None}
                     )
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": result
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {"id": request["id"], "ok": True, "result": result}
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -1372,7 +1470,9 @@ def test_v1_owned_publication_sends_aggregate_over_local_socket(tmp_path, monkey
             assert session.store_identity() == store_id
             ch.v1_publisher_identity(identity_path, store_id, create=True)
             with ch.v1_owned_publisher(
-                identity_path, store_id, session.request,
+                identity_path,
+                store_id,
+                session.request,
                 send_guarded=session.request_with_send_guard,
             ) as publisher:
                 assert ch.v1_publish_owned_once(
@@ -1380,11 +1480,13 @@ def test_v1_owned_publication_sends_aggregate_over_local_socket(tmp_path, monkey
                 )
         worker.join(5)
         assert [item["method"] for item in received] == [
-            "notification.state.info", "notification.state.command",
+            "notification.state.info",
+            "notification.state.command",
             "notification.state.command",
         ]
         assert [item["params"]["action"] for item in received[1:]] == [
-            "register", "set"
+            "register",
+            "set",
         ]
         assert received[2]["params"]["destinations"][0]["title"] == "herdr: 1 waiting"
         identity = ch.v1_publisher_identity(identity_path, store_id, create=False)
@@ -1401,10 +1503,15 @@ def test_v1_owned_publication_releases_state_lock_before_response(
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    state = {"sessions": {}, "v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }}
+    state = {
+        "sessions": {},
+        "v1": {
+            "clients": {
+                "c": {"workspace": workspace, "surface": surface, "source": "a"}
+            },
+            "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+        },
+    }
     ch.save_state(state)
     store_id = str(uuid.uuid4())
     path = tmp_path / "publisher.json"
@@ -1426,9 +1533,12 @@ def test_v1_owned_publication_releases_state_lock_before_response(
                             state["v1"]["sources"]["a"]["attention"] = {}
                             ch.save_state(state)
                         updated.set()
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": {"state": None}
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {"id": request["id"], "ok": True, "result": {"state": None}}
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -1438,7 +1548,9 @@ def test_v1_owned_publication_releases_state_lock_before_response(
         with (
             ch.V1OwnedSocketSession(sock_path, timeout=2) as session,
             ch.v1_owned_publisher(
-                path, store_id, session.request,
+                path,
+                store_id,
+                session.request,
                 send_guarded=session.request_with_send_guard,
             ) as publisher,
         ):
@@ -1462,10 +1574,17 @@ def test_v1_owned_supervisor_publishes_over_one_session(tmp_path, monkeypatch):
     marker.write_text("owned")
     marker.chmod(0o600)
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    ch.save_state({"sessions": {}, "v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }})
+    ch.save_state(
+        {
+            "sessions": {},
+            "v1": {
+                "clients": {
+                    "c": {"workspace": workspace, "surface": surface, "source": "a"}
+                },
+                "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+            },
+        }
+    )
     stop = threading.Event()
     opened = []
     published = []
@@ -1499,10 +1618,17 @@ def test_v1_owned_supervisor_reconnects_after_socket_loss(tmp_path, monkeypatch)
     marker.write_text("owned")
     marker.chmod(0o600)
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    ch.save_state({"sessions": {}, "v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }})
+    ch.save_state(
+        {
+            "sessions": {},
+            "v1": {
+                "clients": {
+                    "c": {"workspace": workspace, "surface": surface, "source": "a"}
+                },
+                "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+            },
+        }
+    )
     stop = threading.Event()
     opened = []
     published = []
@@ -1568,10 +1694,16 @@ def test_v1_owned_supervisor_transitions_over_socket(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "v1_cmux_socket_password", lambda *_args: None)
     (tmp_path / "v1-enabled").write_text("enabled")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    ch.save_state({"v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }})
+    ch.save_state(
+        {
+            "v1": {
+                "clients": {
+                    "c": {"workspace": workspace, "surface": surface, "source": "a"}
+                },
+                "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+            }
+        }
+    )
     sock_path = short_sock_path(uuid.uuid4().hex[:8])
     ready, stop = threading.Event(), threading.Event()
     requests = []
@@ -1594,9 +1726,16 @@ def test_v1_owned_supervisor_transitions_over_socket(monkeypatch, tmp_path):
                         result = {"notifications": []}
                     else:
                         result = {"state": None}
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": result,
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "ok": True,
+                                "result": result,
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
 
     def monitor():
         marker = tmp_path / "v1-notification-backend"
@@ -1617,7 +1756,8 @@ def test_v1_owned_supervisor_transitions_over_socket(monkeypatch, tmp_path):
     monitor_thread.start()
     try:
         ch.v1_supervised_owned_publish_loop(
-            stop, SimpleNamespace(scope=lambda: None),
+            stop,
+            SimpleNamespace(scope=lambda: None),
             {"CMUX_SOCKET_PATH": str(sock_path)},
         )
         worker.join(5)
@@ -1672,7 +1812,8 @@ def test_v1_supervisor_starts_and_joins_both_publishers(monkeypatch):
         ("start", "v1_supervised_owned_publish_loop"),
         ("join", "v1_supervised_publish_loop"),
         ("join", "v1_supervised_owned_publish_loop"),
-        "sources closed", "leases closed",
+        "sources closed",
+        "leases closed",
     ]
 
 
@@ -1717,10 +1858,17 @@ def test_v1_owned_supervisor_recovers_lost_update_over_socket(tmp_path, monkeypa
     marker.write_text("owned")
     marker.chmod(0o600)
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
-    ch.save_state({"sessions": {}, "v1": {
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }})
+    ch.save_state(
+        {
+            "sessions": {},
+            "v1": {
+                "clients": {
+                    "c": {"workspace": workspace, "surface": surface, "source": "a"}
+                },
+                "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+            },
+        }
+    )
     sock_path = short_sock_path(uuid.uuid4().hex[:8])
     ready, stop = threading.Event(), threading.Event()
     store_id, new_epoch = str(uuid.uuid4()), str(uuid.uuid4())
@@ -1749,15 +1897,25 @@ def test_v1_owned_supervisor_recovers_lost_update_over_socket(tmp_path, monkeypa
                             assert params["destinations"] == committed
                             result = {"state": None}
                         elif params["action"] == "resume":
-                            result = {"state": {
-                                "epoch": new_epoch, "revision": "0",
-                                "destinations": committed,
-                            }}
+                            result = {
+                                "state": {
+                                    "epoch": new_epoch,
+                                    "revision": "0",
+                                    "destinations": committed,
+                                }
+                            }
                         else:
                             result = {"state": None}
-                        conn.sendall(json.dumps({
-                            "id": request["id"], "ok": True, "result": result,
-                        }).encode() + b"\n")
+                        conn.sendall(
+                            json.dumps(
+                                {
+                                    "id": request["id"],
+                                    "ok": True,
+                                    "result": result,
+                                }
+                            ).encode()
+                            + b"\n"
+                        )
                         if params.get("action") == "resume":
                             stop.set()
                             break
@@ -1769,7 +1927,8 @@ def test_v1_owned_supervisor_recovers_lost_update_over_socket(tmp_path, monkeypa
     watchdog.start()
     try:
         ch.v1_supervised_owned_publish_loop(
-            stop, SimpleNamespace(scope=lambda: None),
+            stop,
+            SimpleNamespace(scope=lambda: None),
             {"CMUX_SOCKET_PATH": str(sock_path)},
         )
         worker.join(5)
@@ -1782,7 +1941,11 @@ def test_v1_owned_supervisor_recovers_lost_update_over_socket(tmp_path, monkeypa
         assert journal["destinations"] == committed
         assert committed[0]["title"] == "herdr: 1 waiting"
         assert [r["params"].get("action", "info") for r in requests] == [
-            "info", "register", "set", "info", "resume"
+            "info",
+            "register",
+            "set",
+            "info",
+            "resume",
         ]
     finally:
         watchdog.cancel()
@@ -3314,8 +3477,12 @@ def test_v1_owned_socket_request_preserves_saved_params_bytes():
                     data += conn.recv(65536)
                 received.append(data)
                 request = json.loads(data)
-                conn.sendall(json.dumps({"id": request["id"], "ok": True,
-                                         "result": {"state": None}}).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {"id": request["id"], "ok": True, "result": {"state": None}}
+                    ).encode()
+                    + b"\n"
+                )
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
@@ -3354,7 +3521,7 @@ def test_v1_owned_socket_request_rejects_invalid_response(response):
     assert ready.wait(5)
     try:
         with pytest.raises(ch.SocketError):
-            ch.v1_owned_socket_request(sock_path, b'{}')
+            ch.v1_owned_socket_request(sock_path, b"{}")
         thread.join(5)
     finally:
         sock_path.unlink(missing_ok=True)
@@ -3374,8 +3541,11 @@ def test_v1_owned_socket_request_preserves_error_code():
             conn, _ = server.accept()
             with conn:
                 request = json.loads(conn.recv(65536))
-                response = {"id": request["id"], "ok": False,
-                            "error": {"code": "wrong_epoch", "message": "secret"}}
+                response = {
+                    "id": request["id"],
+                    "ok": False,
+                    "error": {"code": "wrong_epoch", "message": "secret"},
+                }
                 conn.sendall(json.dumps(response).encode() + b"\n")
 
     thread = threading.Thread(target=serve, daemon=True)
@@ -3408,9 +3578,12 @@ def test_v1_owned_socket_session_reuses_connection_for_requests():
                 for _ in range(2):
                     request = json.loads(stream.readline())
                     received.append(request["params"])
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": {"state": None}
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {"id": request["id"], "ok": True, "result": {"state": None}}
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -3445,9 +3618,16 @@ def test_v1_owned_socket_session_presents_capability_on_every_request():
                     prefix, capability, command = stream.readline().split(b" ", 2)
                     prefixes.append((prefix, capability))
                     request = json.loads(command)
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": {"state": None},
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "ok": True,
+                                "result": {"state": None},
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -3479,10 +3659,16 @@ def test_v1_owned_socket_session_reads_store_identity():
             with conn:
                 request = json.loads(conn.recv(65536))
                 requests.append(request)
-                conn.sendall(json.dumps({
-                    "id": request["id"], "ok": True,
-                    "result": {"store_id": store_id.upper()},
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "ok": True,
+                            "result": {"store_id": store_id.upper()},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -3521,7 +3707,11 @@ def test_v1_owned_backend_probe_requires_valid_store_identity(monkeypatch, tmp_p
     monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
     assert ch.v1_probe_owned_backend({"CMUX_SOCKET_PATH": "/tmp/cmux"}, tmp_path)
     assert events == [
-        ("open", "/tmp/cmux"), ("probe",), ("probe",), ("list",), ("close",)
+        ("open", "/tmp/cmux"),
+        ("probe",),
+        ("probe",),
+        ("list",),
+        ("close",),
     ]
     assert not ch.v1_probe_owned_backend({}, tmp_path)
 
@@ -3543,8 +3733,13 @@ def test_v1_owned_backend_probe_waits_for_unidentified_legacy_unread(
             return str(uuid.uuid4())
 
         def list_notifications(self):
-            return [{"id": str(uuid.uuid4()), "is_read": False,
-                     "subtitle": ch.NOTIFICATION_SUBTITLE}]
+            return [
+                {
+                    "id": str(uuid.uuid4()),
+                    "is_read": False,
+                    "subtitle": ch.NOTIFICATION_SUBTITLE,
+                }
+            ]
 
     monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
     assert not ch.v1_probe_owned_backend({"CMUX_SOCKET_PATH": "/tmp/cmux"}, tmp_path)
@@ -3555,8 +3750,11 @@ def test_v1_owned_backend_rechecks_store_and_unread_notifications():
     session = SimpleNamespace(store_identity=lambda: store_id, list_notifications=list)
     assert ch.v1_owned_backend_is_clear(session, store_id)
     session.list_notifications = lambda: [
-        {"id": str(uuid.uuid4()), "is_read": False,
-         "subtitle": ch.NOTIFICATION_SUBTITLE}
+        {
+            "id": str(uuid.uuid4()),
+            "is_read": False,
+            "subtitle": ch.NOTIFICATION_SUBTITLE,
+        }
     ]
     assert not ch.v1_owned_backend_is_clear(session, store_id)
     session.store_identity = lambda: str(uuid.uuid4())
@@ -3569,6 +3767,7 @@ def test_v1_supervisor_handoff_requires_complete_and_supported_backend(
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     calls = []
+
     class Session:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -3588,7 +3787,8 @@ def test_v1_supervisor_handoff_requires_complete_and_supported_backend(
 
     monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
     monkeypatch.setattr(
-        ch, "v1_try_supervisor_handoff",
+        ch,
+        "v1_try_supervisor_handoff",
         lambda *_args, **kwargs: calls.append("handoff") or kwargs["final_check"](),
     )
     verified = SimpleNamespace(scope=lambda: set())
@@ -3612,9 +3812,9 @@ def test_v1_supervisor_keeps_legacy_when_store_provenance_is_missing(
 ):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
-    ch.STATE_PATH.write_text(json.dumps({"v1": {"destinations": {
-        "old": {"notification_id": "old-notice"}
-    }}}))
+    ch.STATE_PATH.write_text(
+        json.dumps({"v1": {"destinations": {"old": {"notification_id": "old-notice"}}}})
+    )
     calls = []
 
     class Session:
@@ -3717,7 +3917,8 @@ def test_v1_supervisor_attempts_handoff_after_recovery_and_discovery(
     monkeypatch.setattr(ch, "v1_discovered_targets", lambda _inventory: {"c": {}})
     monkeypatch.setattr(ch, "v1_reconcile_supervisor_inventory", lambda *_args: None)
     monkeypatch.setattr(
-        ch, "v1_maybe_supervisor_handoff",
+        ch,
+        "v1_maybe_supervisor_handoff",
         lambda *_args: calls.append("handoff") or False,
     )
     assert ch.v1_run_supervisor({}, Stop())
@@ -3739,9 +3940,16 @@ def test_v1_owned_socket_send_guard_released_before_response():
             with conn:
                 request = json.loads(conn.recv(65536))
                 assert released.wait(2)
-                conn.sendall(json.dumps({
-                    "id": request["id"], "ok": True, "result": {"state": None},
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "ok": True,
+                            "result": {"state": None},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
 
     @contextmanager
     def guard():
@@ -3843,9 +4051,16 @@ def test_v1_owned_socket_session_rejects_invalid_store_identity(result):
             conn, _ = server.accept()
             with conn:
                 request = json.loads(conn.recv(65536))
-                conn.sendall(json.dumps({
-                    "id": request["id"], "ok": True, "result": result,
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "ok": True,
+                            "result": result,
+                        }
+                    ).encode()
+                    + b"\n"
+                )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -3883,12 +4098,19 @@ def test_v1_owned_socket_session_authenticates_once_before_commands(capability):
                     if capability:
                         prefix = b"_cmux_capability_v1 test-token "
                         assert line.startswith(prefix)
-                        line = line[len(prefix):]
+                        line = line[len(prefix) :]
                     request = json.loads(line)
                     received.append(request["params"]["action"])
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": {"state": None},
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "ok": True,
+                                "result": {"state": None},
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -3910,13 +4132,15 @@ def test_v1_cmux_socket_password_prefers_environment_and_reads_saved_file(tmp_pa
     directory = tmp_path / ".local" / "state" / "cmux"
     directory.mkdir(parents=True)
     (directory / "socket-control-password").write_text("saved-password\n")
-    assert ch.v1_cmux_socket_password(
-        {"CMUX_SOCKET_PASSWORD": "env-password\n"}, tmp_path
-    ) == "env-password"
+    assert (
+        ch.v1_cmux_socket_password({"CMUX_SOCKET_PASSWORD": "env-password\n"}, tmp_path)
+        == "env-password"
+    )
     assert ch.v1_cmux_socket_password({}, tmp_path) == "saved-password"
-    assert ch.v1_cmux_socket_password(
-        {"CMUX_SOCKET_PASSWORD": "\n"}, tmp_path
-    ) == "saved-password"
+    assert (
+        ch.v1_cmux_socket_password({"CMUX_SOCKET_PASSWORD": "\n"}, tmp_path)
+        == "saved-password"
+    )
     (directory / "socket-control-password").unlink()
     assert ch.v1_cmux_socket_password({}, tmp_path) is None
 
@@ -3925,12 +4149,16 @@ def test_v1_cmux_socket_password_normalizes_unicode_newlines(tmp_path):
     directory = tmp_path / ".local" / "state" / "cmux"
     directory.mkdir(parents=True)
     (directory / "socket-control-password").write_text("\u2028saved\u0085")
-    assert ch.v1_cmux_socket_password(
-        {"CMUX_SOCKET_PASSWORD": "\u2029"}, tmp_path
-    ) == "saved"
-    assert ch.v1_cmux_socket_password(
-        {"CMUX_SOCKET_PASSWORD": "\x0bvalue\u2028"}, tmp_path
-    ) == "value"
+    assert (
+        ch.v1_cmux_socket_password({"CMUX_SOCKET_PASSWORD": "\u2029"}, tmp_path)
+        == "saved"
+    )
+    assert (
+        ch.v1_cmux_socket_password(
+            {"CMUX_SOCKET_PASSWORD": "\x0bvalue\u2028"}, tmp_path
+        )
+        == "value"
+    )
 
 
 def test_v1_cmux_socket_password_tolerates_unreadable_file(tmp_path, monkeypatch):
@@ -3964,9 +4192,16 @@ def test_v1_owned_socket_publisher_pins_store_before_registering(tmp_path):
                         if request["method"] == "notification.state.info"
                         else {"state": None}
                     )
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": result,
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "ok": True,
+                                "result": result,
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -4005,10 +4240,16 @@ def test_v1_owned_socket_publisher_rejects_replaced_store(tmp_path):
             with conn, conn.makefile("rb") as stream:
                 request = json.loads(stream.readline())
                 requests.append(request)
-                conn.sendall(json.dumps({
-                    "id": request["id"], "ok": True,
-                    "result": {"store_id": str(uuid.uuid4())},
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "ok": True,
+                            "result": {"store_id": str(uuid.uuid4())},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 assert stream.readline() == b""
 
     worker = threading.Thread(target=serve, daemon=True)
@@ -4047,14 +4288,27 @@ def test_v1_owned_socket_session_keeps_connection_after_rejection():
             conn, _ = server.accept()
             with conn, conn.makefile("rb") as stream:
                 first = json.loads(stream.readline())
-                conn.sendall(json.dumps({
-                    "id": first["id"], "ok": False,
-                    "error": {"code": "target_denied"},
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": first["id"],
+                            "ok": False,
+                            "error": {"code": "target_denied"},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 second = json.loads(stream.readline())
-                conn.sendall(json.dumps({
-                    "id": second["id"], "ok": True, "result": {"state": None},
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": second["id"],
+                            "ok": True,
+                            "result": {"state": None},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -4089,9 +4343,16 @@ def test_v1_owned_socket_session_rejects_concurrent_requests():
                 request = json.loads(conn.recv(65536))
                 entered.set()
                 release.wait(5)
-                conn.sendall(json.dumps({
-                    "id": request["id"], "ok": True, "result": {"state": None},
-                }).encode() + b"\n")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "ok": True,
+                            "result": {"state": None},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -4099,12 +4360,12 @@ def test_v1_owned_socket_session_rejects_concurrent_requests():
     try:
         with ch.V1OwnedSocketSession(sock_path) as session:
             request = threading.Thread(
-                target=lambda: results.append(session.request(b'{}')), daemon=True
+                target=lambda: results.append(session.request(b"{}")), daemon=True
             )
             request.start()
             assert entered.wait(5)
             with pytest.raises(ch.SocketError, match="already in use"):
-                session.request(b'{}')
+                session.request(b"{}")
             release.set()
             request.join(5)
             assert results == [{"state": None}]
@@ -11924,7 +12185,8 @@ def test_v1_publication_backend_read_failure_keeps_sidebar(monkeypatch, tmp_path
     monkeypatch.setattr(os, "open", read)
     calls = []
     monkeypatch.setattr(
-        ch, "publish_v1_clients_once",
+        ch,
+        "publish_v1_clients_once",
         lambda *args, **kwargs: calls.append(kwargs["notifications"]) or False,
     )
     ch.publish_v1_clients({})
@@ -11974,6 +12236,7 @@ def test_v1_activation_rollback_requires_directory_sync(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     (tmp_path / "v1-enabled").write_text("pending")
     with ch.v1_activation_lock():
+
         def fail_sync(_fd):
             raise OSError("directory sync failed")
 
@@ -12017,6 +12280,7 @@ def test_v1_recovery_syncs_absent_marker_without_restore_plan(monkeypatch, tmp_p
 
 def test_v1_daemon_startup_requires_absent_marker_sync(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
+
     def fail_sync(_fd):
         raise OSError("sync failed")
 
@@ -12112,7 +12376,8 @@ def test_v1_publication_backend_rejects_unsafe_marker(monkeypatch, tmp_path, kin
         os.mkfifo(marker, 0o600)
     calls = []
     monkeypatch.setattr(
-        ch, "publish_v1_clients_once",
+        ch,
+        "publish_v1_clients_once",
         lambda *args, **kwargs: calls.append(kwargs["notifications"]) or False,
     )
     ch.publish_v1_clients({})
@@ -12178,11 +12443,16 @@ def test_v1_prepare_ordinary_cleanup_stage_fences_and_persists(monkeypatch, tmp_
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     (tmp_path / "v1-enabled").write_text("enabled")
-    state = {"v1": {"destinations": {
-        ch.v1_destination_key(workspace, surface): {
-            "notification_id": "owned", "store_id": store,
+    state = {
+        "v1": {
+            "destinations": {
+                ch.v1_destination_key(workspace, surface): {
+                    "notification_id": "owned",
+                    "store_id": store,
+                }
+            }
         }
-    }}}
+    }
     ch.save_state(state)
     session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
     inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
@@ -12199,9 +12469,17 @@ def test_v1_prepare_ordinary_cleanup_stage_rejects_unproven_store(
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     (tmp_path / "v1-enabled").write_text("enabled")
-    ch.save_state({"v1": {"destinations": {
-        ch.v1_destination_key(workspace, surface): {"notification_id": "owned"}
-    }}})
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {
+                    ch.v1_destination_key(workspace, surface): {
+                        "notification_id": "owned"
+                    }
+                }
+            }
+        }
+    )
     session = SimpleNamespace(
         store_identity=lambda: store,
         list_notifications=lambda: [{"id": "owned", "is_read": False}],
@@ -12219,9 +12497,17 @@ def test_v1_old_unread_notice_keeps_publication_until_read_then_fences(
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     (tmp_path / "v1-enabled").write_text("enabled")
-    ch.save_state({"v1": {"destinations": {
-        ch.v1_destination_key(workspace, surface): {"notification_id": "old"}
-    }}})
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {
+                    ch.v1_destination_key(workspace, surface): {
+                        "notification_id": "old"
+                    }
+                }
+            }
+        }
+    )
     notice = {"id": "old", "is_read": False}
     session = SimpleNamespace(
         store_identity=lambda: store, list_notifications=lambda: [notice.copy()]
@@ -12271,7 +12557,8 @@ def test_v1_prepare_ordinary_cleanup_stage_retries_after_persistence_failure(
         ch.v1_prepare_ordinary_cleanup_stage(session)
     assert not (tmp_path / "v1-notification-backend").exists()
     assert ch.v1_prepare_ordinary_cleanup_stage(session) == {
-        "store_id": store, "items": []
+        "store_id": store,
+        "items": [],
     }
 
 
@@ -12282,11 +12569,18 @@ def test_v1_cleanup_stage_recovers_saved_inventory_after_state_loss(
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     (tmp_path / "v1-enabled").write_text("enabled")
-    ch.save_state({"v1": {"destinations": {
-        ch.v1_destination_key(workspace, surface): {
-            "notification_id": "owned", "store_id": store
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {
+                    ch.v1_destination_key(workspace, surface): {
+                        "notification_id": "owned",
+                        "store_id": store,
+                    }
+                }
+            }
         }
-    }}})
+    )
     session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
     inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
     ch.STATE_PATH.unlink()
@@ -12305,11 +12599,18 @@ def test_v1_cleanup_stage_merges_unfenced_inventory_after_interruption(
         tmp_path / "v1-ordinary-cleanup.json", {"store_id": store, "items": [old]}
     )
     other_surface = str(uuid.uuid4())
-    ch.save_state({"v1": {"destinations": {
-        ch.v1_destination_key(workspace, other_surface): {
-            "notification_id": "new", "store_id": store
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {
+                    ch.v1_destination_key(workspace, other_surface): {
+                        "notification_id": "new",
+                        "store_id": store,
+                    }
+                }
+            }
         }
-    }}})
+    )
     session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
     inventory = ch.v1_prepare_ordinary_cleanup_stage(session)
     assert {item["id"] for item in inventory["items"]} == {"old", "new"}
@@ -12320,16 +12621,24 @@ def test_v1_cleanup_stage_rejects_conflicting_unfenced_inventory(monkeypatch, tm
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     (tmp_path / "v1-enabled").write_text("enabled")
-    previous = {"store_id": store, "items": [
-        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
-    ]}
+    previous = {
+        "store_id": store,
+        "items": [{"id": "owned", "workspace_id": workspace, "surface_id": surface}],
+    }
     journal = tmp_path / "v1-ordinary-cleanup.json"
     ch.v1_prepare_ordinary_cleanup(journal, previous)
-    ch.save_state({"v1": {"destinations": {
-        ch.v1_destination_key(workspace, str(uuid.uuid4())): {
-            "notification_id": "owned", "store_id": store
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {
+                    ch.v1_destination_key(workspace, str(uuid.uuid4())): {
+                        "notification_id": "owned",
+                        "store_id": store,
+                    }
+                }
+            }
         }
-    }}})
+    )
     session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
     with pytest.raises(ValueError, match="conflicting cleanup notification"):
         ch.v1_prepare_ordinary_cleanup_stage(session)
@@ -12372,8 +12681,9 @@ def test_v1_cleanup_stage_rejects_saved_inventory_from_another_store(
         tmp_path / "v1-ordinary-cleanup.json",
         {"store_id": str(uuid.uuid4()), "items": []},
     )
-    session = SimpleNamespace(store_identity=lambda: str(uuid.uuid4()),
-                              list_notifications=list)
+    session = SimpleNamespace(
+        store_identity=lambda: str(uuid.uuid4()), list_notifications=list
+    )
     with pytest.raises(ValueError, match="store identity"):
         ch.v1_prepare_ordinary_cleanup_stage(session)
 
@@ -12387,10 +12697,13 @@ def test_v1_cleanup_stage_rejects_unidentified_legacy_notification(
     ch.save_state({"v1": {"destinations": {}}})
     session = SimpleNamespace(
         store_identity=lambda: str(uuid.uuid4()),
-        list_notifications=lambda: [{
-            "id": str(uuid.uuid4()), "subtitle": ch.NOTIFICATION_SUBTITLE,
-            "is_read": False,
-        }],
+        list_notifications=lambda: [
+            {
+                "id": str(uuid.uuid4()),
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "is_read": False,
+            }
+        ],
     )
     with pytest.raises(ValueError, match="unidentified legacy notification"):
         ch.v1_prepare_ordinary_cleanup_stage(session)
@@ -12412,13 +12725,18 @@ def test_v1_cleanup_stage_recognizes_owned_row_after_interrupted_publish(
     )
     session = SimpleNamespace(
         store_identity=lambda: store,
-        list_notifications=lambda: [{
-            "id": str(uuid.uuid4()), "subtitle": ch.NOTIFICATION_SUBTITLE,
-            "is_read": False, "owned_producer_id": producer.upper(),
-        }],
+        list_notifications=lambda: [
+            {
+                "id": str(uuid.uuid4()),
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "is_read": False,
+                "owned_producer_id": producer.upper(),
+            }
+        ],
     )
     assert ch.v1_prepare_ordinary_cleanup_stage(session, producer=producer) == {
-        "store_id": store, "items": []
+        "store_id": store,
+        "items": [],
     }
 
 
@@ -12432,10 +12750,14 @@ def test_v1_cleanup_stage_does_not_adopt_another_producers_notification(
     ch.save_state({"v1": {"destinations": {}}})
     session = SimpleNamespace(
         store_identity=lambda: store,
-        list_notifications=lambda: [{
-            "id": str(uuid.uuid4()), "subtitle": ch.NOTIFICATION_SUBTITLE,
-            "is_read": False, "owned_producer_id": str(uuid.uuid4()),
-        }],
+        list_notifications=lambda: [
+            {
+                "id": str(uuid.uuid4()),
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "is_read": False,
+                "owned_producer_id": str(uuid.uuid4()),
+            }
+        ],
     )
     with pytest.raises(ValueError, match="unidentified legacy notification"):
         ch.v1_prepare_ordinary_cleanup_stage(session, producer=producer)
@@ -12458,7 +12780,8 @@ def test_v1_cleanup_stage_lists_after_publication_is_fenced(monkeypatch, tmp_pat
         store_identity=lambda: store, list_notifications=list_notifications
     )
     assert ch.v1_prepare_ordinary_cleanup_stage(session) == {
-        "store_id": store, "items": []
+        "store_id": store,
+        "items": [],
     }
 
 
@@ -12469,13 +12792,24 @@ def test_v1_cleanup_stage_drains_and_retries_from_durable_inventory(
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     (tmp_path / "v1-enabled").write_text("enabled")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    ch.save_state({"v1": {"destinations": {
-        ch.v1_destination_key(workspace, surface): {
-            "notification_id": "owned", "store_id": store
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {
+                    ch.v1_destination_key(workspace, surface): {
+                        "notification_id": "owned",
+                        "store_id": store,
+                    }
+                }
+            }
         }
-    }}})
-    notice = {"id": "owned", "workspace_id": workspace,
-              "surface_id": surface, "is_read": False}
+    )
+    notice = {
+        "id": "owned",
+        "workspace_id": workspace,
+        "surface_id": surface,
+        "is_read": False,
+    }
     attempts = []
 
     def mark(_notice_id):
@@ -12486,7 +12820,8 @@ def test_v1_cleanup_stage_drains_and_retries_from_durable_inventory(
         return True
 
     session = SimpleNamespace(
-        store_identity=lambda: store, list_notifications=lambda: [notice],
+        store_identity=lambda: store,
+        list_notifications=lambda: [notice],
         mark_notification_read=mark,
     )
     assert not ch.v1_drain_ordinary_cleanup_stage(session)
@@ -12611,19 +12946,23 @@ def test_v1_owned_transition_orders_prepare_publish_drain_and_commit(
         ch, "v1_publisher_identity", lambda *args, **kwargs: {"producer": producer}
     )
     monkeypatch.setattr(
-        ch, "v1_prepare_ordinary_cleanup_stage",
+        ch,
+        "v1_prepare_ordinary_cleanup_stage",
         lambda current, **kwargs: calls.append(("prepare", kwargs["producer"])),
     )
     monkeypatch.setattr(
-        ch, "v1_drain_ordinary_cleanup_stage",
+        ch,
+        "v1_drain_ordinary_cleanup_stage",
         lambda current, **kwargs: calls.append(("drain", kwargs["producer"])) or True,
     )
     monkeypatch.setattr(
-        ch, "v1_publish_owned_once",
+        ch,
+        "v1_publish_owned_once",
         lambda *args, **kwargs: calls.append(("publish", kwargs)) or receipt,
     )
     monkeypatch.setattr(
-        ch, "v1_commit_owned_backend",
+        ch,
+        "v1_commit_owned_backend",
         lambda *args: calls.append(("commit", args[2])) or True,
     )
     assert ch.v1_transition_owned_backend(session, publisher, verification)
@@ -12650,11 +12989,17 @@ def test_v1_owned_transition_runs_over_one_socket(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     (tmp_path / "v1-enabled").write_text("enabled")
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    ch.save_state({"v1": {
-        "destinations": {},
-        "clients": {"c": {"workspace": workspace, "surface": surface, "source": "a"}},
-        "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
-    }})
+    ch.save_state(
+        {
+            "v1": {
+                "destinations": {},
+                "clients": {
+                    "c": {"workspace": workspace, "surface": surface, "source": "a"}
+                },
+                "sources": {"a": {"attention": {"p": {"status": "blocked"}}}},
+            }
+        }
+    )
     sock_path = short_sock_path(uuid.uuid4().hex[:8])
     ready = threading.Event()
     requests = []
@@ -12675,9 +13020,16 @@ def test_v1_owned_transition_runs_over_one_socket(monkeypatch, tmp_path):
                         result = {"notifications": []}
                     else:
                         result = {"state": None}
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": result,
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "ok": True,
+                                "result": result,
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -12720,7 +13072,8 @@ def test_v1_cleanup_stage_accepts_initialized_state_without_destinations(
     store = str(uuid.uuid4())
     session = SimpleNamespace(store_identity=lambda: store, list_notifications=list)
     assert ch.v1_prepare_ordinary_cleanup_stage(session) == {
-        "store_id": store, "items": []
+        "store_id": store,
+        "items": [],
     }
 
 
@@ -12860,18 +13213,26 @@ def test_v1_ordinary_cleanup_inventory_pins_ids_and_rejects_conflicts():
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     first = ch.v1_destination_key(workspace, surface)
     alias = ch.v1_destination_key(workspace.upper(), surface.upper())
-    state = {"v1": {"destinations": {
-        first: {"notification_id": "notice-a", "store_id": store},
-        alias: {"notification_id": "notice-b", "store_id": store},
-    }}}
+    state = {
+        "v1": {
+            "destinations": {
+                first: {"notification_id": "notice-a", "store_id": store},
+                alias: {"notification_id": "notice-b", "store_id": store},
+            }
+        }
+    }
     inventory = ch.v1_ordinary_cleanup_inventory(state, store)
-    assert inventory == {"store_id": store, "items": [
-        {"workspace_id": workspace, "surface_id": surface, "id": "notice-a"},
-        {"workspace_id": workspace, "surface_id": surface, "id": "notice-b"},
-    ]}
+    assert inventory == {
+        "store_id": store,
+        "items": [
+            {"workspace_id": workspace, "surface_id": surface, "id": "notice-a"},
+            {"workspace_id": workspace, "surface_id": surface, "id": "notice-b"},
+        ],
+    }
     other = ch.v1_destination_key(str(uuid.uuid4()), surface)
     state["v1"]["destinations"][other] = {
-        "notification_id": "notice-a", "store_id": store
+        "notification_id": "notice-a",
+        "store_id": store,
     }
     with pytest.raises(ValueError, match="conflicting notification"):
         ch.v1_ordinary_cleanup_inventory(state, store)
@@ -12999,7 +13360,8 @@ def test_v1_ordinary_cleanup_inventory_skips_empty_destination():
     workspace, surface, store = (str(uuid.uuid4()) for _ in range(3))
     state = {"v1": {"destinations": {ch.v1_destination_key(workspace, surface): {}}}}
     assert ch.v1_ordinary_cleanup_inventory(state, store) == {
-        "store_id": store, "items": []
+        "store_id": store,
+        "items": [],
     }
 
 
@@ -13007,9 +13369,9 @@ def test_v1_ordinary_cleanup_inventory_rejects_object_destination_key():
     workspace, surface = str(uuid.uuid4()), str(uuid.uuid4())
     key = json.dumps({workspace: "ignored", surface: "ignored"})
     store = str(uuid.uuid4())
-    state = {"v1": {"destinations": {key: {
-        "notification_id": "owned", "store_id": store
-    }}}}
+    state = {
+        "v1": {"destinations": {key: {"notification_id": "owned", "store_id": store}}}
+    }
     with pytest.raises(ValueError, match="invalid notification target"):
         ch.v1_ordinary_cleanup_inventory(state, store)
 
@@ -13017,33 +13379,50 @@ def test_v1_ordinary_cleanup_inventory_rejects_object_destination_key():
 @pytest.mark.parametrize("recorded", [None, "other-store"])
 def test_v1_ordinary_cleanup_rejects_unproven_store(recorded):
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    state = {"v1": {"destinations": {
-        ch.v1_destination_key(workspace, surface): {
-            "notification_id": "owned", "store_id": recorded,
+    state = {
+        "v1": {
+            "destinations": {
+                ch.v1_destination_key(workspace, surface): {
+                    "notification_id": "owned",
+                    "store_id": recorded,
+                }
+            }
         }
-    }}}
+    }
     with pytest.raises(ValueError, match="unproven notification store"):
         ch.v1_ordinary_cleanup_inventory(state, store)
 
 
 def test_v1_ordinary_cleanup_reads_only_recorded_ids_and_verifies():
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    inventory = {"store_id": store, "items": [
-        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
-    ]}
-    notice = {"id": "owned", "workspace_id": workspace,
-              "surface_id": surface, "is_read": False}
-    foreign = {"id": "foreign", "workspace_id": workspace,
-               "surface_id": surface, "is_read": False}
+    inventory = {
+        "store_id": store,
+        "items": [{"id": "owned", "workspace_id": workspace, "surface_id": surface}],
+    }
+    notice = {
+        "id": "owned",
+        "workspace_id": workspace,
+        "surface_id": surface,
+        "is_read": False,
+    }
+    foreign = {
+        "id": "foreign",
+        "workspace_id": workspace,
+        "surface_id": surface,
+        "is_read": False,
+    }
     calls = []
+
     def mark(notice_id):
         calls.append(notice_id)
         notice["is_read"] = True
         return True
 
-    session = SimpleNamespace(store_identity=lambda: store,
-                              list_notifications=lambda: [notice, foreign],
-                              mark_notification_read=mark)
+    session = SimpleNamespace(
+        store_identity=lambda: store,
+        list_notifications=lambda: [notice, foreign],
+        mark_notification_read=mark,
+    )
     assert ch.v1_drain_ordinary_cleanup(session, inventory)
     assert calls == ["owned"]
     assert not foreign["is_read"]
@@ -13051,11 +13430,16 @@ def test_v1_ordinary_cleanup_reads_only_recorded_ids_and_verifies():
 
 def test_v1_ordinary_cleanup_preserves_obligation_on_failure():
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    inventory = {"store_id": store, "items": [
-        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
-    ]}
-    notice = {"id": "owned", "workspace_id": workspace,
-              "surface_id": surface, "is_read": False}
+    inventory = {
+        "store_id": store,
+        "items": [{"id": "owned", "workspace_id": workspace, "surface_id": surface}],
+    }
+    notice = {
+        "id": "owned",
+        "workspace_id": workspace,
+        "surface_id": surface,
+        "is_read": False,
+    }
     calls = []
     session = SimpleNamespace(
         store_identity=lambda: store,
@@ -13074,11 +13458,16 @@ def test_v1_ordinary_cleanup_preserves_obligation_on_failure():
 @pytest.mark.parametrize("variant", ["wrong-target", "invalid-read", "duplicate"])
 def test_v1_ordinary_cleanup_rejects_ambiguous_listing(variant):
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
-    inventory = {"store_id": store, "items": [
-        {"id": "owned", "workspace_id": workspace, "surface_id": surface}
-    ]}
-    notice = {"id": "owned", "workspace_id": workspace,
-              "surface_id": surface, "is_read": False}
+    inventory = {
+        "store_id": store,
+        "items": [{"id": "owned", "workspace_id": workspace, "surface_id": surface}],
+    }
+    notice = {
+        "id": "owned",
+        "workspace_id": workspace,
+        "surface_id": surface,
+        "is_read": False,
+    }
     if variant == "wrong-target":
         notice["surface_id"] = str(uuid.uuid4())
     elif variant == "invalid-read":
@@ -13098,11 +13487,16 @@ def test_v1_ordinary_cleanup_uses_one_socket_for_store_and_mutation():
     import threading
 
     store, workspace, surface, notice_id = (str(uuid.uuid4()) for _ in range(4))
-    inventory = {"store_id": store, "items": [
-        {"id": notice_id, "workspace_id": workspace, "surface_id": surface}
-    ]}
-    notice = {"id": notice_id, "workspace_id": workspace,
-              "surface_id": surface, "is_read": False}
+    inventory = {
+        "store_id": store,
+        "items": [{"id": notice_id, "workspace_id": workspace, "surface_id": surface}],
+    }
+    notice = {
+        "id": notice_id,
+        "workspace_id": workspace,
+        "surface_id": surface,
+        "is_read": False,
+    }
     sock_path = short_sock_path(uuid.uuid4().hex[:8])
     ready, requests = threading.Event(), []
 
@@ -13124,9 +13518,16 @@ def test_v1_ordinary_cleanup_uses_one_socket_for_store_and_mutation():
                         result = {"marked_read": 1}
                     else:
                         result = {"notifications": [notice]}
-                    conn.sendall(json.dumps({
-                        "id": request["id"], "ok": True, "result": result,
-                    }).encode() + b"\n")
+                    conn.sendall(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "ok": True,
+                                "result": result,
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -13136,8 +13537,10 @@ def test_v1_ordinary_cleanup_uses_one_socket_for_store_and_mutation():
             assert ch.v1_drain_ordinary_cleanup(session, inventory)
         worker.join(5)
         assert [request["method"] for request in requests] == [
-            "notification.state.info", "notification.list",
-            "notification.mark_read", "notification.list",
+            "notification.state.info",
+            "notification.list",
+            "notification.mark_read",
+            "notification.list",
         ]
         assert requests[2]["params"] == {"id": notice_id}
     finally:
@@ -13147,14 +13550,16 @@ def test_v1_ordinary_cleanup_uses_one_socket_for_store_and_mutation():
 def test_v1_ordinary_cleanup_retries_partial_progress():
     store, workspace, surface = (str(uuid.uuid4()) for _ in range(3))
     notices = [
-        {"id": item, "workspace_id": workspace, "surface_id": surface,
-         "is_read": False}
+        {"id": item, "workspace_id": workspace, "surface_id": surface, "is_read": False}
         for item in ("first", "second")
     ]
-    inventory = {"store_id": store, "items": [
-        {"id": item["id"], "workspace_id": workspace, "surface_id": surface}
-        for item in notices
-    ]}
+    inventory = {
+        "store_id": store,
+        "items": [
+            {"id": item["id"], "workspace_id": workspace, "surface_id": surface}
+            for item in notices
+        ],
+    }
     calls = []
     fail = [True]
 
@@ -15890,15 +16295,19 @@ def test_v1_activation_releases_lock_when_retirement_is_busy(monkeypatch, tmp_pa
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     pid_path = tmp_path / "remote.pid"
     monkeypatch.setattr(
-        ch, "retire_v1_legacy_daemons",
+        ch,
+        "retire_v1_legacy_daemons",
         lambda plan: ch.stop_v1_legacy_daemon(pid_path, "remote", plan),
     )
     monkeypatch.setattr(ch, "restart_legacy_daemons", lambda plan: None)
     result = []
+
     def activate():
-        result.append(ch._activate_v1_client_once(
-            "c", "source", "w", "s", None, ch.threading.Event()
-        ))
+        result.append(
+            ch._activate_v1_client_once(
+                "c", "source", "w", "s", None, ch.threading.Event()
+            )
+        )
 
     with open(tmp_path / "remote.lock", "w") as daemon_lock:
         ch.fcntl.flock(daemon_lock, ch.fcntl.LOCK_EX)
@@ -15943,9 +16352,9 @@ def test_v1_activation_replays_event_when_retirement_fails(monkeypatch, tmp_path
     event = status_event("p", "w", "done")
 
     def retire(plan):
-        ch.save_state({
-            "v1_pending_legacy_events": [{"session": "work", "event": event}]
-        })
+        ch.save_state(
+            {"v1_pending_legacy_events": [{"session": "work", "event": event}]}
+        )
         return False
 
     monkeypatch.setattr(ch, "retire_v1_legacy_daemons", retire)

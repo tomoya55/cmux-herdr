@@ -174,8 +174,10 @@ def _v1_check_publisher_directory(info):
 @contextmanager
 def _v1_publisher_lock(directory_fd, name):
     lock_fd = os.open(
-        f".{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-        0o600, dir_fd=directory_fd,
+        f".{name}.lock",
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+        dir_fd=directory_fd,
     )
     try:
         info = os.fstat(lock_fd)
@@ -205,8 +207,10 @@ def _v1_publisher_identity_at(path, directory_fd, store_id, *, create):
         }
         temporary = f".publisher-{uuid.uuid4()}"
         fd = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600, dir_fd=directory_fd,
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as file:
@@ -239,17 +243,26 @@ def _v1_publisher_identity_at(path, directory_fd, store_id, *, create):
     finally:
         os.close(fd)
     if not isinstance(identity, dict) or set(identity) != {
-        "store_id", "producer", "epoch", "capability", "phase", "revision",
-        "destinations", "pending"
+        "store_id",
+        "producer",
+        "epoch",
+        "capability",
+        "phase",
+        "revision",
+        "destinations",
+        "pending",
     }:
         raise ValueError("invalid publisher identity")
-    if not all(isinstance(identity[key], str) for key in (
-        "store_id", "producer", "epoch", "capability", "phase", "revision"
-    )):
+    if not all(
+        isinstance(identity[key], str)
+        for key in ("store_id", "producer", "epoch", "capability", "phase", "revision")
+    ):
         raise ValueError("invalid publisher identity")
-    if identity["phase"] not in {"bootstrap", "active"} or not isinstance(
-        identity["destinations"], list
-    ) or not (identity["pending"] is None or isinstance(identity["pending"], str)):
+    if (
+        identity["phase"] not in {"bootstrap", "active"}
+        or not isinstance(identity["destinations"], list)
+        or not (identity["pending"] is None or isinstance(identity["pending"], str))
+    ):
         raise ValueError("invalid publisher journal")
     try:
         revision = int(identity["revision"])
@@ -307,9 +320,11 @@ def v1_owned_set_request(identity, revision, destinations):
         raise ValueError("invalid notification destinations")
     seen = set()
     for destination in destinations:
-        if not isinstance(destination, dict) or set(destination) != {
-            "workspace_id", "surface_id", "title", "body"
-        } or not all(isinstance(value, str) for value in destination.values()):
+        if (
+            not isinstance(destination, dict)
+            or set(destination) != {"workspace_id", "surface_id", "title", "body"}
+            or not all(isinstance(value, str) for value in destination.values())
+        ):
             raise ValueError("invalid notification destination")
         try:
             key = (
@@ -402,7 +417,8 @@ def v1_publisher_prepare_register(path, store_id):
 def v1_publisher_ack_register(path, store_id, pending):
     with _v1_locked_publisher_journal(path, store_id) as (path, fd, info, journal):
         if (
-            journal["phase"] != "bootstrap" or journal["pending"] is None
+            journal["phase"] != "bootstrap"
+            or journal["pending"] is None
             or journal["pending"].encode("utf-8") != pending
         ):
             raise ValueError("pending publisher request changed")
@@ -435,7 +451,9 @@ def v1_publisher_prepare_resume(path, store_id, *, expected_epoch, rejected_set=
 
 def _v1_validate_resumed_state(journal, state):
     if not isinstance(state, dict) or set(state) != {
-        "epoch", "revision", "destinations"
+        "epoch",
+        "revision",
+        "destinations",
     }:
         raise ValueError("invalid resumed state")
     try:
@@ -452,15 +470,19 @@ def _v1_validate_resumed_state(journal, state):
             raise ValueError("writer epoch did not change")
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         raise ValueError("invalid resumed state") from exc
-    return {"epoch": new_epoch, "revision": str(revision),
-            "destinations": copy.deepcopy(state["destinations"])}
+    return {
+        "epoch": new_epoch,
+        "revision": str(revision),
+        "destinations": copy.deepcopy(state["destinations"]),
+    }
 
 
 def v1_publisher_ack_resume(path, store_id, pending, state):
     """Persist the fenced writer epoch and acknowledged state together."""
     with _v1_locked_publisher_journal(path, store_id) as (path, fd, info, journal):
         if (
-            journal["phase"] != "active" or journal["pending"] is None
+            journal["phase"] != "active"
+            or journal["pending"] is None
             or journal["pending"].encode("utf-8") != pending
             or json.loads(pending).get("action") != "resume"
         ):
@@ -532,8 +554,10 @@ def _v1_write_publisher_journal(path, directory_fd, info, journal):
         raise ValueError("publisher journal exceeds size limit")
     temporary = f".publisher-{uuid.uuid4()}"
     fd = os.open(
-        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600, dir_fd=directory_fd,
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
     )
     try:
         with os.fdopen(fd, "wb") as file:
@@ -604,7 +628,9 @@ def v1_publisher_recover(path, store_id, send):
             # verification. Fence its epoch and recover the committed state;
             # later publication derives a new update from verified state.
             pending = v1_publisher_prepare_resume(
-                path, store_id, expected_epoch=expected_epoch,
+                path,
+                store_id,
+                expected_epoch=expected_epoch,
                 rejected_set=pending,
             )
             result = send(pending)
@@ -725,7 +751,11 @@ class V1OwnedPublisher:
                 return {
                     key: copy.deepcopy(journal[key])
                     for key in (
-                        "store_id", "producer", "epoch", "revision", "destinations"
+                        "store_id",
+                        "producer",
+                        "epoch",
+                        "revision",
+                        "destinations",
                     )
                 }
             return True
@@ -776,7 +806,8 @@ class V1OwnedPublisher:
         try:
             result = (
                 self.send_guarded(pending, send_guard)
-                if send_guard is not None else self.send(pending)
+                if send_guard is not None
+                else self.send(pending)
             )
             if result != {"state": None}:
                 raise ValueError("invalid update response")
@@ -784,7 +815,9 @@ class V1OwnedPublisher:
             if error.code != "target_denied":
                 raise
             resume = v1_publisher_prepare_resume(
-                self.path, self.store_id, expected_epoch=self.epoch,
+                self.path,
+                self.store_id,
+                expected_epoch=self.epoch,
                 rejected_set=pending,
             )
             self._finish_resume(resume)
@@ -810,7 +843,10 @@ class V1OwnedPublisher:
         if self._resume_ack is not None:
             pending, state = self._resume_ack
             with _v1_locked_publisher_journal(self.path, self.store_id) as (
-                _path, fd, _info, saved
+                _path,
+                fd,
+                _info,
+                saved,
             ):
                 already_saved = (
                     isinstance(state, dict)
@@ -836,7 +872,9 @@ class V1OwnedPublisher:
             journal = v1_publisher_identity(self.path, self.store_id, create=False)
         if journal["pending"] is not None:
             pending = v1_publisher_prepare_resume(
-                self.path, self.store_id, expected_epoch=self.epoch,
+                self.path,
+                self.store_id,
+                expected_epoch=self.epoch,
                 rejected_set=journal["pending"].encode("utf-8"),
             )
             self._finish_resume(pending)
@@ -846,12 +884,13 @@ class V1OwnedPublisher:
     def _publish(self, destinations, *, send_guard=None, force=False):
         journal = self._recover_pending()
         desired = v1_owned_set_request(journal, 0, destinations)["destinations"]
-        current = v1_owned_set_request(
-            journal, 0, journal["destinations"]
-        )["destinations"]
+        current = v1_owned_set_request(journal, 0, journal["destinations"])[
+            "destinations"
+        ]
 
         def order(item):
             return item["workspace_id"], item["surface_id"]
+
         if not force and sorted(desired, key=order) == sorted(current, key=order):
             return False
         pending = v1_publisher_prepare_set(
@@ -880,10 +919,13 @@ def v1_owned_publisher(path, store_id, send, *, send_guarded=None):
         OWNED_PUBLISHER_IDENTITY.reset(identity_token)
         OWNED_PUBLISHER_DIRECTORY.reset(token)
     producer = str(uuid.UUID(identity["producer"]))
-    digests = sorted({
-        hashlib.sha256(value.encode()).hexdigest()
-        for value in (absolute_path, resolved_path)
-    } | {hashlib.sha256(f"producer:{store_id}:{producer}".encode()).hexdigest()})
+    digests = sorted(
+        {
+            hashlib.sha256(value.encode()).hexdigest()
+            for value in (absolute_path, resolved_path)
+        }
+        | {hashlib.sha256(f"producer:{store_id}:{producer}".encode()).hexdigest()}
+    )
     home = os.path.realpath(_v1_publisher_lease_home())
     home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -908,7 +950,8 @@ def v1_owned_publisher(path, store_id, send, *, send_guarded=None):
                 lock_fd = os.open(
                     f"cmux-herdr-owned-{os.getuid()}-{digest}.lock",
                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                    0o600, dir_fd=directory_fd,
+                    0o600,
+                    dir_fd=directory_fd,
                 )
                 locks.callback(os.close, lock_fd)
                 lock_info = os.fstat(lock_fd)
@@ -943,7 +986,8 @@ def _v1_owned_publisher_locked(path, store_id, send, expected_producer, send_gua
         lock_fd = os.open(
             f".{path.name}.leader.lock",
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-            0o600, dir_fd=directory_fd,
+            0o600,
+            dir_fd=directory_fd,
         )
         try:
             lock_info = os.fstat(lock_fd)
@@ -4333,8 +4377,14 @@ def v1_owned_destinations(state):
             raise ValueError("invalid publisher attention state")
         title = v1_attention_title(attention)
         if title is not None:
-            result.append({"workspace_id": workspace, "surface_id": surface,
-                           "title": title, "body": ""})
+            result.append(
+                {
+                    "workspace_id": workspace,
+                    "surface_id": surface,
+                    "title": title,
+                    "body": "",
+                }
+            )
     return result
 
 
@@ -4378,16 +4428,22 @@ def _v1_owned_publication_snapshot(verification, previous, *, require_complete=F
                 else:
                     for target in scope:
                         expected = {
-                            key: spec for key, spec in desired.items()
+                            key: spec
+                            for key, spec in desired.items()
                             if (
                                 spec["workspace"].casefold(),
                                 spec["surface"].casefold(),
-                            ) == target
+                            )
+                            == target
                         }
                         actual = {
-                            key for key, client in v1["clients"].items()
-                            if (str(client.get("workspace", "")).casefold(),
-                                str(client.get("surface", "")).casefold()) == target
+                            key
+                            for key, client in v1["clients"].items()
+                            if (
+                                str(client.get("workspace", "")).casefold(),
+                                str(client.get("surface", "")).casefold(),
+                            )
+                            == target
                         }
                         if (
                             actual != set(expected)
@@ -4402,15 +4458,17 @@ def _v1_owned_publication_snapshot(verification, previous, *, require_complete=F
                 destinations = v1_owned_destinations(state)
             else:
                 clients = {
-                    key: client for key, client in v1["clients"].items()
+                    key: client
+                    for key, client in v1["clients"].items()
                     if (client["workspace"].casefold(), client["surface"].casefold())
                     in scope
                 }
-                destinations = v1_owned_destinations({"v1": {
-                    "clients": clients, "sources": v1["sources"]
-                }})
+                destinations = v1_owned_destinations(
+                    {"v1": {"clients": clients, "sources": v1["sources"]}}
+                )
                 destinations.extend(
-                    item for item in previous()
+                    item
+                    for item in previous()
                     if (item["workspace_id"].casefold(), item["surface_id"].casefold())
                     not in scope
                 )
@@ -4425,7 +4483,8 @@ def v1_publish_owned_once(
         raise ValueError("publication receipt requires a guarded forced update")
     if getattr(publisher, "send_guarded", None) is None:
         with _v1_owned_publication_snapshot(
-            verification, getattr(publisher, "current_destinations", lambda: []),
+            verification,
+            getattr(publisher, "current_destinations", lambda: []),
             require_complete=require_complete,
         ) as destinations:
             if destinations is None:
@@ -5118,12 +5177,16 @@ def v1_activation_lock():
         lock_fd = os.open(
             "v1-activation.lock",
             os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-            0o600, dir_fd=directory_fd,
+            0o600,
+            dir_fd=directory_fd,
         )
         try:
             lock_info = os.fstat(lock_fd)
-            if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
-                    or lock_info.st_mode & 0o022):
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != os.getuid()
+                or lock_info.st_mode & 0o022
+            ):
                 raise ValueError("invalid activation lock")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             token = ACTIVATION_DIRECTORY.set((directory.st_dev, directory.st_ino))
@@ -5273,16 +5336,19 @@ def v1_write_activation_marker(value):
     directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         info = os.fstat(directory_fd)
-        if ACTIVATION_DIRECTORY.get() is not None and (
-            info.st_dev, info.st_ino
-        ) != ACTIVATION_DIRECTORY.get():
+        if (
+            ACTIVATION_DIRECTORY.get() is not None
+            and (info.st_dev, info.st_ino) != ACTIVATION_DIRECTORY.get()
+        ):
             raise ValueError("activation directory changed")
         if info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise ValueError("invalid activation directory")
         temporary = f".activation-{uuid.uuid4()}"
         fd = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600, dir_fd=directory_fd,
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
         )
         try:
             with os.fdopen(fd, "wb") as file:
@@ -5292,8 +5358,12 @@ def v1_write_activation_marker(value):
             current = os.stat(state_dir, follow_symlinks=False)
             if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
                 raise ValueError("activation directory changed")
-            os.replace(temporary, "v1-enabled", src_dir_fd=directory_fd,
-                       dst_dir_fd=directory_fd)
+            os.replace(
+                temporary,
+                "v1-enabled",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
             os.fsync(directory_fd)
             current = os.stat(state_dir, follow_symlinks=False)
             if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
@@ -5749,6 +5819,7 @@ def v1_maybe_supervisor_handoff(cfg, sources, stop, verified, environment):
         ) as session:
             store_id = session.store_identity()
             uuid.UUID(store_id)
+
             def ready_for_handoff():
                 with state_lock():
                     try:
@@ -5765,7 +5836,10 @@ def v1_maybe_supervisor_handoff(cfg, sources, stop, verified, environment):
             if not ready_for_handoff():
                 return False
             return v1_try_supervisor_handoff(
-                cfg, sources, stop, final_check=ready_for_handoff,
+                cfg,
+                sources,
+                stop,
+                final_check=ready_for_handoff,
             )
     except (OSError, SocketError, ValueError, TypeError, AttributeError):
         return False
@@ -6062,9 +6136,12 @@ def v1_resolved_unproven_destinations(state, visible):
     if not isinstance(destinations, dict):
         raise ValueError("invalid ordinary notification state")
     return {
-        entry["notification_id"] for entry in destinations.values()
-        if isinstance(entry, dict) and isinstance(entry.get("notification_id"), str)
-        and not entry.get("store_id") and entry["notification_id"] not in unread
+        entry["notification_id"]
+        for entry in destinations.values()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("notification_id"), str)
+        and not entry.get("store_id")
+        and entry["notification_id"] not in unread
     }
 
 
@@ -6081,9 +6158,11 @@ def v1_ordinary_cleanup_inventory(state, store_id, *, resolved_unproven=frozense
     for key, entry in destinations.items():
         if entry == {}:
             continue
-        if not isinstance(entry, dict) or not isinstance(
-            entry.get("notification_id"), str
-        ) or not entry["notification_id"]:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("notification_id"), str)
+            or not entry["notification_id"]
+        ):
             raise ValueError("unidentified notification")
         if not entry.get("store_id") and entry["notification_id"] in resolved_unproven:
             continue
@@ -6104,10 +6183,13 @@ def v1_ordinary_cleanup_inventory(state, store_id, *, resolved_unproven=frozense
         if notification_id in items and items[notification_id] != target:
             raise ValueError("conflicting notification target")
         items[notification_id] = target
-    return {"store_id": store, "items": [
-        {"workspace_id": target[0], "surface_id": target[1], "id": notice_id}
-        for notice_id, target in sorted(items.items())
-    ]}
+    return {
+        "store_id": store,
+        "items": [
+            {"workspace_id": target[0], "surface_id": target[1], "id": notice_id}
+            for notice_id, target in sorted(items.items())
+        ],
+    }
 
 
 def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False):
@@ -6115,7 +6197,8 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
     path = Path(path)
     encoded = (
         json.dumps(inventory, separators=(",", ":")).encode("utf-8")
-        if inventory is not None else None
+        if inventory is not None
+        else None
     )
     if encoded is not None and len(encoded) > 10 * 1024 * 1024:
         raise ValueError("cleanup inventory exceeds size limit")
@@ -6128,8 +6211,10 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
             if encoded is not None:
                 temporary = f".cleanup-{uuid.uuid4()}"
                 fd = os.open(
-                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600, dir_fd=directory_fd,
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
                 )
                 try:
                     with os.fdopen(fd, "wb") as file:
@@ -6138,21 +6223,26 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
                         os.fsync(file.fileno())
                     with suppress(FileExistsError):
                         os.link(
-                            temporary, path.name,
-                            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                            temporary,
+                            path.name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
                         )
                     os.fsync(directory_fd)
                 finally:
                     os.unlink(temporary, dir_fd=directory_fd)
             fd = os.open(
-                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                 dir_fd=directory_fd,
             )
             try:
                 info = os.fstat(fd)
                 if (
-                    not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_size > 10 * 1024 * 1024
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077
+                    or info.st_size > 10 * 1024 * 1024
                 ):
                     raise ValueError("invalid cleanup inventory file")
                 with os.fdopen(fd, "rb", closefd=False) as file:
@@ -6162,7 +6252,8 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
                     path.name, dir_fd=directory_fd, follow_symlinks=False
                 )
                 if (current_file.st_dev, current_file.st_ino) != (
-                    info.st_dev, info.st_ino
+                    info.st_dev,
+                    info.st_ino,
                 ):
                     raise ValueError("cleanup inventory file changed")
                 os.fsync(directory_fd)
@@ -6458,9 +6549,7 @@ def v1_prepare_owned_backend(*, preflight=None):
             return False
         if preflight is not None:
             preflight()
-        directory_fd = os.open(
-            state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        )
+        directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             info = os.fstat(directory_fd)
             if info.st_uid != os.getuid() or info.st_mode & 0o022:
@@ -6468,8 +6557,10 @@ def v1_prepare_owned_backend(*, preflight=None):
             name = "v1-notification-backend"
             temporary = f".backend-{uuid.uuid4()}"
             fd = os.open(
-                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600, dir_fd=directory_fd,
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
             )
             try:
                 with os.fdopen(fd, "wb") as file:
@@ -6477,16 +6568,25 @@ def v1_prepare_owned_backend(*, preflight=None):
                     file.flush()
                     os.fsync(file.fileno())
                 with suppress(FileExistsError):
-                    os.link(temporary, name, src_dir_fd=directory_fd,
-                            dst_dir_fd=directory_fd)
+                    os.link(
+                        temporary,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
             finally:
                 os.unlink(temporary, dir_fd=directory_fd)
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                         dir_fd=directory_fd)
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+            )
             try:
                 marker = os.fstat(fd)
-                if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.getuid()
-                        or marker.st_mode & 0o077 or marker.st_size > 32):
+                if (
+                    not stat.S_ISREG(marker.st_mode)
+                    or marker.st_uid != os.getuid()
+                    or marker.st_mode & 0o077
+                    or marker.st_size > 32
+                ):
                     raise ValueError("invalid notification backend file")
                 value = os.read(fd, 33).decode("utf-8")
                 os.fsync(fd)
@@ -6496,7 +6596,8 @@ def v1_prepare_owned_backend(*, preflight=None):
                 os.fsync(directory_fd)
                 current_dir = os.stat(state_dir, follow_symlinks=False)
                 if (current_dir.st_dev, current_dir.st_ino) != (
-                    info.st_dev, info.st_ino
+                    info.st_dev,
+                    info.st_ino,
                 ):
                     raise ValueError("notification backend directory changed")
                 if value == "owned":
@@ -6504,8 +6605,10 @@ def v1_prepare_owned_backend(*, preflight=None):
                 if value == "ordinary":
                     temporary = f".backend-{uuid.uuid4()}"
                     replacement = os.open(
-                        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600, dir_fd=directory_fd,
+                        temporary,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
                     )
                     try:
                         with os.fdopen(replacement, "wb") as file:
@@ -6516,15 +6619,21 @@ def v1_prepare_owned_backend(*, preflight=None):
                             name, dir_fd=directory_fd, follow_symlinks=False
                         )
                         if (current.st_dev, current.st_ino) != (
-                            marker.st_dev, marker.st_ino
+                            marker.st_dev,
+                            marker.st_ino,
                         ):
                             raise ValueError("notification backend file changed")
-                        os.replace(temporary, name, src_dir_fd=directory_fd,
-                                   dst_dir_fd=directory_fd)
+                        os.replace(
+                            temporary,
+                            name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                        )
                         os.fsync(directory_fd)
                         current_dir = os.stat(state_dir, follow_symlinks=False)
                         if (current_dir.st_dev, current_dir.st_ino) != (
-                            info.st_dev, info.st_ino
+                            info.st_dev,
+                            info.st_ino,
                         ):
                             raise ValueError("notification backend directory changed")
                     finally:
@@ -6551,8 +6660,12 @@ def v1_notification_backend():
         return "ordinary"
     try:
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_size > 32):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or info.st_size > 32
+        ):
             raise ValueError("invalid notification backend file")
         return os.read(fd, 33).decode("utf-8")
     finally:
@@ -6606,10 +6719,13 @@ def v1_prepare_ordinary_cleanup_stage(session, *, producer=None):
                 ):
                     raise ValueError("conflicting cleanup notification target")
                 combined = {**old_targets, **new_targets}
-                inventory = {"store_id": store_id, "items": [
-                    {"id": key, "workspace_id": target[0], "surface_id": target[1]}
-                    for key, target in sorted(combined.items())
-                ]}
+                inventory = {
+                    "store_id": store_id,
+                    "items": [
+                        {"id": key, "workspace_id": target[0], "surface_id": target[1]}
+                        for key, target in sorted(combined.items())
+                    ],
+                }
         else:
             raise ValueError("owned backend preparation is unavailable")
         tracked = {item["id"] for item in inventory["items"]}
@@ -6629,14 +6745,18 @@ def v1_prepare_ordinary_cleanup_stage(session, *, producer=None):
                 if producer_id is not None and owner == producer_id:
                     continue
             if (
-                not item["is_read"] and is_our_notification(item)
+                not item["is_read"]
+                and is_our_notification(item)
                 and item.get("id") not in tracked
             ):
                 raise ValueError("unidentified legacy notification")
-        prepared.append(v1_prepare_ordinary_cleanup(
-            state_dir / "v1-ordinary-cleanup.json", inventory,
-            replace_unfenced=backend == "ordinary",
-        ))
+        prepared.append(
+            v1_prepare_ordinary_cleanup(
+                state_dir / "v1-ordinary-cleanup.json",
+                inventory,
+                replace_unfenced=backend == "ordinary",
+            )
+        )
 
     if not v1_prepare_owned_backend(preflight=preflight):
         raise ValueError("owned backend preparation is unavailable")
@@ -6709,25 +6829,33 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
             try:
                 directory = os.fstat(directory_fd)
                 if (directory.st_dev, directory.st_ino) != (
-                    pinned.st_dev, pinned.st_ino
+                    pinned.st_dev,
+                    pinned.st_ino,
                 ):
                     raise ValueError("notification backend directory changed")
                 name = "v1-notification-backend"
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                             dir_fd=directory_fd)
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_fd,
+                )
                 try:
                     marker = os.fstat(fd)
-                    if (not stat.S_ISREG(marker.st_mode)
-                            or marker.st_uid != os.getuid()
-                            or marker.st_mode & 0o077 or marker.st_size > 32
-                            or os.read(fd, 33).decode("utf-8") != backend):
+                    if (
+                        not stat.S_ISREG(marker.st_mode)
+                        or marker.st_uid != os.getuid()
+                        or marker.st_mode & 0o077
+                        or marker.st_size > 32
+                        or os.read(fd, 33).decode("utf-8") != backend
+                    ):
                         raise ValueError("invalid notification backend file")
                     os.fsync(fd)
                     current_marker = os.stat(
                         name, dir_fd=directory_fd, follow_symlinks=False
                     )
                     if (marker.st_dev, marker.st_ino) != (
-                        current_marker.st_dev, current_marker.st_ino
+                        current_marker.st_dev,
+                        current_marker.st_ino,
                     ):
                         raise ValueError("notification backend file changed")
                     if backend == "preparing-owned":
@@ -6735,7 +6863,8 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
                         replacement = os.open(
                             temporary,
                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                            0o600, dir_fd=directory_fd,
+                            0o600,
+                            dir_fd=directory_fd,
                         )
                         try:
                             with os.fdopen(replacement, "wb") as file:
@@ -6747,16 +6876,22 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
                                 name, dir_fd=directory_fd, follow_symlinks=False
                             )
                             if (marker.st_dev, marker.st_ino) != (
-                                current_marker.st_dev, current_marker.st_ino
+                                current_marker.st_dev,
+                                current_marker.st_ino,
                             ):
                                 raise ValueError("notification backend file changed")
-                            os.replace(temporary, name, src_dir_fd=directory_fd,
-                                       dst_dir_fd=directory_fd)
+                            os.replace(
+                                temporary,
+                                name,
+                                src_dir_fd=directory_fd,
+                                dst_dir_fd=directory_fd,
+                            )
                             current_marker = os.stat(
                                 name, dir_fd=directory_fd, follow_symlinks=False
                             )
                             if (installed.st_dev, installed.st_ino) != (
-                                current_marker.st_dev, current_marker.st_ino
+                                current_marker.st_dev,
+                                current_marker.st_ino,
                             ):
                                 raise ValueError("notification backend file changed")
                         finally:
@@ -6767,7 +6902,8 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
                     os.close(fd)
                 current_dir = os.stat(state_dir, follow_symlinks=False)
                 if (current_dir.st_dev, current_dir.st_ino) != (
-                    directory.st_dev, directory.st_ino
+                    directory.st_dev,
+                    directory.st_ino,
                 ):
                     raise ValueError("notification backend directory changed")
                 return True
@@ -6854,7 +6990,11 @@ def v1_workspace_inputs_current(snapshot, workspace):
 
 
 def publish_v1_clients_once(
-    cfg, *, eligible_destinations=None, eligibility_check=None, workspace_check=None,
+    cfg,
+    *,
+    eligible_destinations=None,
+    eligibility_check=None,
+    workspace_check=None,
     notifications=True,
 ):
     with state_lock():
@@ -7384,15 +7524,20 @@ def _v1_owned_socket_frame(pending, method="notification.state.command"):
     if not isinstance(pending, bytes) or len(pending) > 3 * 1024 * 1024:
         raise ValueError("invalid owned notification request size")
     if (
-        b"\n" in pending or b"\r" in pending
+        b"\n" in pending
+        or b"\r" in pending
         or not isinstance(json.loads(pending), dict)
     ):
         raise ValueError("invalid owned notification request")
     request_id = str(uuid.uuid4())
     request = (
-        b'{"id":' + json.dumps(request_id).encode("ascii")
-        + b',"method":' + json.dumps(method).encode("ascii")
-        + b',"params":' + pending + b"}\n"
+        b'{"id":'
+        + json.dumps(request_id).encode("ascii")
+        + b',"method":'
+        + json.dumps(method).encode("ascii")
+        + b',"params":'
+        + pending
+        + b"}\n"
     )
     return request_id, request
 
@@ -7430,9 +7575,9 @@ class V1OwnedSocketSession:
             self.conn.connect(str(self.path))
             if self.password is not None:
                 self._timeout(deadline)
-                self.conn.sendall(self._wrap(
-                    b"auth " + self.password.encode("utf-8") + b"\n"
-                ))
+                self.conn.sendall(
+                    self._wrap(b"auth " + self.password.encode("utf-8") + b"\n")
+                )
                 if not self._read_line(deadline).startswith(b"OK"):
                     raise SocketError("cmux authentication failed")
             return self
@@ -7466,8 +7611,10 @@ class V1OwnedSocketSession:
     def _wrap(self, request):
         if self.capability is not None:
             request = (
-                b"_cmux_capability_v1 " + self.capability.encode("utf-8")
-                + b" " + request
+                b"_cmux_capability_v1 "
+                + self.capability.encode("utf-8")
+                + b" "
+                + request
             )
         return request
 
@@ -7609,7 +7756,9 @@ def v1_owned_socket_transport(path, environment, account_home):
         else:
             v1_publisher_identity(path, store_id, create=False)
         with v1_owned_publisher(
-            path, store_id, session.request,
+            path,
+            store_id,
+            session.request,
             send_guarded=session.request_with_send_guard,
         ) as publisher:
             if publisher is not None:
@@ -9505,7 +9654,8 @@ def _activate_v1_client_once(
             return False
         finally:
             if (
-                not registered and not already_enabled
+                not registered
+                and not already_enabled
                 and _v1_rollback_legacy_events_and_marker_locked()
             ):
                 _v1_check_activation_directory()
