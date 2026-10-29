@@ -944,10 +944,130 @@ def apply_v1_snapshot(
             if pane_id not in live:
                 attention.pop(pane_id, None)
                 panes.pop(pane_id, None)
+                source.get("retired_blocked", {}).pop(pane_id, None)
 
 
 def new_v1_episode_id():
     return uuid.uuid4().hex
+
+
+def v1_reconcile_absent_agents(
+    state, source_id, generation, before, agents, panes, after
+):
+    """Retire blocked attention only with a stable, sequenced absence proof."""
+    source = state.get("v1", {}).get("sources", {}).get(source_id, {})
+    attention, tracked = source.get("attention", {}), source.get("panes", {})
+    if any(
+        not isinstance(snapshot.get("agents"), list)
+        or not isinstance(snapshot.get("panes"), list)
+        for snapshot in (before, after)
+    ):
+        return
+    if any(
+        not isinstance(item, dict) or not isinstance(item.get("pane_id"), str)
+        for collection in (
+            before["agents"],
+            after["agents"],
+            before["panes"],
+            after["panes"],
+            agents,
+            panes,
+        )
+        for item in collection
+    ):
+        return
+
+    def unique_panes(items):
+        result = {}
+        for item in items:
+            pane_id = item["pane_id"]
+            if pane_id in result:
+                return None
+            result[pane_id] = item
+        return result
+
+    snapshots = [
+        unique_panes(items) for items in (before["panes"], panes, after["panes"])
+    ]
+    if any(snapshot is None for snapshot in snapshots):
+        return
+    active = {
+        item["pane_id"]
+        for collection in (before["agents"], agents, after["agents"])
+        for item in collection
+    }
+    retired = source.setdefault("retired_blocked", {})
+    for pane_id in snapshots[-1]:
+        if pane_id in active:
+            continue
+        observations = [snapshot.get(pane_id) for snapshot in snapshots]
+        if any(not isinstance(pane, dict) for pane in observations):
+            continue
+        terminal = observations[0].get("terminal_id")
+        sequence = observations[0].get("state_change_seq")
+        if (
+            not isinstance(terminal, str)
+            or not terminal
+            or type(sequence) is not int
+            or sequence < 0
+            or any(
+                pane.get("terminal_id") != terminal
+                or pane.get("state_change_seq") != sequence
+                or pane.get("agent") is not None
+                or pane.get("agent_status") not in ("idle", "unknown")
+                for pane in observations
+            )
+        ):
+            continue
+        prior = retired.get(pane_id, {})
+        if (
+            prior.get("generation") == generation
+            and prior.get("terminal_id") == terminal
+            and type(prior.get("sequence")) is int
+            and prior["sequence"] > sequence
+        ):
+            continue
+        retired[pane_id] = {
+            "generation": generation,
+            "terminal_id": terminal,
+            "sequence": sequence,
+        }
+        current = attention.get(pane_id, {})
+        if (
+            current.get("generation") == generation
+            and current.get("terminal_id") == terminal
+            and type(current.get("sequence")) is int
+            and current["sequence"] >= sequence
+        ):
+            continue
+        if current.get("terminal_id") not in (None, terminal):
+            attention.pop(pane_id, None)
+        elif (
+            current.get("status") == "blocked"
+            and current.get("generation") == generation
+            and current.get("terminal_id") == terminal
+            and type(current.get("sequence")) is int
+            and current["sequence"] < sequence
+        ):
+            attention[pane_id] = {
+                "sequence": current["sequence"],
+                "generation": generation,
+                "terminal_id": terminal,
+            }
+        tracked[pane_id] = {
+            "workspace_id": observations[-1].get("workspace_id", ""),
+            "terminal_id": terminal,
+            "status": observations[-1]["agent_status"],
+            "completion_seq": None,
+            "agent": tracked.get(pane_id, {}).get("agent", "agent")
+            if current.get("status") == "done"
+            else "agent",
+            "title": tracked.get(pane_id, {}).get("title", "")
+            if current.get("status") == "done"
+            else observations[-1].get("terminal_title_stripped")
+            or observations[-1].get("title")
+            or "",
+        }
 
 
 def apply_v1_status_event(state, source_id, data, event_boot=None):
@@ -978,6 +1098,15 @@ def apply_v1_status_event(state, source_id, data, event_boot=None):
             or not source.get("cursor_generation")
         ):
             return False
+        retired = source.get("retired_blocked", {}).get(pane_id, {})
+        if (
+            status == "blocked"
+            and retired.get("generation") == source["cursor_generation"]
+            and retired.get("terminal_id") == terminal
+            and type(retired.get("sequence")) is int
+            and sequence <= retired["sequence"]
+        ):
+            return True
         watermark = current.get("sequence")
         if type(watermark) is int and sequence <= watermark:
             generation = source["cursor_generation"]
@@ -2078,6 +2207,10 @@ def refresh_v1_source(
             reconnect=reconnect,
             boot_id=before_boot if verified_boot else None,
         )
+        if verified_boot:
+            v1_reconcile_absent_agents(
+                candidate, source_id, episode_generation, before, agents, panes, after
+            )
         if verified_boot:
             candidate["v1"]["sources"][source_id]["server_boot_id"] = before_boot
         else:
@@ -5096,6 +5229,7 @@ def v1_subscriptions(pane_ids):
     subs.extend(
         {"type": event}
         for event in (
+            "pane.agent_detected",
             "pane.updated",
             "pane.focused",
             "pane.moved",
@@ -5291,6 +5425,17 @@ def v1_watch_connection(
                     persist_v1_ack_event(source_id, msg.get("data") or {}, event_boot)
                     and on_change
                 ):
+                    on_change()
+            elif event == "pane_agent_detected":
+                if not sync_v1_source(source_id, generation, sock_path, **sync_options):
+                    raise SocketError(
+                        "Herdr snapshot failed after agent lifecycle event"
+                    )
+                if event_boot and not v1_subscription_matches_source(
+                    source_id, event_boot
+                ):
+                    raise SocketError("Herdr subscription server changed")
+                if on_change is not None:
                     on_change()
     finally:
         conn.close()
