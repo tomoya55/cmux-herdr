@@ -4887,7 +4887,7 @@ def test_v1_focus_observation_requires_matching_socket_peer(monkeypatch):
     monkeypatch.setattr(
         ch,
         "v1_read_client_response",
-        lambda path, expected_peer=None: seen.append(expected_peer),
+        lambda path, expected_peer=None, timeout=2: seen.append(expected_peer),
     )
     assert ch.v1_client_observation("/tmp/client.sock", 42) is None
     assert seen == [42]
@@ -5001,7 +5001,7 @@ def test_v1_upstream_client_inventory_requires_unique_stable_server(monkeypatch)
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 200)
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
     monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
     output = "\n".join(
         [
@@ -5034,7 +5034,7 @@ def test_v1_upstream_client_inventory_rejects_api_only_connection(monkeypatch):
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 200)
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
     monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
     output = "\n".join(
         [
@@ -5058,7 +5058,7 @@ def test_v1_upstream_client_inventory_rejects_unidentified_connection(monkeypatc
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 200)
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
     monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
     output = "\n".join(
         [
@@ -5086,7 +5086,9 @@ def test_v1_upstream_client_inventory_allows_unrelated_running_server(monkeypatc
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
     monkeypatch.setattr(
-        ch, "v1_unix_peer_pid", lambda path: 200 if path == "/tmp/a.sock" else 300
+        ch,
+        "v1_unix_peer_pid",
+        lambda path, **kwargs: 200 if path == "/tmp/a.sock" else 300,
     )
     monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
 
@@ -5101,6 +5103,28 @@ def test_v1_upstream_client_inventory_allows_unrelated_running_server(monkeypatc
         100, 42, ["/tmp/b.sock", "/tmp/a.sock"]
     )
     assert result["sources"][0]["api_socket_path"] == "/tmp/a.sock"
+
+
+def test_v1_upstream_client_inventory_skips_disappeared_unrelated_server(monkeypatch):
+    monkeypatch.setattr(
+        ch,
+        "v1_native_process_info",
+        lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
+    )
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+
+    def generation(path):
+        if path == "/tmp/stale.sock":
+            raise FileNotFoundError(path)
+        return "1:2"
+
+    monkeypatch.setattr(ch, "v1_local_generation", generation)
+    output = "p100\nf4\nd0x111\nn->0x222\np200\nf9\nd0x222\nn/tmp/herdr-client.sock\n"
+    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
+    result = ch.v1_upstream_local_client_inventory(
+        100, 42, ["/tmp/stale.sock", "/tmp/herdr.sock"]
+    )
+    assert result["sources"][0]["api_socket_path"] == "/tmp/herdr.sock"
 
 
 def test_v1_running_local_socket_paths_rejects_ambiguous_session_list(monkeypatch):
@@ -5203,6 +5227,86 @@ def test_v1_discovery_uses_verified_upstream_local_client(monkeypatch, tmp_path)
         tree, [tmp_path], upstream_sockets=lambda: ["/tmp/herdr.sock"]
     )
     assert not result["complete"]
+
+
+def test_discovery_excludes_only_verified_ttyless_herdr_server(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 42)
+    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: False)
+    monkeypatch.setattr(
+        ch, "v1_native_process_info", lambda pid: {"pid": pid, "start_token": 5}
+    )
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    tree = {
+        "windows": [
+            {
+                "workspaces": [
+                    {
+                        "id": "w",
+                        "panes": [
+                            {
+                                "surfaces": [
+                                    {
+                                        "id": "s",
+                                        "type": "terminal",
+                                        "tty": "tty",
+                                        "processes": [
+                                            {
+                                                "pid": 200,
+                                                "name": "herdr",
+                                                "tty_device": None,
+                                                "children": [],
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    result = ch.v1_discover_clients_in_tree(
+        tree, [tmp_path], upstream_sockets=lambda: ["/tmp/herdr.sock"]
+    )
+    assert result["complete"]
+    assert result["clients"] == []
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 201)
+    assert not ch.v1_discover_clients_in_tree(
+        tree, [tmp_path], upstream_sockets=lambda: ["/tmp/herdr.sock"]
+    )["complete"]
+
+
+def test_server_verification_continues_past_stale_socket(monkeypatch):
+    monkeypatch.setattr(
+        ch, "v1_native_process_info", lambda pid: {"pid": pid, "start_token": 5}
+    )
+
+    def generation(path):
+        if path == "/stale":
+            raise FileNotFoundError(path)
+        return "1:2"
+
+    monkeypatch.setattr(ch, "v1_local_generation", generation)
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    assert ch.v1_is_verified_local_server(
+        200, ["/stale", "/live"], deadline=time.monotonic() + 5
+    )
+
+
+def test_local_socket_provider_uses_remaining_scan_budget(monkeypatch):
+    monkeypatch.setattr(ch.time, "monotonic", lambda: 100.0)
+    received = []
+    monkeypatch.setattr(
+        ch,
+        "v1_running_local_socket_paths",
+        lambda *, timeout: received.append(timeout) or [],
+    )
+    provider = ch.v1_local_socket_provider(100.25)
+    assert provider() == []
+    assert provider() == []
+    assert received == [0.25]
 
 
 def test_v1_source_inventory_accepts_only_local_verified_socket_without_boot():
@@ -9173,7 +9277,9 @@ def test_v1_foreground_observation_requires_one_observable_herdr(monkeypatch, tm
         ch, "v1_observer_socket_exists", lambda path: int(path.stem) in available
     )
     monkeypatch.setattr(
-        ch, "v1_client_observation", lambda path, pid: {"pid": pid, "instance": "i"}
+        ch,
+        "v1_client_observation",
+        lambda path, pid, **kwargs: {"pid": pid, "instance": "i"},
     )
     assert ch.v1_foreground_observation(processes, [tmp_path]) == {
         "pid": 20,
@@ -9184,7 +9290,7 @@ def test_v1_foreground_observation_requires_one_observable_herdr(monkeypatch, tm
     available.add(30)
     assert ch.v1_foreground_observation(processes, [tmp_path]) is None
     del processes[30]
-    monkeypatch.setattr(ch, "v1_client_observation", lambda path, pid: None)
+    monkeypatch.setattr(ch, "v1_client_observation", lambda path, pid, **kwargs: None)
     assert ch.v1_foreground_observation(processes, [tmp_path]) is None
 
 
@@ -9196,11 +9302,51 @@ def test_v1_foreground_observation_accepts_remote_parent_and_client(
         21: {"pid": 21, "ppid": 20, "name": "herdr", "path": "/bin/herdr"},
     }
     monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: path.stem == "21")
-    monkeypatch.setattr(ch, "v1_client_observation", lambda path, pid: {"pid": pid})
+    monkeypatch.setattr(
+        ch, "v1_client_observation", lambda path, pid, **kwargs: {"pid": pid}
+    )
     assert ch.v1_foreground_observation(processes, [tmp_path]) == {"pid": 21}
     processes[20]["ppid"] = 21
     processes[21]["ppid"] = 10
     assert ch.v1_foreground_observation(processes, [tmp_path]) is None
+
+
+def test_v1_foreground_observation_ignores_verified_ttyless_server(
+    monkeypatch, tmp_path
+):
+    processes = {
+        20: {"pid": 20, "ppid": 1, "name": "herdr", "tty_device": None},
+        21: {"pid": 21, "ppid": 10, "name": "herdr", "tty_device": 42},
+    }
+    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: path.stem == "21")
+    monkeypatch.setattr(
+        ch, "v1_client_observation", lambda path, pid, **kwargs: {"pid": pid}
+    )
+    monkeypatch.setattr(
+        ch, "v1_is_verified_local_server", lambda pid, paths, **kwargs: pid == 20
+    )
+    assert ch.v1_foreground_observation(
+        processes,
+        [tmp_path],
+        upstream_sockets=lambda: ["/source"],
+        deadline=time.monotonic() + 5,
+    ) == {"pid": 21}
+
+
+def test_v1_foreground_observation_does_not_query_after_deadline(monkeypatch, tmp_path):
+    processes = {21: {"pid": 21, "ppid": 10, "name": "herdr", "tty_device": 42}}
+    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: True)
+    calls = []
+    monkeypatch.setattr(
+        ch, "v1_client_observation", lambda *args, **kwargs: calls.append(args)
+    )
+    assert (
+        ch.v1_foreground_observation(
+            processes, [tmp_path], deadline=time.monotonic() - 1
+        )
+        is None
+    )
+    assert calls == []
 
 
 def test_v1_surface_observation_requests_both_cmux_ids(monkeypatch):
@@ -9213,7 +9359,7 @@ def test_v1_surface_observation_requests_both_cmux_ids(monkeypatch):
         ),
     )
     monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
-    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args: None)
+    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args, **kwargs: None)
     ch.v1_surface_observation({}, "workspace-uuid", "surface-uuid")
     assert (
         "--id-format" in calls[0]
@@ -9234,7 +9380,9 @@ def test_v1_surface_observation_requires_current_native_ownership(monkeypatch):
     )
     monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
     observation = {"pid": 42, "instance": "i", "observation": {}}
-    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args: observation)
+    monkeypatch.setattr(
+        ch, "v1_foreground_observation", lambda *args, **kwargs: observation
+    )
     record = {"connection_id": "bound"}
     client = {
         "pid": 42,
@@ -9244,7 +9392,7 @@ def test_v1_surface_observation_requires_current_native_ownership(monkeypatch):
         "native_ownership": record,
     }
     scan = {"complete": True, "clients": [client]}
-    monkeypatch.setattr(ch, "v1_discover_clients_in_tree", lambda *args: scan)
+    monkeypatch.setattr(ch, "v1_discover_clients_in_tree", lambda *args, **kwargs: scan)
     assert ch.v1_surface_observation({}, "w", "s") == {
         **observation,
         "native_ownership": record,
@@ -9277,9 +9425,11 @@ def test_v1_surface_observation_ignores_unrelated_surfaces(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(tree)),
     )
     monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
-    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args: observation)
+    monkeypatch.setattr(
+        ch, "v1_foreground_observation", lambda *args, **kwargs: observation
+    )
 
-    def scan(value, directories):
+    def scan(value, directories, **kwargs):
         surfaces = [
             s
             for w in value["windows"]
@@ -16407,7 +16557,9 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
             "agent_state_change_seq": 7,
         },
     }
-    monkeypatch.setattr(ch, "v1_client_observation", lambda path, pid: observation)
+    monkeypatch.setattr(
+        ch, "v1_client_observation", lambda path, pid, **kwargs: observation
+    )
     monkeypatch.setattr(
         ch,
         "socket_rpc",

@@ -2464,8 +2464,8 @@ def v1_read_client_response(path, expected_peer=None, *, timeout=2):
         return None
 
 
-def v1_client_observation(path, pid):
-    response = v1_read_client_response(path, expected_peer=pid)
+def v1_client_observation(path, pid, *, timeout=2):
+    response = v1_read_client_response(path, expected_peer=pid, timeout=timeout)
     return response if valid_v1_client_observation(response, pid) else None
 
 
@@ -2516,6 +2516,36 @@ def v1_lsof_processes_connected(peers, client_pid, server_pid, client_path=None)
     return any(peer in servers for _, peer, _ in peers.get(client_pid, set()) if peer)
 
 
+def v1_is_verified_local_server(pid, socket_paths, *, deadline):
+    """Identify a Herdr API server without treating unknown processes as servers."""
+    try:
+        before = v1_native_process_info(pid)
+        if before is None:
+            return False
+        for path in socket_paths:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                generation = v1_local_generation(path)
+                if v1_unix_peer_pid(path, timeout=min(remaining, 1)) != pid:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                verified = (
+                    v1_native_process_info(pid) == before
+                    and v1_local_generation(path) == generation
+                    and v1_unix_peer_pid(path, timeout=min(remaining, 1)) == pid
+                )
+                return verified and time.monotonic() < deadline
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    return False
+
+
 def v1_upstream_local_client_inventory(pid, tty_device, socket_paths, *, deadline=None):
     """Identify one live local Herdr connection using kernel socket peers."""
     before_client = v1_native_process_info(pid)
@@ -2529,10 +2559,26 @@ def v1_upstream_local_client_inventory(pid, tty_device, socket_paths, *, deadlin
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            generation = v1_local_generation(path)
-            server_pid = v1_unix_peer_pid(path)
+            try:
+                generation = v1_local_generation(path)
+            except FileNotFoundError:
+                continue
+            server_pid = v1_unix_peer_pid(path, timeout=min(remaining, 1))
+            if server_pid is None:
+                try:
+                    v1_local_generation(path)
+                except FileNotFoundError:
+                    continue
+                return None
             before_server = v1_native_process_info(server_pid)
             if before_server is None:
+                try:
+                    v1_local_generation(path)
+                except FileNotFoundError:
+                    continue
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
             output = v1_bounded_command_output(
                 ["lsof", "-n", "-F", "pfdn", "-a", "-p", f"{pid},{server_pid}", "-U"],
@@ -2542,10 +2588,14 @@ def v1_upstream_local_client_inventory(pid, tty_device, socket_paths, *, deadlin
             if output is None:
                 return None
             peers = v1_parse_lsof_unix_peers(output)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
             if v1_native_process_info(pid) != before_client or (
                 v1_native_process_info(server_pid) != before_server
                 or v1_local_generation(path) != generation
-                or v1_unix_peer_pid(path) != server_pid
+                or v1_unix_peer_pid(path, timeout=min(remaining, 1)) != server_pid
+                or time.monotonic() >= deadline
             ):
                 return None
             client_path = str(Path(path).with_name(f"{Path(path).stem}-client.sock"))
@@ -3232,6 +3282,15 @@ def v1_discover_clients_in_tree(
                             ):
                                 continue
                             if type(process.get("tty_device")) is not int:
+                                paths = (
+                                    upstream_sockets()
+                                    if upstream_sockets is not None
+                                    else None
+                                )
+                                if paths is not None and v1_is_verified_local_server(
+                                    pid, paths, deadline=deadline
+                                ):
+                                    continue
                                 complete = False
                                 surface_complete[key] = False
                                 continue
@@ -3451,12 +3510,7 @@ def v1_discover_clients(cfg):
     ]
     scans = []
     deadline = time.monotonic() + 20
-    upstream_cache = []
-
-    def upstream_sockets():
-        if not upstream_cache:
-            upstream_cache.append(v1_running_local_socket_paths())
-        return upstream_cache[0]
+    upstream_sockets = v1_local_socket_provider(deadline)
 
     try:
         for _ in range(2):
@@ -3587,14 +3641,27 @@ def v1_discovered_targets(inventory):
     return targets
 
 
-def v1_foreground_observation(processes, directories):
+def v1_foreground_observation(
+    processes, directories, *, upstream_sockets=None, deadline=None
+):
     """Require exactly one Herdr client with one working observation socket."""
     if not isinstance(processes, dict):
         return None
     candidates = []
+    if deadline is None:
+        deadline = time.monotonic() + 20
     for pid, process in processes.items():
         name, path = process.get("name"), process.get("path")
         if name == "herdr" or isinstance(path, str) and Path(path).name == "herdr":
+            if (
+                type(process.get("tty_device")) is not int
+                and upstream_sockets is not None
+            ):
+                paths = upstream_sockets()
+                if paths is not None and v1_is_verified_local_server(
+                    pid, paths, deadline=deadline
+                ):
+                    continue
             candidates.append(pid)
     if not candidates:
         return None
@@ -3616,7 +3683,10 @@ def v1_foreground_observation(processes, directories):
         current = processes[current].get("ppid")
     if not set(candidates).issubset(ancestors):
         return None
-    return v1_client_observation(path, pid)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return v1_client_observation(path, pid, timeout=min(remaining, 2))
 
 
 def v1_cmux_identity(cfg, workspace_id, surface_id):
@@ -3659,13 +3729,18 @@ def v1_cmux_focus(cfg, workspace_id, surface_id):
     return (identity["focused"], identity["bundle"]) if identity else (False, None)
 
 
-def v1_unix_peer_pid(path):
+def v1_unix_peer_pid(path, *, timeout=1):
     """Read the owner PID of a macOS Unix socket connection."""
-    if sys.platform != "darwin" or not isinstance(path, str) or not path:
+    if (
+        sys.platform != "darwin"
+        or not isinstance(path, str)
+        or not path
+        or timeout <= 0
+    ):
         return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(1)
+            conn.settimeout(timeout)
             conn.connect(path)
             pid = conn.getsockopt(0, 2)  # Darwin SOL_LOCAL, LOCAL_PEERPID
             return pid if pid > 0 else None
@@ -3825,6 +3900,8 @@ def v1_verified_focus_episode(state, source_id, observation, snapshot):
 def v1_surface_observation(cfg, workspace_id, surface_id):
     """Read the sole foreground Herdr client in the given cmux surface."""
     binary = cfg.get("cmux_bin") or DEFAULT_CMUX_BIN
+    deadline = time.monotonic() + 20
+    upstream_sockets = v1_local_socket_provider(deadline)
     try:
         proc = run(
             [binary, "--id-format", "both", "top", "--all", "--processes", "--json"],
@@ -3840,7 +3917,9 @@ def v1_surface_observation(cfg, workspace_id, surface_id):
         directories = [
             state_home / name / "client-observers" for name in ("herdr", "herdr-dev")
         ]
-        observation = v1_foreground_observation(processes, directories)
+        observation = v1_foreground_observation(
+            processes, directories, upstream_sockets=upstream_sockets, deadline=deadline
+        )
         if not observation:
             return None
 
@@ -3880,7 +3959,9 @@ def v1_surface_observation(cfg, workspace_id, surface_id):
                 }
             ]
         }
-        scan = v1_discover_clients_in_tree(scoped, directories)
+        scan = v1_discover_clients_in_tree(
+            scoped, directories, upstream_sockets=upstream_sockets, deadline=deadline
+        )
         if not scan or not scan["complete"]:
             return None
         matches = [
@@ -9475,11 +9556,29 @@ def session_socket_path(session=None):
     return None
 
 
-def v1_running_local_socket_paths():
+def v1_local_socket_provider(deadline):
+    cache = []
+
+    def get_paths():
+        if not cache:
+            remaining = deadline - time.monotonic()
+            cache.append(
+                v1_running_local_socket_paths(timeout=min(remaining, 10))
+                if remaining > 0
+                else None
+            )
+        return cache[0]
+
+    return get_paths
+
+
+def v1_running_local_socket_paths(*, timeout=10):
     """Return the complete, unambiguous inventory of running local API sockets."""
     binary = os.environ.get("HERDR_BIN_PATH", "herdr")
     try:
-        proc = run([binary, "session", "list", "--json"])
+        if timeout <= 0:
+            return None
+        proc = run([binary, "session", "list", "--json"], timeout=timeout)
         if proc.returncode:
             return None
         sessions = json.loads(proc.stdout).get("sessions")
