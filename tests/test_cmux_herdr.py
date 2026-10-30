@@ -1772,7 +1772,7 @@ def test_v1_owned_supervisor_transitions_over_socket(monkeypatch, tmp_path):
         sock_path.unlink(missing_ok=True)
 
 
-def test_v1_supervisor_starts_and_joins_both_publishers(monkeypatch):
+def test_v1_supervisor_starts_and_joins_ordinary_publisher(monkeypatch):
     calls = []
 
     class Leases:
@@ -1809,9 +1809,7 @@ def test_v1_supervisor_starts_and_joins_both_publishers(monkeypatch):
     assert ch.v1_run_supervisor({}, stop)
     assert calls == [
         ("start", "v1_supervised_publish_loop"),
-        ("start", "v1_supervised_owned_publish_loop"),
         ("join", "v1_supervised_publish_loop"),
-        ("join", "v1_supervised_owned_publish_loop"),
         "sources closed",
         "leases closed",
     ]
@@ -2031,6 +2029,7 @@ def cfg():
 @pytest.fixture
 def cmux_calls(monkeypatch):
     calls = []
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: [])
 
     def fake_run(cmd, timeout=10):
         calls.append(cmd[1:])
@@ -2082,6 +2081,217 @@ def test_done_notifies_finished(cfg, state, cmux_calls):
     assert "claude: finished" in notify[0]
 
 
+def test_legacy_read_does_not_mark_unrelated_workspace_notifications(
+    cfg, state, cmux_calls
+):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    cmux_calls.clear()
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "idle"))
+    assert not [call for call in cmux_calls if call[0] == "mark-notification-read"]
+
+
+def test_legacy_notification_defers_when_an_unread_notice_exists(
+    monkeypatch, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(
+        ch, "cmux_notifications_checked", lambda cfg: [{"is_read": False}]
+    )
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+
+
+def test_legacy_notification_is_not_blocked_by_other_workspace(
+    monkeypatch, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(
+        ch,
+        "cmux_notifications_checked",
+        lambda cfg: [{"is_read": False, "workspace_id": "other"}],
+    )
+    monkeypatch.setattr(
+        ch, "legacy_workspace_aliases", lambda cfg, ref: {"workspace:1", "target"}
+    )
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    assert len([call for call in cmux_calls if call[0] == "notify"]) == 1
+
+
+def test_legacy_notification_defers_unread_with_empty_workspace(
+    monkeypatch, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(
+        ch,
+        "cmux_notifications_checked",
+        lambda cfg: [{"is_read": False, "workspace_id": ""}],
+    )
+    monkeypatch.setattr(
+        ch, "legacy_workspace_aliases", lambda cfg, ref: {"workspace:1", "target"}
+    )
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+
+
+def test_legacy_workspace_aliases_require_unique_identity(monkeypatch):
+    tree = {"windows": [{"workspaces": [{"id": "TARGET", "ref": "workspace:1"}]}]}
+    monkeypatch.setattr(
+        ch,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(tree)),
+    )
+    assert ch.legacy_workspace_aliases({}, "workspace:1") == {"target", "workspace:1"}
+    tree["windows"][0]["workspaces"].append({"id": "OTHER", "ref": "workspace:1"})
+    assert ch.legacy_workspace_aliases({}, "workspace:1") is None
+
+
+def test_legacy_notification_retries_when_other_notice_is_read(
+    monkeypatch, tmp_path, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "session_socket_path", lambda session=None: "/source.sock")
+    monkeypatch.setattr(
+        ch, "socket_rpc", lambda *args: {"agents": [remote_agent("w1:p1", "done")]}
+    )
+    visible = [{"is_read": False}]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: visible)
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    ch.save_state(state)
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+    visible.clear()
+    ch.retry_legacy_notifications(cfg)
+    assert len([call for call in cmux_calls if call[0] == "notify"]) == 1
+    ch.retry_legacy_notifications(cfg)
+    assert len([call for call in cmux_calls if call[0] == "notify"]) == 1
+
+
+def test_reconcile_preserves_pending_notification_for_same_attention(
+    monkeypatch, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(
+        ch, "cmux_notifications_checked", lambda cfg: [{"is_read": False}]
+    )
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    monkeypatch.setattr(
+        ch, "herdr_cli", lambda args: {"agents": [remote_agent("w1:p1", "blocked")]}
+    )
+    monkeypatch.setattr(ch, "clear_legacy_sidebar_logs", lambda *args: None)
+    monkeypatch.setattr(ch, "prune_dead_sessions", lambda *args: None)
+    monkeypatch.setattr(ch, "sweep_orphan_pills", lambda *args: None)
+    ch.reconcile(cfg, state)
+    assert state["sessions"][""]["workspaces"]["w1"]["panes"]["w1:p1"][
+        "notification_pending"
+    ]
+
+
+def test_reconcile_preserves_blocked_when_status_unknown(
+    monkeypatch, cfg, state, cmux_calls
+):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    monkeypatch.setattr(
+        ch, "herdr_cli", lambda args: {"agents": [remote_agent("w1:p1", "unknown")]}
+    )
+    monkeypatch.setattr(ch, "clear_legacy_sidebar_logs", lambda *args: None)
+    monkeypatch.setattr(ch, "prune_dead_sessions", lambda *args: None)
+    monkeypatch.setattr(ch, "sweep_orphan_pills", lambda *args: None)
+    ch.reconcile(cfg, state)
+    assert (
+        state["sessions"][""]["workspaces"]["w1"]["panes"]["w1:p1"]["status"]
+        == "blocked"
+    )
+
+
+def test_legacy_retry_loop_runs_until_stopped(monkeypatch):
+    stop = ch.threading.Event()
+    calls = []
+
+    def retry(cfg, *, session=None):
+        calls.append(cfg)
+        stop.set()
+
+    monkeypatch.setattr(ch, "retry_legacy_notifications", retry)
+    ch.legacy_retry_loop({"key": "value"}, stop)
+    assert calls == [{"key": "value"}]
+
+
+def test_legacy_discards_deferred_notification_after_wait_ends(
+    monkeypatch, tmp_path, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "session_socket_path", lambda session=None: "/source.sock")
+    monkeypatch.setattr(
+        ch, "socket_rpc", lambda *args: {"agents": [remote_agent("w1:p1", "working")]}
+    )
+    visible = [{"is_read": False}]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: visible)
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
+    ch.save_state(state)
+    visible.clear()
+    ch.retry_legacy_notifications(cfg)
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+
+
+def test_legacy_retry_requires_current_matching_status(
+    monkeypatch, tmp_path, cfg, state, cmux_calls
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    visible = [{"is_read": False}]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: visible)
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
+    ch.save_state(state)
+    visible.clear()
+    monkeypatch.setattr(ch, "session_socket_path", lambda session=None: "/source.sock")
+    monkeypatch.setattr(
+        ch, "socket_rpc", lambda *args: {"agents": [remote_agent("w1:p1", "idle")]}
+    )
+    ch.retry_legacy_notifications(cfg)
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+
+
+def test_legacy_retry_observes_agent_after_acquiring_state_lock(
+    monkeypatch, tmp_path, cfg
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(ch, "session_socket_path", lambda session=None: "/source.sock")
+    order = []
+
+    class Lock:
+        def __enter__(self):
+            order.append("lock")
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ch, "state_lock", Lock)
+    monkeypatch.setattr(
+        ch, "socket_rpc", lambda *args: order.append("observe") or {"agents": []}
+    )
+    ch.retry_legacy_notifications(cfg)
+    assert order == ["lock", "observe"]
+
+
+def test_legacy_unknown_status_preserves_waiting_attention(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "unknown"))
+    pane = state["sessions"][""]["workspaces"]["w1"]["panes"]["w1:p1"]
+    assert pane["status"] == "blocked"
+
+
+def test_watch_unknown_status_preserves_waiting_attention(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    ch.apply_watch_event(
+        cfg,
+        state,
+        "/source.sock",
+        status_event("w1:p1", "w1", "unknown")["data"],
+        tracked=False,
+    )
+    pane = state["sessions"][""]["workspaces"]["w1"]["panes"]["w1:p1"]
+    assert pane["status"] == "blocked"
+
+
 def test_done_sets_finished_pill(cfg, state, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "done"))
 
@@ -2106,7 +2316,7 @@ def test_viewing_finished_pane_clears_its_entries(cfg, state, cmux_calls):
     assert ["clear-status", "herdr.w1.w1_p1", "--workspace", "workspace:1"] in clears
     assert ["clear-status", "herdr.w1", "--workspace", "workspace:1"] in clears
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+    assert read == []
 
 
 def test_working_sets_pill_without_notification(cfg, state, cmux_calls):
@@ -2156,13 +2366,15 @@ def test_pane_closed_updates_pill(cfg, state, cmux_calls):
     assert pill[0][2] == "1 working"
 
 
-def test_leaving_attention_marks_notifications_read(cfg, state, cmux_calls):
+def test_leaving_attention_does_not_mark_unowned_notifications_read(
+    cfg, state, cmux_calls
+):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
     cmux_calls.clear()
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "working"))
 
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+    assert read == []
 
 
 def test_local_mark_read_respects_remote_attention(
@@ -2197,7 +2409,7 @@ def test_other_attention_pane_keeps_notifications_unread(cfg, state, cmux_calls)
     assert [c for c in cmux_calls if c[0] == "mark-notification-read"] == []
 
 
-def test_pane_closed_attention_marks_notifications_read(cfg, state, cmux_calls):
+def test_pane_closed_does_not_mark_unowned_notifications_read(cfg, state, cmux_calls):
     ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
     cmux_calls.clear()
     ch.handle_event(
@@ -2210,7 +2422,7 @@ def test_pane_closed_attention_marks_notifications_read(cfg, state, cmux_calls):
     )
 
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+    assert read == []
 
 
 def test_workspace_closed_clears_status(cfg, state, workspaces, cmux_calls):
@@ -2390,7 +2602,9 @@ def test_reconcile_defers_log_migration_when_cmux_unreachable(monkeypatch, cfg, 
     assert "legacy_log_cleared" not in state
 
 
-def test_workspace_focused_marks_notifications_read(cfg, state, cmux_calls):
+def test_workspace_focus_does_not_acknowledge_agent_attention(cfg, state, cmux_calls):
+    ch.handle_event(cfg, state, status_event("w1:p1", "w1", "blocked"))
+    cmux_calls.clear()
     ch.handle_event(
         cfg,
         state,
@@ -2400,7 +2614,7 @@ def test_workspace_focused_marks_notifications_read(cfg, state, cmux_calls):
         },
     )
 
-    assert cmux_calls == [["mark-notification-read", "--workspace", "workspace:1"]]
+    assert not any(call[0] == "mark-notification-read" for call in cmux_calls)
 
 
 def test_workspace_renamed_updates_label(cfg, state, workspaces, cmux_calls):
@@ -2651,7 +2865,7 @@ def test_reconcile_clears_stale_workspace(
         ["clear-status", "herdr.w1", "--workspace", "workspace:1"],
     ]
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:1"]]
+    assert read == []
 
 
 def reconcile_run(monkeypatch, responses, agents):
@@ -2712,7 +2926,7 @@ def test_reconcile_keeps_active_pill_keys(monkeypatch, cfg, state):
     assert [c for c in calls if c[0] == "clear-status"] == []
 
 
-def test_reconcile_marks_stale_notifications_read(monkeypatch, cfg, state):
+def test_reconcile_preserves_unidentified_notifications(monkeypatch, cfg, state):
     notifications = json.dumps(
         [
             {"id": "n1", "is_read": False, "title": "claude: waiting for input"},
@@ -2725,7 +2939,7 @@ def test_reconcile_marks_stale_notifications_read(monkeypatch, cfg, state):
     ch.reconcile(cfg, state)
 
     read = [c for c in calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--id", "n1"]]
+    assert read == []
 
 
 def test_reconcile_keeps_notifications_while_attention(monkeypatch, cfg, state):
@@ -2830,7 +3044,7 @@ def test_reconcile_prunes_ended_sessions(monkeypatch, cfg, state):
 
     assert "ghost" not in state["sessions"]
     assert ["clear-status", "herdr.w5", "--workspace", "workspace:5"] in calls
-    assert ["mark-notification-read", "--workspace", "workspace:5"] in calls
+    assert not any(c[0] == "mark-notification-read" for c in calls)
 
 
 def test_reconcile_keeps_sessions_when_liveness_unknown(monkeypatch, cfg, state):
@@ -2924,6 +3138,7 @@ def test_main_event_mode(monkeypatch, tmp_path, cfg):
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(ch, "config_dir", tmp_path)
     monkeypatch.setattr(ch, "load_config", lambda: cfg)
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: [])
     monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "event"])
     monkeypatch.setenv(
         "HERDR_PLUGIN_EVENT_JSON", json.dumps(status_event("w1:p1", "w1", "blocked"))
@@ -3049,7 +3264,9 @@ def test_remote_per_pane_pills(cmux_calls, remote_title_map):
     assert pane_pill[2] == "claude: waiting"
 
     cmux_calls.clear()
-    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, [], {})
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "idle")], {}
+    )
     clears = [c for c in cmux_calls if c[0] == "clear-status"]
     assert [
         "clear-status",
@@ -3096,7 +3313,80 @@ def test_remote_unchanged_snapshot_is_noop(cmux_calls, remote_title_map):
     assert cmux_calls == []
 
 
-def test_remote_leaving_attention_marks_read(cmux_calls, remote_title_map):
+def test_remote_retries_deferred_notification_when_other_notice_is_read(
+    monkeypatch, cmux_calls, remote_title_map
+):
+    visible = [{"is_read": False}]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: visible)
+    rstate = {"remotes": {}}
+    agents = [remote_agent("w1:p1", "blocked")]
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+    visible.clear()
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, agents, {})
+    assert len([call for call in cmux_calls if call[0] == "notify"]) == 1
+
+
+def test_remote_discards_deferred_notification_after_wait_ends(
+    monkeypatch, cmux_calls, remote_title_map
+):
+    visible = [{"is_read": False}]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: visible)
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
+    )
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "working")], {}
+    )
+    visible.clear()
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "working")], {}
+    )
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+
+
+def test_remote_does_not_retry_waiting_notification_for_missing_agent(
+    monkeypatch, cmux_calls, remote_title_map
+):
+    visible = [{"is_read": False}]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: visible)
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
+    )
+    visible.clear()
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, [], {})
+    assert not [call for call in cmux_calls if call[0] == "notify"]
+
+
+def test_remote_unknown_status_preserves_waiting_attention(
+    cmux_calls, remote_title_map
+):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
+    )
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "unknown")], {}
+    )
+    assert rstate["remotes"]["tom"]["panes"]["w1:p1"]["status"] == "blocked"
+
+
+def test_remote_missing_agent_does_not_prove_input_wait_ended(
+    cmux_calls, remote_title_map
+):
+    rstate = {"remotes": {}}
+    ch.apply_remote_snapshot(
+        {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
+    )
+    ch.apply_remote_snapshot({}, rstate, "tom", REMOTE_CFG, [], {})
+    assert rstate["remotes"]["tom"]["panes"]["w1:p1"]["status"] == "blocked"
+
+
+def test_remote_leaving_attention_preserves_unowned_notifications(
+    cmux_calls, remote_title_map
+):
     rstate = {"remotes": {}}
     ch.apply_remote_snapshot(
         {}, rstate, "tom", REMOTE_CFG, [remote_agent("w1:p1", "blocked")], {}
@@ -3107,7 +3397,7 @@ def test_remote_leaving_attention_marks_read(cmux_calls, remote_title_map):
     )
 
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
+    assert read == []
     pill = [c for c in cmux_calls if c[0] == "set-status"]
     assert pill[0][2] == "1 working"
 
@@ -3170,7 +3460,7 @@ def test_remote_title_change_reroutes_pill(cmux_calls, remote_title_map):
         ["clear-status", "herdr.remote.tom.w1_p1", "--workspace", "workspace:9"],
     ]
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
+    assert read == []
     # new title is not in the map -> no stale ref reuse, no pill yet
     assert [c for c in cmux_calls if c[0] == "set-status"] == []
 
@@ -3213,7 +3503,7 @@ def test_remote_daemon_without_remotes_cleans_up(monkeypatch, cmux_calls, tmp_pa
     assert ch.remote_daemon({}) == 0
 
     read = [c for c in cmux_calls if c[0] == "mark-notification-read"]
-    assert read == [["mark-notification-read", "--workspace", "workspace:9"]]
+    assert read == []
     saved = json.loads((tmp_path / "remote-state.json").read_text())
     assert saved["remotes"] == {}
 
@@ -3271,7 +3561,7 @@ def test_remote_mark_read_respects_other_remote_on_same_workspace(cmux_calls):
     assert cmux_calls == []
 
     ch.remote_mark_read_ref({}, rstate, "b", "workspace:9")
-    assert cmux_calls == [["mark-notification-read", "--workspace", "workspace:9"]]
+    assert cmux_calls == []
 
 
 def test_remote_ref_clears_pill_when_title_moves(monkeypatch, cmux_calls, tmp_path):
@@ -3288,7 +3578,7 @@ def test_remote_ref_clears_pill_when_title_moves(monkeypatch, cmux_calls, tmp_pa
     assert ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"] in (
         cmux_calls
     )
-    assert ["mark-notification-read", "--workspace", "workspace:9"] in cmux_calls
+    assert not any(c[0] == "mark-notification-read" for c in cmux_calls)
 
 
 def test_poll_interval_validation():
@@ -3378,7 +3668,7 @@ def test_retire_remote_clears_pill_and_state(monkeypatch, cmux_calls, tmp_path):
     assert ["clear-status", "herdr.remote.tom", "--workspace", "workspace:9"] in (
         cmux_calls
     )
-    assert ["mark-notification-read", "--workspace", "workspace:9"] in cmux_calls
+    assert not any(c[0] == "mark-notification-read" for c in cmux_calls)
     saved = json.loads((tmp_path / "remote-state.json").read_text())
     assert saved["remotes"] == {}
 
@@ -3768,24 +4058,7 @@ def test_v1_supervisor_handoff_requires_complete_and_supported_backend(
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
     calls = []
 
-    class Session:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __enter__(self):
-            calls.append("probe")
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def store_identity(self):
-            return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-
-        def list_notifications(self):
-            return []
-
-    monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: [])
     monkeypatch.setattr(
         ch,
         "v1_try_supervisor_handoff",
@@ -3798,13 +4071,67 @@ def test_v1_supervisor_handoff_requires_complete_and_supported_backend(
     assert ch.v1_maybe_supervisor_handoff(
         {}, object(), object(), verified, {"CMUX_SOCKET_PATH": "/tmp/cmux"}
     )
-    assert calls == ["probe", "handoff"]
+    assert calls == ["handoff"]
     marker = tmp_path / "v1-notification-backend"
     marker.write_text("owned")
     marker.chmod(0o600)
     calls.clear()
     assert not ch.v1_maybe_supervisor_handoff({}, object(), object(), verified, {})
     assert calls == []
+
+
+def test_v1_supervisor_never_marks_unrelated_notice_with_stale_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: calls.append(args) or True)
+    foreign = [
+        {
+            "id": "stale",
+            "workspace_id": "w",
+            "surface_id": "s",
+            "title": "Other app",
+            "subtitle": "",
+            "is_read": False,
+        }
+    ]
+    ch.reconcile_aggregate_notification({}, "w", "s", {}, foreign, "stale")
+    assert calls == []
+
+
+def test_v1_retiring_destination_does_not_read_foreign_stale_id(monkeypatch):
+    key = ch.v1_destination_key("w", "s")
+    state = {"v1": {"destinations": {key: {"notification_id": "stale"}}}}
+    foreign = [
+        {
+            "id": "stale",
+            "workspace_id": "w",
+            "surface_id": "s",
+            "title": "Other app",
+            "subtitle": "",
+            "is_read": False,
+        }
+    ]
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: foreign)
+    calls = []
+    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: calls.append(args) or True)
+    assert ch.retire_v1_destination({}, state, key)
+    assert calls == []
+
+
+def test_v1_supervisor_handoff_uses_existing_cmux_notification_api(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: [])
+    calls = []
+
+    def handoff(*args, final_check):
+        calls.append("handoff")
+        return final_check()
+
+    monkeypatch.setattr(ch, "v1_try_supervisor_handoff", handoff)
+    verified = SimpleNamespace(scope=lambda: None)
+    assert ch.v1_maybe_supervisor_handoff({}, object(), object(), verified, {})
+    assert calls == ["handoff"]
 
 
 def test_v1_supervisor_keeps_legacy_when_store_provenance_is_missing(
@@ -3817,23 +4144,13 @@ def test_v1_supervisor_keeps_legacy_when_store_provenance_is_missing(
     )
     calls = []
 
-    class Session:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def store_identity(self):
-            return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-
-        def list_notifications(self):
-            return [{"id": "old-notice", "is_read": False}]
-
-    monkeypatch.setattr(ch, "V1OwnedSocketSession", Session)
+    monkeypatch.setattr(
+        ch,
+        "cmux_notifications_checked",
+        lambda cfg: [
+            {"id": "old-notice", "is_read": False, "subtitle": ch.NOTIFICATION_SUBTITLE}
+        ],
+    )
     monkeypatch.setattr(
         ch, "v1_try_supervisor_handoff", lambda *args, **kwargs: calls.append("retire")
     )
@@ -4596,6 +4913,295 @@ def test_v1_client_observation_rejects_untrusted_responses(change):
     assert not ch.valid_v1_client_observation({**payload, **change}, 42)
 
 
+def test_v1_lsof_unix_peers_match_distinct_process_connections():
+    output = "\n".join(
+        [
+            "p100",
+            "f4",
+            "d0x111",
+            "n->0x222",
+            "f11",
+            "d0x111",
+            "n->0x222",
+            "p200",
+            "f4",
+            "d0x333",
+            "n/path/herdr.sock",
+            "f9",
+            "d0x222",
+            "n/tmp/herdr-client.sock",
+            "f10",
+            "d0x222",
+            "n/path/herdr-client.sock",
+        ]
+    )
+    peers = ch.v1_parse_lsof_unix_peers(output)
+    assert ch.v1_lsof_processes_connected(peers, 100, 200)
+    assert not ch.v1_lsof_processes_connected(peers, 100, 300)
+
+
+def test_v1_lsof_client_path_accepts_equivalent_symlink(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    output = "\n".join(
+        [
+            "p100",
+            "f4",
+            "d0x111",
+            "n->0x222",
+            "p200",
+            "f9",
+            "d0x222",
+            f"n{alias}/herdr-client.sock",
+        ]
+    )
+    peers = ch.v1_parse_lsof_unix_peers(output)
+    assert ch.v1_lsof_processes_connected(
+        peers, 100, 200, str(real / "herdr-client.sock")
+    )
+
+
+def test_v1_upstream_client_inventory_requires_unique_stable_server(monkeypatch):
+    monkeypatch.setattr(
+        ch,
+        "v1_native_process_info",
+        lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
+    )
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 200)
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    output = "\n".join(
+        [
+            "p100",
+            "f4",
+            "d0x111",
+            "n->0x222",
+            "p200",
+            "f9",
+            "d0x222",
+            "n/tmp/herdr-client.sock",
+        ]
+    )
+    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
+    result = ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/herdr.sock"])
+    assert result["sources"][0]["api_socket_path"] == "/tmp/herdr.sock"
+    assert result["sources"][0]["socket_generation"] == "1:2"
+    assert result["sources"][0]["server_pid"] == 200
+    assert result["sources"][0]["server_start_token"] == 201
+    assert result["observation"] is None
+    assert (
+        ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/a.sock", "/tmp/b.sock"])
+        is None
+    )
+
+
+def test_v1_upstream_client_inventory_rejects_api_only_connection(monkeypatch):
+    monkeypatch.setattr(
+        ch,
+        "v1_native_process_info",
+        lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
+    )
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 200)
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    output = "\n".join(
+        [
+            "p100",
+            "f4",
+            "d0x111",
+            "n->0x222",
+            "p200",
+            "f9",
+            "d0x222",
+            "n/tmp/herdr.sock",
+        ]
+    )
+    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
+    assert ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/herdr.sock"]) is None
+
+
+def test_v1_upstream_client_inventory_rejects_unidentified_connection(monkeypatch):
+    monkeypatch.setattr(
+        ch,
+        "v1_native_process_info",
+        lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
+    )
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 200)
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    output = "\n".join(
+        [
+            "p100",
+            "f4",
+            "d0x111",
+            "n->0x222",
+            "f5",
+            "d0x555",
+            "n->0x666",
+            "p200",
+            "f9",
+            "d0x222",
+            "n/tmp/herdr-client.sock",
+        ]
+    )
+    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
+    assert ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/herdr.sock"]) is None
+
+
+def test_v1_upstream_client_inventory_allows_unrelated_running_server(monkeypatch):
+    monkeypatch.setattr(
+        ch,
+        "v1_native_process_info",
+        lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
+    )
+    monkeypatch.setattr(
+        ch, "v1_unix_peer_pid", lambda path: 200 if path == "/tmp/a.sock" else 300
+    )
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+
+    def lsof(args, **kwargs):
+        server = int(args[-2].split(",")[1])
+        server_socket = "0x222" if server == 200 else "0x333"
+        name = "/tmp/a-client.sock" if server == 200 else "/tmp/b-client.sock"
+        return f"p100\nf4\nd0x111\nn->0x222\np{server}\nf9\nd{server_socket}\nn{name}\n"
+
+    monkeypatch.setattr(ch, "v1_bounded_command_output", lsof)
+    result = ch.v1_upstream_local_client_inventory(
+        100, 42, ["/tmp/b.sock", "/tmp/a.sock"]
+    )
+    assert result["sources"][0]["api_socket_path"] == "/tmp/a.sock"
+
+
+def test_v1_running_local_socket_paths_rejects_ambiguous_session_list(monkeypatch):
+    monkeypatch.setattr(
+        ch,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "sessions": [
+                        {"running": True, "socket_path": "/tmp/a.sock"},
+                        {"running": True, "socket_path": "/tmp/a.sock"},
+                    ]
+                }
+            ),
+            stderr="",
+        ),
+    )
+    assert ch.v1_running_local_socket_paths() is None
+
+
+def test_v1_running_local_socket_paths_preserves_usable_spelling(monkeypatch, tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    path = str(alias / "herdr.sock")
+    monkeypatch.setattr(
+        ch,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"sessions": [{"running": True, "socket_path": path}]}),
+        ),
+    )
+    assert ch.v1_running_local_socket_paths() == [path]
+
+
+def test_v1_discovery_uses_verified_upstream_local_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 42)
+    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: False)
+    inventory = {
+        "version": 1,
+        "pid": 100,
+        "instance": "100:5",
+        "status": "ok",
+        "sources_complete": True,
+        "sources": [
+            {
+                "endpoint": "local",
+                "api_socket_path": "/tmp/herdr.sock",
+                "socket_generation": "1:2",
+                "connection_generation": 5,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        ch, "v1_upstream_local_client_inventory", lambda *args, **kwargs: inventory
+    )
+    tree = {
+        "windows": [
+            {
+                "workspaces": [
+                    {
+                        "id": "w",
+                        "panes": [
+                            {
+                                "surfaces": [
+                                    {
+                                        "id": "s",
+                                        "type": "terminal",
+                                        "tty": "tty",
+                                        "processes": [
+                                            {
+                                                "pid": 100,
+                                                "name": "herdr",
+                                                "tty_device": 42,
+                                                "children": [],
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    result = ch.v1_discover_clients_in_tree(
+        tree, [tmp_path], upstream_sockets=lambda: ["/tmp/herdr.sock"]
+    )
+    assert result["complete"]
+    assert result["clients"][0]["sources"] == inventory["sources"]
+    tree["windows"][0]["workspaces"][0]["panes"][0]["surfaces"][0]["processes"][0][
+        "children"
+    ].append({"pid": 101, "name": "ssh", "tty_device": 0, "children": []})
+    result = ch.v1_discover_clients_in_tree(
+        tree, [tmp_path], upstream_sockets=lambda: ["/tmp/herdr.sock"]
+    )
+    assert not result["complete"]
+
+
+def test_v1_source_inventory_accepts_only_local_verified_socket_without_boot():
+    source = {
+        "endpoint": "local",
+        "api_socket_path": "/tmp/herdr.sock",
+        "socket_generation": "1:2",
+        "connection_generation": 1,
+    }
+    payload = {
+        "version": 1,
+        "pid": 42,
+        "instance": "i",
+        "status": "ok",
+        "sources_complete": True,
+        "sources": [source],
+    }
+    assert ch.valid_v1_source_inventory(payload, 42)
+    assert not ch.valid_v1_source_inventory(
+        {**payload, "sources": [{**source, "socket_generation": "unknown"}]}, 42
+    )
+    remote = {
+        "endpoint": "ssh:" + "a" * 32,
+        "ssh_target": "tom@host",
+        "session": "work",
+        "socket_generation": "1:2",
+        "connection_generation": 1,
+    }
+    assert not ch.valid_v1_source_inventory({**payload, "sources": [remote]}, 42)
+
+
 def test_v1_source_inventory_accepts_unfocused_client_and_multiple_endpoints():
     payload = {
         "version": 1,
@@ -5013,6 +5619,33 @@ def test_v1_discovery_rejects_new_empty_surface_as_globally_complete(monkeypatch
     result = ch.v1_discover_clients({})
     assert not result["complete"]
     assert result["surface_complete"] == {("w", "a"): True, ("w", "b"): False}
+
+
+def test_v1_discovered_targets_preserve_upstream_socket_generation():
+    source = {
+        "endpoint": "local",
+        "api_socket_path": "/tmp/a.sock",
+        "socket_generation": "123:456",
+        "connection_generation": 7,
+    }
+    inventory = {
+        "clients": [
+            {
+                "pid": 20,
+                "instance": "i",
+                "workspace": "w",
+                "surface": "s",
+                "sources": [source],
+            }
+        ]
+    }
+    targets = ch.v1_discovered_targets(inventory)
+    target = next(iter(targets.values()))["target"]
+    assert target == {
+        "remote": None,
+        "socket_path": "/tmp/a.sock",
+        "socket_generation": "123:456",
+    }
 
 
 def test_v1_discovered_targets_preserve_client_source_and_boot():
@@ -5806,6 +6439,26 @@ def test_v1_supervisor_reconcile_keeps_old_source_until_binding_commit_succeeds(
     finally:
         sources.close()
         leases.close()
+
+
+def test_v1_supervisor_publishes_ordinary_notifications_for_verified_surface(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ch, "state_dir", tmp_path)
+    (tmp_path / "v1-enabled").write_text("enabled")
+    stop = ch.threading.Event()
+    scope = {("workspace", "surface")}
+    verified = SimpleNamespace(scope=lambda: scope, workspace_allowed=lambda _: True)
+    calls = []
+
+    def publish(cfg, **kwargs):
+        calls.append(kwargs)
+        stop.set()
+
+    monkeypatch.setattr(ch, "publish_v1_clients", publish)
+    ch.v1_supervised_publish_loop({}, stop, verified)
+    assert calls[0]["eligible_destinations"] == scope
+    assert calls[0].get("notifications", True)
 
 
 def test_v1_supervisor_loop_publishes_only_after_enabled(monkeypatch, tmp_path):
@@ -8627,7 +9280,7 @@ def test_watch_clears_pane_herdr_no_longer_tracks(
     assert saved["sessions"][""]["workspaces"]["w1"]["panes"] == {}
 
 
-def test_watch_marks_notifications_read_when_attention_drains(
+def test_watch_leaves_unowned_notifications_when_attention_drains(
     monkeypatch, cfg, cmux_calls, watch_state
 ):
     seed_state(watch_state, {"w1:p1": done_pane()})
@@ -8635,7 +9288,7 @@ def test_watch_marks_notifications_read_when_attention_drains(
 
     ch.handle_watch_event(cfg, "/tmp/x.sock", socket_event("w1:p1", "w1", "idle"))
 
-    assert any(c[0] == "mark-notification-read" for c in cmux_calls)
+    assert not any(c[0] == "mark-notification-read" for c in cmux_calls)
 
 
 def test_watch_ignores_tracked_status(monkeypatch, cfg, cmux_calls, watch_state):
@@ -8861,6 +9514,7 @@ def test_aggregate_notification_updates_when_attention_changes(cfg, cmux_calls):
             "surface_id": "s",
             "is_read": False,
             "title": "herdr: 1 waiting",
+            "subtitle": ch.NOTIFICATION_SUBTITLE,
         }
     ]
     attention = {
@@ -8874,7 +9528,13 @@ def test_aggregate_notification_updates_when_attention_changes(cfg, cmux_calls):
 
 def test_aggregate_notification_marks_only_its_own_id_read(cfg, cmux_calls):
     notifications = [
-        {"id": "our-id", "workspace_id": "w", "surface_id": "s", "is_read": False},
+        {
+            "id": "our-id",
+            "workspace_id": "w",
+            "surface_id": "s",
+            "is_read": False,
+            "subtitle": ch.NOTIFICATION_SUBTITLE,
+        },
         {"id": "foreign", "workspace_id": "w", "surface_id": "other", "is_read": False},
     ]
     ch.reconcile_aggregate_notification(cfg, "w", "s", {}, notifications, "our-id")
@@ -11103,14 +11763,17 @@ def test_v1_supervised_source_retries_after_subscription_timeout(monkeypatch):
 
 
 @pytest.mark.parametrize("marker", ["pending", "enabled"])
+@pytest.mark.parametrize("boot", ["a" * 32, None])
 def test_v1_supervised_source_syncs_tokens_without_supervisor_discovery(
-    monkeypatch, tmp_path, marker
+    monkeypatch, tmp_path, marker, boot
 ):
     import threading
 
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     (tmp_path / "v1-enabled").write_text(marker)
     monkeypatch.setattr(ch, "v1_local_generation", lambda path: "generation")
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 123)
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: {"start_token": 5})
     synced = threading.Event()
     calls = []
 
@@ -11128,9 +11791,67 @@ def test_v1_supervised_source_syncs_tokens_without_supervisor_discovery(
         assert synced.wait(3), "token synchronization depended on supervisor discovery"
 
     monkeypatch.setattr(ch, "v1_watch_connection", watch)
-    target = {"remote": None, "socket_path": "/source.sock", "server_boot_id": "a" * 32}
+    target = {"remote": None, "socket_path": "/source.sock", "server_boot_id": boot}
+    if boot is None:
+        target["socket_generation"] = "generation"
     assert ch.v1_watch_supervised_source("source", target, lambda: None)
-    assert calls and calls[0] == ("source", "/source.sock", "a" * 32)
+    assert calls and calls[0] == ("source", "/source.sock", boot)
+
+
+def test_v1_supervised_upstream_source_rejects_changed_socket(monkeypatch):
+    target = {"remote": None, "socket_path": "/source.sock", "socket_generation": "1:2"}
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:3")
+    events = []
+    monkeypatch.setattr(
+        ch, "v1_watch_connection", lambda *args, **kwargs: events.append(1)
+    )
+    assert not ch.v1_watch_supervised_source("source", target, lambda: None)
+    assert events == []
+
+
+def test_v1_supervised_upstream_source_rejects_replaced_server(monkeypatch):
+    target = {
+        "remote": None,
+        "socket_path": "/source.sock",
+        "socket_generation": "1:2",
+        "server_pid": 123,
+        "server_start_token": 5,
+    }
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 123)
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: {"start_token": 6})
+    calls = []
+    monkeypatch.setattr(
+        ch, "v1_watch_connection", lambda *args, **kwargs: calls.append(1)
+    )
+    assert not ch.v1_watch_supervised_source("source", target, lambda: None)
+    assert calls == []
+
+
+def test_v1_upstream_source_fence_rejects_replaced_socket(monkeypatch):
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:3")
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: {"start_token": 5})
+    token = ch.HERDR_SOURCE_FENCE.set(
+        {"path": "/source.sock", "generation": "1:2", "pid": 123, "start_token": 5}
+    )
+    try:
+        with pytest.raises(ch.SocketError, match="source socket changed"):
+            ch.v1_check_herdr_source_fence("/source.sock")
+    finally:
+        ch.HERDR_SOURCE_FENCE.reset(token)
+
+
+def test_v1_upstream_source_fence_rejects_reused_server_pid(monkeypatch):
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: {"start_token": 6})
+    token = ch.HERDR_SOURCE_FENCE.set(
+        {"path": "/source.sock", "generation": "1:2", "pid": 123, "start_token": 5}
+    )
+    try:
+        with pytest.raises(ch.SocketError, match="source process changed"):
+            ch.v1_check_herdr_source_fence("/source.sock")
+    finally:
+        ch.HERDR_SOURCE_FENCE.reset(token)
 
 
 def test_v1_supervisor_source_entrypoint_reports_readiness(
@@ -13106,7 +13827,13 @@ def test_v1_destination_stops_after_alias_cleanup_invalidates_plan(monkeypatch):
         }
     }
     notices = [
-        {"id": name, "workspace_id": "w", "surface_id": "s", "is_read": False}
+        {
+            "id": name,
+            "workspace_id": "w",
+            "surface_id": "s",
+            "is_read": False,
+            "subtitle": ch.NOTIFICATION_SUBTITLE,
+        }
         for name in ("first", "second")
     ]
     monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: notices)
@@ -13138,7 +13865,13 @@ def test_v1_destination_merges_duplicate_owned_aliases(monkeypatch):
         }
     }
     notices = [
-        {"id": name, "workspace_id": "w", "surface_id": "s", "is_read": False}
+        {
+            "id": name,
+            "workspace_id": "w",
+            "surface_id": "s",
+            "is_read": False,
+            "subtitle": ch.NOTIFICATION_SUBTITLE,
+        }
         for name in ("first", "second")
     ]
     monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: notices)
@@ -13158,7 +13891,13 @@ def test_v1_destination_owns_notification_across_id_case(monkeypatch):
         }
     }
     notices = [
-        {"id": "owned", "workspace_id": "w", "surface_id": "s", "is_read": False}
+        {
+            "id": "owned",
+            "workspace_id": "w",
+            "surface_id": "s",
+            "is_read": False,
+            "subtitle": ch.NOTIFICATION_SUBTITLE,
+        }
     ]
     monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: notices)
     effects = []
@@ -13200,7 +13939,13 @@ def test_v1_retire_destination_matches_notification_case(monkeypatch):
         ch,
         "cmux_notifications_checked",
         lambda cfg: [
-            {"id": "owned", "workspace_id": "w", "surface_id": "s", "is_read": False}
+            {
+                "id": "owned",
+                "workspace_id": "w",
+                "surface_id": "s",
+                "is_read": False,
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+            }
         ],
     )
     effects = []
@@ -13652,7 +14397,13 @@ def test_v1_partial_publication_retires_certified_empty_surface(monkeypatch, tmp
         ch,
         "cmux_notifications_checked",
         lambda cfg: [
-            {"id": "owned", "workspace_id": "w", "surface_id": "s", "is_read": False}
+            {
+                "id": "owned",
+                "workspace_id": "w",
+                "surface_id": "s",
+                "is_read": False,
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+            }
         ],
     )
     effects = []
@@ -14132,7 +14883,13 @@ def test_v1_publish_retires_only_owned_notification_after_last_client_leaves(
         ch,
         "cmux_notifications_checked",
         lambda cfg: [
-            {"id": "our-id", "workspace_id": "w", "surface_id": "s", "is_read": False},
+            {
+                "id": "our-id",
+                "workspace_id": "w",
+                "surface_id": "s",
+                "is_read": False,
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+            },
             {
                 "id": "foreign",
                 "workspace_id": "w",
@@ -14155,7 +14912,13 @@ def test_v1_destination_retirement_retries_when_cmux_fails(monkeypatch):
         ch,
         "cmux_notifications_checked",
         lambda cfg: [
-            {"id": "our-id", "workspace_id": "w", "surface_id": "s", "is_read": False}
+            {
+                "id": "our-id",
+                "workspace_id": "w",
+                "surface_id": "s",
+                "is_read": False,
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+            }
         ],
     )
     monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: False)
@@ -14163,6 +14926,13 @@ def test_v1_destination_retirement_retries_when_cmux_fails(monkeypatch):
     assert key in state["v1"]["destinations"]
 
 
+@pytest.fixture
+def force_action_identity(monkeypatch):
+    monkeypatch.setattr(ch, "v1_herdr_process_identity", lambda pid: {"start_token": 1})
+    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+
+
+@pytest.mark.usefixtures("force_action_identity")
 def test_v1_force_read_action_targets_only_context_pane(monkeypatch):
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
@@ -14170,7 +14940,7 @@ def test_v1_force_read_action_targets_only_context_pane(monkeypatch):
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
     calls = []
 
-    def rpc(path, method, params):
+    def rpc(path, method, params, **kwargs):
         calls.append((path, method, params))
         if method == "session.snapshot":
             return {"snapshot": {"server_boot_id": "a" * 32}}
@@ -14191,6 +14961,7 @@ def test_v1_force_read_action_targets_only_context_pane(monkeypatch):
     assert calls[-1][2]["tokens"] == {"cmux_herdr_ack": "episode-id"}
 
 
+@pytest.mark.usefixtures("force_action_identity")
 def test_v1_force_read_action_does_not_acknowledge_blocked(monkeypatch):
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
@@ -14198,7 +14969,7 @@ def test_v1_force_read_action_does_not_acknowledge_blocked(monkeypatch):
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
     calls = []
 
-    def rpc(path, method, params):
+    def rpc(path, method, params, **kwargs):
         calls.append(method)
         if method == "session.snapshot":
             return {"snapshot": {"server_boot_id": "a" * 32}}
@@ -14215,6 +14986,65 @@ def test_v1_force_read_action_does_not_acknowledge_blocked(monkeypatch):
     assert calls == ["session.snapshot", "pane.get"]
 
 
+@pytest.mark.usefixtures("force_action_identity")
+def test_v1_force_read_upstream_requires_original_server_peer(monkeypatch):
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
+    )
+    monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
+    monkeypatch.setattr(ch.os, "getppid", lambda: 1234)
+    calls = []
+
+    def rpc(path, method, params, **kwargs):
+        calls.append((method, kwargs))
+        if method == "session.snapshot":
+            return {"snapshot": {}}
+        if method == "pane.get":
+            return {
+                "pane": {
+                    "pane_id": "p",
+                    "agent_status": "idle",
+                    "tokens": {"cmux_herdr_done": "episode-id"},
+                }
+            }
+        return {"type": "ok"}
+
+    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    assert ch.v1_force_read_action()
+    assert calls == [
+        ("session.snapshot", {"expected_peer": 1234}),
+        ("pane.get", {"expected_peer": 1234}),
+        ("pane.report_metadata", {"expected_peer": 1234}),
+    ]
+
+
+def test_v1_socket_rpc_rejects_changed_server_before_sending(monkeypatch):
+    events = []
+
+    class Socket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def getsockopt(self, level, option):
+            return 999
+
+        def sendall(self, data):
+            events.append("sent")
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(ch.sys, "platform", "darwin")
+    monkeypatch.setattr(ch.socket, "socket", lambda *args: Socket())
+    with pytest.raises(ch.SocketError, match="incarnation changed"):
+        ch.socket_rpc("/socket", "pane.get", {}, expected_peer=123)
+    assert events == ["closed"]
+
+
+@pytest.mark.usefixtures("force_action_identity")
 def test_v1_force_read_action_accepts_retained_completion_after_agent_exit(monkeypatch):
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
@@ -14222,7 +15052,7 @@ def test_v1_force_read_action_accepts_retained_completion_after_agent_exit(monke
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
     calls = []
 
-    def rpc(path, method, params):
+    def rpc(path, method, params, **kwargs):
         calls.append((method, params))
         if method == "session.snapshot":
             return {"snapshot": {"server_boot_id": "a" * 32}}
@@ -14242,6 +15072,7 @@ def test_v1_force_read_action_accepts_retained_completion_after_agent_exit(monke
     assert calls[-1][1]["tokens"] == {"cmux_herdr_ack": "episode"}
 
 
+@pytest.mark.usefixtures("force_action_identity")
 def test_v1_force_read_action_rejects_unknown_state_for_present_agent(monkeypatch):
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
@@ -14250,7 +15081,7 @@ def test_v1_force_read_action_rejects_unknown_state_for_present_agent(monkeypatc
     monkeypatch.setattr(
         ch,
         "socket_rpc",
-        lambda path, method, params: (
+        lambda path, method, params, **kwargs: (
             {"snapshot": {"server_boot_id": "a" * 32}}
             if method == "session.snapshot"
             else {
@@ -14266,6 +15097,7 @@ def test_v1_force_read_action_rejects_unknown_state_for_present_agent(monkeypatc
     assert not ch.v1_force_read_action()
 
 
+@pytest.mark.usefixtures("force_action_identity")
 def test_v1_force_read_writes_only_with_verified_server_boot(monkeypatch):
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
@@ -14274,7 +15106,7 @@ def test_v1_force_read_writes_only_with_verified_server_boot(monkeypatch):
     calls = []
     boot = "a" * 32
 
-    def rpc(path, method, params):
+    def rpc(path, method, params, **kwargs):
         calls.append((method, params))
         if method == "session.snapshot":
             return {"snapshot": {"server_boot_id": boot}}
@@ -14294,6 +15126,7 @@ def test_v1_force_read_writes_only_with_verified_server_boot(monkeypatch):
     assert calls[-1][1]["expected_server_boot_id"] == boot
 
 
+@pytest.mark.usefixtures("force_action_identity")
 def test_v1_force_read_rejects_missing_or_restarted_server_identity(monkeypatch):
     monkeypatch.setenv(
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
@@ -14301,15 +15134,15 @@ def test_v1_force_read_rejects_missing_or_restarted_server_identity(monkeypatch)
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
     calls = []
 
-    def no_boot(path, method, params):
+    def no_boot(path, method, params, **kwargs):
         calls.append(method)
         return {"snapshot": {}}
 
     monkeypatch.setattr(ch, "socket_rpc", no_boot)
     assert not ch.v1_force_read_action()
-    assert calls == ["session.snapshot"]
+    assert calls == ["session.snapshot", "pane.get"]
 
-    def restarted(path, method, params):
+    def restarted(path, method, params, **kwargs):
         if method == "session.snapshot":
             return {"snapshot": {"server_boot_id": "a" * 32}}
         if method == "pane.get":
@@ -14509,7 +15342,13 @@ def test_v1_publisher_repairs_attention_acknowledged_during_notification_creatio
 
     def run(cmd, **kwargs):
         notices.append(
-            {"id": "new", "workspace_id": "w", "surface_id": "s", "is_read": False}
+            {
+                "id": "new",
+                "workspace_id": "w",
+                "surface_id": "s",
+                "is_read": False,
+                "subtitle": ch.NOTIFICATION_SUBTITLE,
+            }
         )
         return SimpleNamespace(returncode=0, stdout='{"id":"new"}', stderr="")
 

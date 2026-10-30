@@ -17,6 +17,7 @@ import shlex
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,7 @@ OWNED_PUBLISHER_IDENTITY = contextvars.ContextVar(
     "owned_publisher_identity", default=None
 )
 ACTIVATION_DIRECTORY = contextvars.ContextVar("activation_directory", default=None)
+HERDR_SOURCE_FENCE = contextvars.ContextVar("herdr_source_fence", default=None)
 
 state_dir = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", "."))
 config_dir = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "."))
@@ -1086,7 +1088,13 @@ def v1_source_key(target):
 def v1_supervised_source_key(target):
     """Separate source incarnations so handoff can prepare both safely."""
     return json.dumps(
-        [v1_source_key(target), target["server_boot_id"]], separators=(",", ":")
+        [
+            v1_source_key(target),
+            target.get("server_boot_id") or target.get("socket_generation"),
+            target.get("server_pid"),
+            target.get("server_start_token"),
+        ],
+        separators=(",", ":"),
     )
 
 
@@ -1544,11 +1552,75 @@ def update_pill(cfg, bucket, ws_id):
     push_pill(cfg, ref, status_key(ws_id), panes)
 
 
+def legacy_workspace_aliases(cfg, ref):
+    """Resolve a workspace reference to both its UUID and short reference."""
+    binary = cfg.get("cmux_bin") or DEFAULT_CMUX_BIN
+    try:
+        proc = run(
+            [binary, "--id-format", "both", "top", "--all", "--processes", "--json"],
+            timeout=20,
+        )
+        if proc.returncode:
+            return None
+        tree = json.loads(proc.stdout)
+        workspaces = [
+            workspace
+            for window in tree["windows"]
+            for workspace in window["workspaces"]
+        ]
+        matches = [
+            workspace
+            for workspace in workspaces
+            if any(
+                isinstance(workspace.get(key), str)
+                and workspace[key].casefold() == ref.casefold()
+                for key in ("id", "ref")
+            )
+        ]
+        if len(matches) != 1:
+            return None
+        aliases = {matches[0].get("id"), matches[0].get("ref")}
+        if any(not isinstance(value, str) or not value for value in aliases):
+            return None
+        return {value.casefold() for value in aliases}
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        subprocess.TimeoutExpired,
+    ):
+        return None
+
+
+def legacy_notification_preflight(cfg, ref):
+    """Defer legacy creation while an unowned unread notification may be replaced."""
+    visible = cmux_notifications_checked(cfg)
+    if visible is None or any(
+        not isinstance(item, dict) or type(item.get("is_read")) is not bool
+        for item in visible
+    ):
+        return False
+    unread = [item for item in visible if not item["is_read"]]
+    if not unread:
+        return True
+    aliases = legacy_workspace_aliases(cfg, ref)
+    return aliases is not None and all(
+        isinstance(item.get("workspace_id"), str)
+        and bool(item["workspace_id"])
+        and item["workspace_id"].casefold() not in aliases
+        for item in unread
+    )
+
+
 def notify(cfg, bucket, ws_id, title, body):
     ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
     if not ref:
-        return
-    cmux_cli(
+        return False
+    if not legacy_notification_preflight(cfg, ref):
+        return False
+    return cmux_cli(
         cfg,
         [
             "notify",
@@ -1565,15 +1637,8 @@ def notify(cfg, bucket, ws_id, title, body):
 
 
 def mark_read(cfg, bucket, ws_id):
-    ref, _ = resolve_cmux_workspace(cfg, bucket, ws_id)
-    if not ref:
-        return
-    # mark-notification-read is workspace-wide; do not hide notifications
-    # for a remote that still needs attention on the same workspace.
-    for r in load_remote_state().get("remotes", {}).values():
-        if r.get("ref") == ref and has_attention_panes(r.get("panes", {})):
-            return
-    cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
+    """Legacy notifications lack IDs; workspace-wide reads would affect others."""
+    return
 
 
 def has_attention_panes(panes):
@@ -2312,12 +2377,21 @@ def valid_v1_source_inventory(response, pid):
         if not isinstance(source, dict):
             return False
         endpoint, boot = source.get("endpoint"), source.get("boot_id")
+        generation = source.get("socket_generation")
+        identity_valid = (
+            isinstance(boot, str) and re.fullmatch(r"[0-9a-f]{32}", boot)
+        ) or (
+            boot is None
+            and endpoint == "local"
+            and "api_socket_path" in source
+            and isinstance(generation, str)
+            and re.fullmatch(r"\d+:\d+", generation)
+        )
         if (
             not isinstance(endpoint, str)
             or not re.fullmatch(r"local|ssh:[0-9a-f]{32}", endpoint)
             or endpoint in seen
-            or not isinstance(boot, str)
-            or not re.fullmatch(r"[0-9a-f]{32}", boot)
+            or not identity_valid
             or type(source.get("connection_generation")) is not int
             or source["connection_generation"] < 0
         ):
@@ -2398,6 +2472,120 @@ def v1_client_observation(path, pid):
 def v1_client_source_inventory(path, pid, *, timeout=2):
     response = v1_read_client_response(path, expected_peer=pid, timeout=timeout)
     return response if valid_v1_source_inventory(response, pid) else None
+
+
+def v1_parse_lsof_unix_peers(output):
+    """Parse lsof's machine-readable Unix socket devices and peers."""
+    if not isinstance(output, str) or len(output) > 4 * 1024 * 1024:
+        raise ValueError("invalid lsof output")
+    result = {}
+    pid = device = None
+    for field in output.splitlines():
+        if field.startswith("p"):
+            value = field[1:]
+            if not value.isdecimal() or int(value) <= 1:
+                raise ValueError("invalid lsof process")
+            pid, device = int(value), None
+            result.setdefault(pid, set())
+        elif field.startswith("f"):
+            device = None
+        elif field.startswith("d"):
+            value = field[1:]
+            if re.fullmatch(r"0x[0-9a-fA-F]+", value):
+                device = value.lower()
+        elif field.startswith("n") and pid is not None and device:
+            value = field[1:]
+            peer = value[2:].lower() if value.startswith("->") else None
+            if peer is not None and not re.fullmatch(r"0x[0-9a-f]+", peer):
+                raise ValueError("invalid lsof socket peer")
+            result[pid].add((device, peer, value if peer is None else None))
+    return result
+
+
+def v1_lsof_processes_connected(peers, client_pid, server_pid, client_path=None):
+    if client_pid == server_pid:
+        return False
+    servers = {
+        device
+        for device, _, name in peers.get(server_pid, set())
+        if client_path is None
+        or name is not None
+        and os.path.isabs(name)
+        and os.path.realpath(name) == os.path.realpath(client_path)
+    }
+    return any(peer in servers for _, peer, _ in peers.get(client_pid, set()) if peer)
+
+
+def v1_upstream_local_client_inventory(pid, tty_device, socket_paths, *, deadline=None):
+    """Identify one live local Herdr connection using kernel socket peers."""
+    before_client = v1_native_process_info(pid)
+    if before_client is None or before_client.get("tty_device") != tty_device:
+        return None
+    if deadline is None:
+        deadline = time.monotonic() + 10
+    matches = []
+    try:
+        for path in socket_paths:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            generation = v1_local_generation(path)
+            server_pid = v1_unix_peer_pid(path)
+            before_server = v1_native_process_info(server_pid)
+            if before_server is None:
+                return None
+            output = v1_bounded_command_output(
+                ["lsof", "-n", "-F", "pfdn", "-a", "-p", f"{pid},{server_pid}", "-U"],
+                max_bytes=4 * 1024 * 1024,
+                timeout=min(remaining, 3),
+            )
+            if output is None:
+                return None
+            peers = v1_parse_lsof_unix_peers(output)
+            if v1_native_process_info(pid) != before_client or (
+                v1_native_process_info(server_pid) != before_server
+                or v1_local_generation(path) != generation
+                or v1_unix_peer_pid(path) != server_pid
+            ):
+                return None
+            client_path = str(Path(path).with_name(f"{Path(path).stem}-client.sock"))
+            if v1_lsof_processes_connected(peers, pid, server_pid, client_path):
+                own_devices = {device for device, _, _ in peers.get(pid, set())}
+                server_devices = {
+                    device for device, _, _ in peers.get(server_pid, set())
+                }
+                if any(
+                    peer not in own_devices | server_devices
+                    for _, peer, _ in peers.get(pid, set())
+                    if peer
+                ):
+                    return None
+                matches.append(
+                    (path, generation, server_pid, before_server["start_token"])
+                )
+        if len(matches) != 1:
+            return None
+        path, generation, server_pid, server_start_token = matches[0]
+        return {
+            "version": 1,
+            "pid": pid,
+            "status": "ok",
+            "observation": None,
+            "instance": f"{pid}:{before_client['start_token']}",
+            "sources_complete": True,
+            "sources": [
+                {
+                    "endpoint": "local",
+                    "api_socket_path": path,
+                    "socket_generation": generation,
+                    "server_pid": server_pid,
+                    "server_start_token": server_start_token,
+                    "connection_generation": before_client["start_token"],
+                }
+            ],
+        }
+    except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired):
+        return None
 
 
 def v1_tty_device(tty):
@@ -2932,7 +3120,9 @@ def v1_validate_discovery_tree(payload, deadline):
         return False
 
 
-def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
+def v1_discover_clients_in_tree(
+    payload, directories, *, deadline=None, upstream_sockets=None
+):
     """Collect candidates from one tree; recheck them before accepting ownership."""
     clients, seen, surfaces = [], set(), set()
     complete = True
@@ -3031,9 +3221,6 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                                 name == "ssh"
                                 or isinstance(path, str)
                                 and Path(path).name == "ssh"
-                            ) and (
-                                type(process.get("tty_device")) is not int
-                                or process["tty_device"] == tty_device
                             ):
                                 # A remote shell may hide a Herdr client.
                                 complete = False
@@ -3073,16 +3260,24 @@ def v1_discover_clients_in_tree(payload, directories, *, deadline=None):
                                     candidate := directory / f"{pid}.sock"
                                 )
                             ]
-                            if len(sockets) != 1:
-                                complete = False
-                                surface_complete[key] = False
-                                continue
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 return {"clients": clients, "complete": False}
-                            inventory = v1_client_source_inventory(
-                                sockets[0], pid, timeout=min(2, remaining)
-                            )
+                            if len(sockets) == 1:
+                                inventory = v1_client_source_inventory(
+                                    sockets[0], pid, timeout=min(2, remaining)
+                                )
+                            elif not sockets and upstream_sockets is not None:
+                                paths = upstream_sockets()
+                                inventory = (
+                                    v1_upstream_local_client_inventory(
+                                        pid, tty_device, paths, deadline=deadline
+                                    )
+                                    if paths is not None
+                                    else None
+                                )
+                            else:
+                                inventory = None
                             if not inventory:
                                 complete = False
                                 surface_complete[key] = False
@@ -3256,6 +3451,13 @@ def v1_discover_clients(cfg):
     ]
     scans = []
     deadline = time.monotonic() + 20
+    upstream_cache = []
+
+    def upstream_sockets():
+        if not upstream_cache:
+            upstream_cache.append(v1_running_local_socket_paths())
+        return upstream_cache[0]
+
     try:
         for _ in range(2):
             remaining = deadline - time.monotonic()
@@ -3276,7 +3478,10 @@ def v1_discover_clients(cfg):
             if output is None:
                 return None
             scan = v1_discover_clients_in_tree(
-                json.loads(output), directories, deadline=deadline
+                json.loads(output),
+                directories,
+                deadline=deadline,
+                upstream_sockets=upstream_sockets,
             )
             if scan is None:
                 return None
@@ -3357,7 +3562,13 @@ def v1_discovered_targets(inventory):
             key = hashlib.sha256(
                 json.dumps(identity, separators=(",", ":")).encode()
             ).hexdigest()
-            target = {"server_boot_id": source["boot_id"]}
+            if source.get("boot_id") is not None:
+                target = {"server_boot_id": source["boot_id"]}
+            else:
+                target = {"socket_generation": source["socket_generation"]}
+                for field in ("server_pid", "server_start_token"):
+                    if field in source:
+                        target[field] = source[field]
             if "api_socket_path" in source:
                 target.update(remote=None, socket_path=source["api_socket_path"])
             else:
@@ -3789,17 +4000,41 @@ def v1_reconcile_focus(cfg, client_id, source_id, workspace_id, surface_id, sock
 
 def v1_force_read_action():
     """Send the invoking pane's verified completion ID through Herdr metadata."""
+    fence_token = None
     try:
         context = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
         pane_id = context.get("focused_pane_id")
         sock_path = os.environ.get("HERDR_SOCKET_PATH")
         if not isinstance(pane_id, str) or not pane_id or not sock_path:
             return False
-        snapshot = socket_rpc(sock_path, "session.snapshot", {}).get("snapshot") or {}
-        boot = snapshot.get("server_boot_id")
-        if not isinstance(boot, str) or not re.fullmatch(r"[0-9a-f]{32}", boot):
+        parent_pid = os.getppid()
+        identity = v1_herdr_process_identity(parent_pid)
+        if identity is None:
             return False
-        pane = socket_rpc(sock_path, "pane.get", {"pane_id": pane_id}).get("pane", {})
+        fence_token = HERDR_SOURCE_FENCE.set(
+            {
+                "path": str(sock_path),
+                "generation": v1_local_generation(sock_path),
+                "pid": parent_pid,
+                "start_token": identity["start_token"],
+            }
+        )
+        snapshot = (
+            socket_rpc(sock_path, "session.snapshot", {}, expected_peer=parent_pid).get(
+                "snapshot"
+            )
+            or {}
+        )
+        boot = snapshot.get("server_boot_id")
+        if boot is not None and (
+            not isinstance(boot, str) or not re.fullmatch(r"[0-9a-f]{32}", boot)
+        ):
+            return False
+        peer = parent_pid if boot is None else None
+        peer_options = {"expected_peer": peer} if peer is not None else {}
+        pane = socket_rpc(
+            sock_path, "pane.get", {"pane_id": pane_id}, **peer_options
+        ).get("pane", {})
         status = pane.get("agent_status")
         if pane.get("pane_id") != pane_id or not (
             status in ("done", "idle")
@@ -3810,21 +4045,23 @@ def v1_force_read_action():
         token = (pane.get("tokens") or {}).get("cmux_herdr_done")
         if not isinstance(token, str) or not token:
             return False
-        socket_rpc(
-            sock_path,
-            "pane.report_metadata_if_boot",
-            {
-                "pane_id": pane_id,
-                "expected_server_boot_id": boot,
-                "source": "cmux-herdr.v1",
-                "tokens": {"cmux_herdr_ack": token},
-                "ttl_ms": 30000,
-            },
-        )
+        params = {
+            "pane_id": pane_id,
+            "source": "cmux-herdr.v1",
+            "tokens": {"cmux_herdr_ack": token},
+            "ttl_ms": 30000,
+        }
+        if boot is not None:
+            params["expected_server_boot_id"] = boot
+        method = "pane.report_metadata_if_boot" if boot else "pane.report_metadata"
+        socket_rpc(sock_path, method, params, **peer_options)
         return True
     except (SocketError, OSError, ValueError, TypeError, AttributeError) as e:
         log(f"v1 force read failed: {e}")
         return False
+    finally:
+        if fence_token is not None:
+            HERDR_SOURCE_FENCE.reset(fence_token)
 
 
 class V1SnapshotRace(ValueError):
@@ -4534,15 +4771,20 @@ def reconcile_aggregate_notification(
         if str(item.get("workspace_id", "")).casefold() == workspace_id.casefold()
         and str(item.get("surface_id", "")).casefold() == surface_id.casefold()
     ]
-    own = next((item for item in relevant if item.get("id") == notification_id), None)
+    own = next(
+        (
+            item
+            for item in relevant
+            if item.get("id") == notification_id
+            and item.get("subtitle") == NOTIFICATION_SUBTITLE
+        ),
+        None,
+    )
     if not pending:
         if own and not own.get("is_read"):
             cmux_cli(cfg, ["mark-notification-read", "--id", notification_id])
         return
-    if any(
-        not item.get("is_read") and item.get("id") != notification_id
-        for item in relevant
-    ):
+    if any(not item.get("is_read") and item is not own for item in relevant):
         return
     title = v1_attention_title(attention)
     if own and not own.get("is_read") and own.get("title") == title:
@@ -4617,7 +4859,7 @@ def reconcile_v1_supervised_bindings(
             "surface": spec["surface"],
             "pid": supervisor_pid,
             "supervised": True,
-            "server_boot_id": spec["target"]["server_boot_id"],
+            "server_boot_id": spec["target"].get("server_boot_id"),
             "connection_generation": spec["connection_generation"],
             "observed_client_pid": spec.get("observed_client_pid"),
             "observed_client_instance": spec.get("observed_client_instance"),
@@ -4962,7 +5204,7 @@ def v1_bindings_match_clients(clients, desired, *, exact=False):
         and clients[key].get("workspace") == spec["workspace"]
         and clients[key].get("surface") == spec["surface"]
         and clients[key].get("source") == v1_supervised_source_key(spec["target"])
-        and clients[key].get("server_boot_id") == spec["target"]["server_boot_id"]
+        and clients[key].get("server_boot_id") == spec["target"].get("server_boot_id")
         and clients[key].get("connection_generation") == spec["connection_generation"]
         and clients[key].get("observed_client_pid") == spec.get("observed_client_pid")
         and clients[key].get("observed_client_instance")
@@ -5747,7 +5989,6 @@ def v1_supervised_publish_loop(cfg, stop, verified):
                         cfg,
                         eligibility_check=verified.scope,
                         workspace_check=verified.workspace_allowed,
-                        notifications=False,
                     )
                 elif scope:
                     publish_v1_clients(
@@ -5755,7 +5996,6 @@ def v1_supervised_publish_loop(cfg, stop, verified):
                         eligible_destinations=scope,
                         eligibility_check=verified.scope,
                         workspace_check=verified.workspace_allowed,
-                        notifications=False,
                     )
         except FileNotFoundError:
             pass
@@ -5804,45 +6044,25 @@ def v1_supervised_owned_publish_loop(stop, verified, environment):
 
 
 def v1_maybe_supervisor_handoff(cfg, sources, stop, verified, environment):
-    """Attempt handoff only after discovery and cmux capability checks."""
+    """Attempt handoff once existing cmux notices can be safely preserved."""
     if verified.scope() is not None or v1_notification_backend() != "ordinary":
         return False
-    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    path = environment.get("CMUX_SOCKET_PATH")
-    if not isinstance(path, str) or not path:
-        return False
-    try:
-        with V1OwnedSocketSession(
-            path,
-            password=v1_cmux_socket_password(environment, account_home),
-            capability=environment.get("CMUX_SOCKET_CAPABILITY") or None,
-        ) as session:
-            store_id = session.store_identity()
-            uuid.UUID(store_id)
 
-            def ready_for_handoff():
-                with state_lock():
-                    try:
-                        state = json.loads(STATE_PATH.read_text())
-                    except FileNotFoundError:
-                        state = {}
-                visible = session.list_notifications()
-                resolved = v1_resolved_unproven_destinations(state, visible)
-                v1_ordinary_cleanup_inventory(
-                    state, store_id, resolved_unproven=resolved
-                )
-                return v1_owned_backend_is_clear(session, store_id)
+    def ready_for_handoff():
+        visible = cmux_notifications_checked(cfg)
+        if visible is None:
+            return False
+        return all(
+            isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and type(item.get("is_read")) is bool
+            and (item["is_read"] or not is_our_notification(item))
+            for item in visible
+        )
 
-            if not ready_for_handoff():
-                return False
-            return v1_try_supervisor_handoff(
-                cfg,
-                sources,
-                stop,
-                final_check=ready_for_handoff,
-            )
-    except (OSError, SocketError, ValueError, TypeError, AttributeError):
+    if not ready_for_handoff():
         return False
+    return v1_try_supervisor_handoff(cfg, sources, stop, final_check=ready_for_handoff)
 
 
 def v1_run_supervisor(cfg, stop):
@@ -5860,7 +6080,6 @@ def v1_run_supervisor(cfg, stop):
     publisher_verified = V1PublicationVerification(sources)
     environment = os.environ.copy()
     publisher = None
-    owned_publisher = None
     try:
         leases.reconcile({}, {}, complete=False)
         publisher = threading.Thread(
@@ -5869,12 +6088,6 @@ def v1_run_supervisor(cfg, stop):
             daemon=True,
         )
         publisher.start()
-        owned_publisher = threading.Thread(
-            target=v1_supervised_owned_publish_loop,
-            args=(publisher_stop, publisher_verified, environment),
-            daemon=True,
-        )
-        owned_publisher.start()
         next_recovery = 0
         recovery_ready = False
         while not stop.is_set():
@@ -5923,8 +6136,6 @@ def v1_run_supervisor(cfg, stop):
         publisher_stop.set()
         if publisher is not None:
             publisher.join()
-        if owned_publisher is not None:
-            owned_publisher.join()
         try:
             sources.close()
         finally:
@@ -6059,6 +6270,7 @@ def reconcile_v1_destination(
             item
             for item in notifications
             if item.get("id") in owned_ids
+            and item.get("subtitle") == NOTIFICATION_SUBTITLE
             and str(item.get("workspace_id", "")).casefold() == workspace_id.casefold()
             and str(item.get("surface_id", "")).casefold() == surface_id.casefold()
         ]
@@ -6361,6 +6573,7 @@ def retire_v1_destination(cfg, state, key, *, is_current=lambda: True):
             item
             for item in notifications
             if item.get("id") == destination.get("notification_id")
+            and item.get("subtitle") == NOTIFICATION_SUBTITLE
             and str(item.get("workspace_id", "")).casefold() == workspace.casefold()
             and str(item.get("surface_id", "")).casefold() == surface.casefold()
         ),
@@ -7181,27 +7394,8 @@ def is_our_notification(item):
 
 
 def sweep_notifications(cfg, state):
-    """Mark our unread notifications read once nothing needs attention.
-
-    Skipped entirely while any pane is blocked/done, since unread
-    notifications may still be legitimate then.
-    """
-    if any(
-        has_attention_panes(ws.get("panes", {})) for _, _, ws in all_workspaces(state)
-    ):
-        return
-    remote = load_remote_state()
-    if any(
-        has_attention_panes(r.get("panes", {}))
-        for r in remote.get("remotes", {}).values()
-    ):
-        return
-    for item in cmux_notifications(cfg):
-        if item.get("is_read") or not is_our_notification(item):
-            continue
-        notif_id = item.get("id")
-        if notif_id:
-            cmux_cli(cfg, ["mark-notification-read", "--id", notif_id])
+    """Do not infer ownership of legacy notices from their title or subtitle."""
+    return
 
 
 def clear_legacy_sidebar_logs(cfg, state):
@@ -7277,6 +7471,9 @@ def on_agent_status_changed(cfg, bucket, data):
     panes = ws["panes"]
     was_attention = panes.get(pane_id, {}).get("status") in ATTENTION_STATUSES
 
+    if status == "unknown" and panes.get(pane_id, {}).get("status") == "blocked":
+        return
+
     if status not in TRACKED_STATUSES:
         # forget_pane republishes the pill itself when it removes something.
         if not forget_pane(cfg, bucket, ws_id, pane_id):
@@ -7294,7 +7491,7 @@ def on_agent_status_changed(cfg, bucket, data):
         agent = pane["agent"]
         label = ws.get("label") or ws_id
         if status == "blocked":
-            notify(
+            sent = notify(
                 cfg,
                 bucket,
                 ws_id,
@@ -7302,13 +7499,15 @@ def on_agent_status_changed(cfg, bucket, data):
                 f"{label} · {pane['title'] or pane_id}",
             )
         else:
-            notify(
+            sent = notify(
                 cfg,
                 bucket,
                 ws_id,
                 f"{agent}: finished",
                 f"{label} · {pane['title'] or pane_id}",
             )
+        if not sent:
+            pane["notification_pending"] = True
     elif was_attention and not has_attention_panes(panes):
         # Answering the prompt retires the notification just as viewing the
         # finished pane does; forget_pane covers the leaving-tracked case.
@@ -7356,10 +7555,58 @@ def on_workspace_closed(cfg, bucket, data):
 
 
 def on_workspace_focused(cfg, bucket, data):
-    ws_id = data.get("workspace_id")
-    if not ws_id:
+    """Workspace focus does not identify the agent pane receiving input."""
+    return
+
+
+def retry_legacy_notifications(cfg, *, session=None):
+    """Retry only attention episodes that the legacy publisher deferred."""
+    sock_path = session_socket_path(session)
+    if not sock_path:
         return
-    mark_read(cfg, bucket, ws_id)
+    with state_lock():
+        if (state_dir / "v1-enabled").exists():
+            return
+        try:
+            agents = socket_rpc(sock_path, "agent.list", {}).get("agents")
+            if not isinstance(agents, list) or any(
+                not isinstance(a, dict) for a in agents
+            ):
+                return
+            observed = {a.get("pane_id"): a.get("agent_status") for a in agents}
+            if len(observed) != len(agents):
+                return
+        except (SocketError, OSError, ValueError, TypeError):
+            return
+        state = load_state()
+        bucket = session_bucket(state, session)
+        changed = False
+        for ws_id, workspace in bucket.get("workspaces", {}).items():
+            for pane_id, pane in workspace.get("panes", {}).items():
+                status = pane.get("status")
+                if (
+                    not pane.get("notification_pending")
+                    or status not in ATTENTION_STATUSES
+                    or observed.get(pane_id) != status
+                ):
+                    continue
+                label = workspace.get("label") or ws_id
+                title = (
+                    f"{pane['agent']}: waiting for input"
+                    if status == "blocked"
+                    else f"{pane['agent']}: finished"
+                )
+                if notify(
+                    cfg,
+                    bucket,
+                    ws_id,
+                    title,
+                    f"{label} · {pane.get('title') or pane_id}",
+                ):
+                    pane.pop("notification_pending", None)
+                    changed = True
+        if changed:
+            save_state(state)
 
 
 def on_workspace_renamed(cfg, bucket, data):
@@ -7460,6 +7707,13 @@ def reconcile(cfg, state):
     ws_ids = set()
     for a in agents:
         status = a.get("agent_status")
+        if status == "unknown":
+            ws_id, pane_id = a.get("workspace_id"), a.get("pane_id")
+            old = previous.get(ws_id, {}).get("panes", {}).get(pane_id, {})
+            if old.get("status") == "blocked":
+                ws_ids.add(ws_id)
+                get_workspace(bucket, ws_id)["panes"][pane_id] = old
+            continue
         if status not in TRACKED_STATUSES:
             continue
         ws_id = a["workspace_id"]
@@ -7470,6 +7724,9 @@ def reconcile(cfg, state):
             "agent": a.get("display_agent") or a.get("agent") or "agent",
             "title": a.get("terminal_title_stripped") or "",
         }
+        old = previous.get(ws_id, {}).get("panes", {}).get(a["pane_id"], {})
+        if old.get("status") == status and old.get("notification_pending"):
+            ws["panes"][a["pane_id"]]["notification_pending"] = True
     for ws_id in ws_ids:
         update_pill(cfg, bucket, ws_id)
     # Clear pills/notifications left behind by workspaces that no longer have
@@ -7773,12 +8030,64 @@ def v1_owned_socket_publisher(path, environment, account_home):
         yield publisher
 
 
-def socket_rpc(sock_path, method, params, timeout=10):
+def v1_herdr_process_identity(pid):
+    if sys.platform == "darwin":
+        return v1_native_process_info(pid)
+    if sys.platform.startswith("linux") and type(pid) is int and pid > 1:
+        try:
+            directory = Path("/proc") / str(pid)
+            if directory.stat().st_uid != os.getuid():
+                return None
+            fields = (directory / "stat").read_text().rsplit(")", 1)[1].split()
+            return {"start_token": int(fields[19])}
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def v1_check_herdr_source_fence(sock_path):
+    fence = HERDR_SOURCE_FENCE.get()
+    if fence is None:
+        return None
+    if (
+        str(sock_path) != fence["path"]
+        or v1_local_generation(sock_path) != fence["generation"]
+    ):
+        raise SocketError("Herdr source socket changed")
+    identity = v1_herdr_process_identity(fence["pid"])
+    if identity is None or identity.get("start_token") != fence["start_token"]:
+        raise SocketError("Herdr source process changed")
+    return fence["pid"]
+
+
+def v1_check_connected_herdr_peer(sock, expected_peer):
+    if expected_peer is None:
+        return
+    if sys.platform == "darwin":
+        peer_pid = sock.getsockopt(0, 2)  # SOL_LOCAL, LOCAL_PEERPID
+    elif sys.platform.startswith("linux"):
+        credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        peer_pid, _uid, _gid = struct.unpack("3i", credentials)
+    else:
+        raise SocketError("cannot verify Herdr socket peer")
+    if peer_pid != expected_peer:
+        raise SocketError("Herdr server incarnation changed")
+
+
+def socket_rpc(sock_path, method, params, timeout=10, *, expected_peer=None):
     """Single NDJSON request/response against a herdr API socket."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
         s.connect(str(sock_path))
+        fenced_peer = v1_check_herdr_source_fence(sock_path)
+        if (
+            expected_peer is not None
+            and fenced_peer is not None
+            and expected_peer != fenced_peer
+        ):
+            raise SocketError("Herdr server identity conflict")
+        v1_check_connected_herdr_peer(s, expected_peer or fenced_peer)
         s.sendall(
             json.dumps({"id": "1", "method": method, "params": params}).encode() + b"\n"
         )
@@ -7927,8 +8236,10 @@ def remote_ref(cfg, rstate, name, entry):
 def remote_notify(cfg, rstate, name, entry, title, body):
     ref = remote_ref(cfg, rstate, name, entry)
     if not ref:
-        return
-    cmux_cli(
+        return False
+    if not legacy_notification_preflight(cfg, ref):
+        return False
+    return cmux_cli(
         cfg,
         [
             "notify",
@@ -7945,16 +8256,8 @@ def remote_notify(cfg, rstate, name, entry, title, body):
 
 
 def remote_mark_read_ref(cfg, rstate, name, ref):
-    """Mark a workspace read, unless another herdr source with attention
-    panes still targets it (mark-notification-read is workspace-wide)."""
-    for other_name, other in rstate.get("remotes", {}).items():
-        if other_name == name:
-            continue
-        if other.get("ref") == ref and has_attention_panes(other.get("panes", {})):
-            return
-    if ref in local_attention_refs(cfg):
-        return
-    cmux_cli(cfg, ["mark-notification-read", "--workspace", ref])
+    """Legacy remote notifications lack IDs; leave unrelated notices untouched."""
+    return
 
 
 def remote_mark_read(cfg, rstate, name, entry):
@@ -7992,10 +8295,12 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     entry = rstate["remotes"].setdefault(name, {"panes": {}})
     changed = False
     identity = [rcfg["ssh_target"], rcfg["session"]]
-    if entry.get("identity") != identity:
+    same_identity = entry.get("identity") == identity
+    if not same_identity:
         # Retargeted: the cached socket path belongs to the previous target.
         entry["identity"] = identity
         entry.pop("socket_path", None)
+        entry.pop("pending_notifications", None)
         changed = True
     cmux_title = rcfg.get("cmux_title") or ""
     if entry.get("cmux_title") != cmux_title:
@@ -8007,6 +8312,13 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
     new = {}
     for a in agents:
         status = a.get("agent_status")
+        if (
+            same_identity
+            and status == "unknown"
+            and old.get(a.get("pane_id"), {}).get("status") == "blocked"
+        ):
+            new[a["pane_id"]] = old[a["pane_id"]]
+            continue
         if status not in TRACKED_STATUSES:
             continue
         new[a["pane_id"]] = {
@@ -8015,6 +8327,42 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
             "title": a.get("terminal_title_stripped") or a.get("terminal_title") or "",
             "workspace_id": a.get("workspace_id") or "",
         }
+    if same_identity:
+        present = {a.get("pane_id") for a in agents}
+        for pane_id, pane in old.items():
+            if pane_id not in present and pane.get("status") == "blocked":
+                new[pane_id] = pane
+    pending = entry.setdefault("pending_notifications", {})
+    for pane_id in list(pending):
+        if new.get(pane_id, {}).get("status") != pending[pane_id]:
+            del pending[pane_id]
+            changed = True
+
+    label = cmux_title or name
+    observed_statuses = {a.get("pane_id"): a.get("agent_status") for a in agents}
+    for pid, p in new.items():
+        if observed_statuses.get(pid) != p["status"]:
+            continue
+        prev = old_statuses.get(pid)
+        if prev == p["status"] and pending.get(pid) != p["status"]:
+            continue
+        what = p["title"] or labels.get(p["workspace_id"]) or pid
+        if p["status"] in ATTENTION_STATUSES:
+            body = f"{label} · {what}"
+            title = (
+                f"{p['agent']}: waiting for input"
+                if p["status"] == "blocked"
+                else f"{p['agent']}: finished"
+            )
+            sent = remote_notify(cfg, rstate, name, entry, title, body)
+            if sent:
+                if pid in pending:
+                    del pending[pid]
+                    changed = True
+            elif pending.get(pid) != p["status"]:
+                pending[pid] = p["status"]
+                changed = True
+
     if new == old:
         # Republish when the pill was never pushed (e.g. the cmux workspace
         # did not exist yet, or the title just changed) or may have been lost
@@ -8023,21 +8371,6 @@ def apply_remote_snapshot(cfg, rstate, name, rcfg, agents, labels):
         if stale or not entry.get("pill_published"):
             update_remote_pill(cfg, rstate, name, entry)
         return changed
-
-    label = cmux_title or name
-    for pid, p in new.items():
-        prev = old_statuses.get(pid)
-        if prev == p["status"]:
-            continue
-        what = p["title"] or labels.get(p["workspace_id"]) or pid
-        if p["status"] in ATTENTION_STATUSES:
-            body = f"{label} · {what}"
-            if p["status"] == "blocked":
-                remote_notify(
-                    cfg, rstate, name, entry, f"{p['agent']}: waiting for input", body
-                )
-            else:
-                remote_notify(cfg, rstate, name, entry, f"{p['agent']}: finished", body)
 
     removed = [pid for pid in old if pid not in new]
     if removed:
@@ -9094,6 +9427,9 @@ def apply_watch_event(cfg, state, sock_path, data, *, session=None, tracked=None
     bucket = session_bucket(state, session)
     if pane_id not in bucket["workspaces"].get(ws_id, {}).get("panes", {}):
         return
+    pane = bucket["workspaces"][ws_id]["panes"][pane_id]
+    if data.get("agent_status") == "unknown" and pane.get("status") == "blocked":
+        return
     if tracked if tracked is not None else pane_is_tracked(sock_path, pane_id):
         return
     forget_pane(cfg, bucket, ws_id, pane_id)
@@ -9127,9 +9463,9 @@ def handle_watch_event(cfg, sock_path, data):
         save_state(state)
 
 
-def session_socket_path():
+def session_socket_path(session=None):
     """API socket of the herdr session this process was spawned from."""
-    name = current_session()
+    name = current_session() if session is None else session
     binary = os.environ.get("HERDR_BIN_PATH", "herdr")
     try:
         proc = run([binary, "session", "list", "--json"])
@@ -9149,6 +9485,32 @@ def session_socket_path():
             return session.get("socket_path")
     log(f"watch: no API socket for herdr session {name!r}")
     return None
+
+
+def v1_running_local_socket_paths():
+    """Return the complete, unambiguous inventory of running local API sockets."""
+    binary = os.environ.get("HERDR_BIN_PATH", "herdr")
+    try:
+        proc = run([binary, "session", "list", "--json"])
+        if proc.returncode:
+            return None
+        sessions = json.loads(proc.stdout).get("sessions")
+        if not isinstance(sessions, list) or len(sessions) > 4096:
+            return None
+        paths = []
+        for entry in sessions:
+            if not isinstance(entry, dict) or type(entry.get("running")) is not bool:
+                return None
+            if not entry["running"]:
+                continue
+            path = entry.get("socket_path")
+            if not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path:
+                return None
+            paths.append(path)
+        identities = [os.path.realpath(path) for path in paths]
+        return paths if len(identities) == len(set(identities)) else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, AttributeError):
+        return None
 
 
 def v1_local_socket(session):
@@ -9175,6 +9537,7 @@ def open_subscription(sock_path, subscriptions, *, timeout=None):
         if timeout is not None:
             conn.settimeout(timeout)
         conn.connect(str(sock_path))
+        v1_check_connected_herdr_peer(conn, v1_check_herdr_source_fence(sock_path))
         conn.sendall(
             json.dumps(
                 {
@@ -9350,6 +9713,7 @@ def v1_watch_supervised_source(source_id, target, on_ready, *, on_not_ready=None
         token_stop = threading.Event()
         token_worker = None
         notified = False
+        fence_token = None
         try:
             if target.get("remote"):
                 sock = ensure_forward(name, v1_remote_config(target), entry, procs)
@@ -9359,6 +9723,34 @@ def v1_watch_supervised_source(source_id, target, on_ready, *, on_not_ready=None
             else:
                 sock = target["socket_path"]
                 generation = v1_local_generation(sock)
+            if target.get("socket_generation") is not None and (
+                generation != target["socket_generation"]
+            ):
+                return False
+            fence = None
+            if target.get("server_boot_id") is None:
+                if (
+                    target.get("remote")
+                    or target.get("socket_generation") != generation
+                ):
+                    return False
+                peer_pid = v1_unix_peer_pid(str(sock))
+                peer = v1_native_process_info(peer_pid)
+                if peer is None:
+                    return False
+                if (
+                    target.get("server_pid", peer_pid) != peer_pid
+                    or target.get("server_start_token", peer["start_token"])
+                    != peer["start_token"]
+                ):
+                    return False
+                fence = {
+                    "path": str(sock),
+                    "generation": generation,
+                    "pid": peer_pid,
+                    "start_token": peer["start_token"],
+                }
+                fence_token = HERDR_SOURCE_FENCE.set(fence)
 
             def on_change():
                 nonlocal notified, token_worker
@@ -9367,7 +9759,13 @@ def v1_watch_supervised_source(source_id, target, on_ready, *, on_not_ready=None
                     notified = True
                     token_worker = threading.Thread(
                         target=v1_supervised_token_loop,
-                        args=(source_id, sock, target["server_boot_id"], token_stop),
+                        args=(
+                            source_id,
+                            sock,
+                            target.get("server_boot_id"),
+                            token_stop,
+                            fence,
+                        ),
                         daemon=True,
                     )
                     token_worker.start()
@@ -9377,10 +9775,12 @@ def v1_watch_supervised_source(source_id, target, on_ready, *, on_not_ready=None
                 generation,
                 sock,
                 on_change=on_change,
-                expected_boot=target["server_boot_id"],
+                expected_boot=target.get("server_boot_id"),
             )
             return True
         finally:
+            if fence_token is not None:
+                HERDR_SOURCE_FENCE.reset(fence_token)
             if notified and on_not_ready is not None:
                 on_not_ready()
             token_stop.set()
@@ -9390,19 +9790,23 @@ def v1_watch_supervised_source(source_id, target, on_ready, *, on_not_ready=None
                 drop_forward(name, entry, procs)
 
 
-def v1_supervised_token_loop(source_id, socket_path, expected_boot, stop):
+def v1_supervised_token_loop(source_id, socket_path, expected_boot, stop, fence=None):
     """Synchronize force-read tokens without waiting for discovery."""
-    while not stop.is_set():
-        try:
-            if (state_dir / "v1-enabled").read_text() == "enabled":
-                sync_v1_episode_tokens(
-                    source_id, socket_path, expected_boot=expected_boot
-                )
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            log(f"v1 supervised token sync failed: {error}")
-        stop.wait(1)
+    token = HERDR_SOURCE_FENCE.set(fence)
+    try:
+        while not stop.is_set():
+            try:
+                if (state_dir / "v1-enabled").read_text() == "enabled":
+                    sync_v1_episode_tokens(
+                        source_id, socket_path, expected_boot=expected_boot
+                    )
+            except FileNotFoundError:
+                pass
+            except (OSError, SocketError, ValueError, KeyError, TypeError) as error:
+                log(f"v1 supervised token sync failed: {error}")
+            stop.wait(1)
+    finally:
+        HERDR_SOURCE_FENCE.reset(token)
 
 
 def run_v1_supervised_source(
@@ -9778,6 +10182,15 @@ def watch_loop(cfg, *, on_ready=None):
         backoff = min(backoff * 2, WATCH_MAX_BACKOFF_SECONDS)
 
 
+def legacy_retry_loop(cfg, stop, session=None):
+    while not stop.is_set():
+        try:
+            retry_legacy_notifications(cfg, session=session)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            log(f"legacy notification retry failed: {error}")
+        stop.wait(1)
+
+
 def watch_daemon(cfg):
     session = current_session()
     restore_pid = os.environ.get("CMUX_HERDR_RESTORE_PID", "")
@@ -9798,12 +10211,19 @@ def watch_daemon(cfg):
         pid_path.write_text(json.dumps({**daemon_self_info(), "handoff_protocol": 1}))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     log(f"watch daemon started (pid {os.getpid()}) for session {session or 'default'}")
+    retry_stop = threading.Event()
+    retry_worker = threading.Thread(
+        target=legacy_retry_loop, args=(cfg, retry_stop, session), daemon=True
+    )
+    retry_worker.start()
     try:
         watch_loop(
             cfg,
             on_ready=lambda: ack_v1_legacy_ready("watch", session or ""),
         )
     finally:
+        retry_stop.set()
+        retry_worker.join()
         # Only unlink our own pidfile; a replacement may already own it.
         try:
             if read_pidfile(pid_path).get("pid") == os.getpid():
@@ -9855,10 +10275,16 @@ def main():
         try:
             source_id, target = sys.argv[2], json.loads(sys.argv[3])
             boot = target.get("server_boot_id")
+            socket_generation = target.get("socket_generation")
             if (
                 not isinstance(target, dict)
-                or not isinstance(boot, str)
-                or not re.fullmatch(r"[0-9a-f]{32}", boot)
+                or not (
+                    isinstance(boot, str)
+                    and re.fullmatch(r"[0-9a-f]{32}", boot)
+                    or boot is None
+                    and isinstance(socket_generation, str)
+                    and re.fullmatch(r"\d+:\d+", socket_generation)
+                )
                 or source_id != v1_supervised_source_key(target)
             ):
                 return 2
