@@ -5121,8 +5121,6 @@ class V1SupervisedSources:
         all_ready = True
         for source_id, bindings in grouped.items():
             target = bindings[0][1]["target"].copy()
-            if not target.get("remote"):
-                target["socket_path"] = os.path.realpath(target["socket_path"])
             existing = self._workers.get(source_id)
             if existing and (
                 not existing["worker"].alive or existing["target"] != target
@@ -5165,10 +5163,12 @@ class V1SupervisedSources:
         if not entry or not entry["worker"].alive or not entry["worker"].ready:
             return None
         prepared = entry["target"]
+        comparison = prepared.copy()
         candidate = target.copy()
         if not candidate.get("remote"):
             candidate["socket_path"] = os.path.realpath(candidate["socket_path"])
-        return prepared.copy() if prepared == candidate else None
+            comparison["socket_path"] = os.path.realpath(comparison["socket_path"])
+        return prepared.copy() if comparison == candidate else None
 
     def current_ready(self, desired):
         """Read worker readiness independently of the discovery loop."""
@@ -7398,46 +7398,6 @@ def sweep_notifications(cfg, state):
     return
 
 
-def clear_legacy_sidebar_logs(cfg, state):
-    """One-time migration: drop sidebar log entries written by old versions.
-
-    Versions before 0.5.0 appended every status transition to the cmux
-    sidebar log, where entries pile up forever. The sidebar now shows
-    current state only (keyed status entries), so the accumulated history
-    is cleared once from every workspace this plugin ever wrote to. Log
-    entries are workspace-wide and cannot be filtered by source, so this
-    also drops unrelated entries on those workspaces.
-    """
-    if state.get("legacy_log_cleared"):
-        return
-    titles = cmux_workspaces_by_title(cfg)
-    if not titles:
-        return  # cmux unreachable; retry on the next reconcile
-    refs = set()
-    # Workspaces still carrying herdr status keys.
-    for ref in titles.values():
-        if cmux_herdr_status_keys(cfg, ref):
-            refs.add(ref)
-    # Workspaces known to the plugin state, by explicit mapping or label.
-    for _, ws_id, ws in all_workspaces(state):
-        ref = cfg.get("workspaces", {}).get(ws_id)
-        label = ws.get("label") or ""
-        if not ref:
-            ref = cfg.get("labels", {}).get(label)
-        if not ref and label:
-            ref = titles.get(label.strip().lower())
-        if ref:
-            refs.add(ref)
-    # Workspaces the remote daemon wrote to.
-    for r in load_remote_state().get("remotes", {}).values():
-        ref = r.get("ref") or titles.get((r.get("cmux_title") or "").strip().lower())
-        if ref:
-            refs.add(ref)
-    for ref in sorted(refs):
-        cmux_cli(cfg, ["clear-log", "--workspace", ref])
-    state["legacy_log_cleared"] = True
-
-
 def get_workspace(bucket, ws_id):
     ws = bucket["workspaces"].setdefault(ws_id, {"label": "", "panes": {}})
     ws.setdefault("panes", {})  # entries from older versions may lack it
@@ -7700,7 +7660,6 @@ def reconcile(cfg, state):
     except Exception as e:
         log(f"reconcile: agent list failed: {e}")
         return
-    clear_legacy_sidebar_logs(cfg, state)
     bucket = session_bucket(state)
     previous = dict(bucket["workspaces"])
     bucket["workspaces"].clear()

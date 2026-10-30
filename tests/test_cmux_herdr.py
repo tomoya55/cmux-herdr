@@ -2173,7 +2173,6 @@ def test_reconcile_preserves_pending_notification_for_same_attention(
     monkeypatch.setattr(
         ch, "herdr_cli", lambda args: {"agents": [remote_agent("w1:p1", "blocked")]}
     )
-    monkeypatch.setattr(ch, "clear_legacy_sidebar_logs", lambda *args: None)
     monkeypatch.setattr(ch, "prune_dead_sessions", lambda *args: None)
     monkeypatch.setattr(ch, "sweep_orphan_pills", lambda *args: None)
     ch.reconcile(cfg, state)
@@ -2189,7 +2188,6 @@ def test_reconcile_preserves_blocked_when_status_unknown(
     monkeypatch.setattr(
         ch, "herdr_cli", lambda args: {"agents": [remote_agent("w1:p1", "unknown")]}
     )
-    monkeypatch.setattr(ch, "clear_legacy_sidebar_logs", lambda *args: None)
     monkeypatch.setattr(ch, "prune_dead_sessions", lambda *args: None)
     monkeypatch.setattr(ch, "sweep_orphan_pills", lambda *args: None)
     ch.reconcile(cfg, state)
@@ -2568,9 +2566,7 @@ def test_sweep_keeps_active_per_pane_keys(monkeypatch, cfg, state):
     assert [c for c in calls if c[0] == "clear-status"] == []
 
 
-def test_reconcile_clears_legacy_sidebar_log_once(monkeypatch, cfg, state):
-    # Workspaces this plugin wrote to (status keys, or a mapping from state)
-    # get one clear-log; the migration never repeats.
+def test_reconcile_preserves_workspace_sidebar_logs(monkeypatch, cfg, state):
     ch.session_bucket(state)["workspaces"]["w2"] = {"label": "other", "panes": {}}
     responses = {
         "list-workspaces": "workspace:1  hd:tom\nworkspace:2  other\nworkspace:3  x\n",
@@ -2582,11 +2578,7 @@ def test_reconcile_clears_legacy_sidebar_log_once(monkeypatch, cfg, state):
 
     ch.reconcile(cfg, state)
     clears = [c for c in calls if c[0] == "clear-log"]
-    assert clears == [
-        ["clear-log", "--workspace", "workspace:1"],
-        ["clear-log", "--workspace", "workspace:2"],
-    ]
-    assert state["legacy_log_cleared"] is True
+    assert clears == []
 
     calls.clear()
     ch.reconcile(cfg, state)
@@ -6196,6 +6188,40 @@ def test_v1_supervisor_groups_symlink_aliases_for_same_source(tmp_path):
             "c2": other,
         }
         assert len(started) == 1
+    finally:
+        manager.close()
+
+
+def test_v1_supervisor_preserves_discovered_socket_path(tmp_path):
+    class Worker:
+        ready = True
+        alive = True
+
+        def stop(self):
+            self.alive = False
+
+    path = tmp_path / "source.sock"
+    path.touch()
+    alias = tmp_path / "alias.sock"
+    alias.symlink_to(path)
+    started = []
+    manager = ch.V1SupervisedSources(
+        lambda key, target: started.append(target) or Worker()
+    )
+    spec = {
+        "workspace": "w",
+        "surface": "s",
+        "target": {
+            "remote": None,
+            "socket_path": str(alias),
+            "server_boot_id": "a" * 32,
+        },
+        "connection_generation": 1,
+    }
+    try:
+        manager.reconcile({"c": spec}, complete=True)
+        assert started[0]["socket_path"] == str(alias)
+        assert manager.current_ready({"c": spec}) == {"c": spec}
     finally:
         manager.close()
 
