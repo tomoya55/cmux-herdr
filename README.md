@@ -44,7 +44,7 @@ Invoke the Herdr plugin action **Mark focused agent result as read** for the age
 
 ```toml
 [[keys.command]]
-key = "prefix+r"
+key = "prefix+a"
 type = "plugin_action"
 command = "cmux-herdr.mark-agent-read"
 description = "mark focused agent result as read"
