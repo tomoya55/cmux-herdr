@@ -6065,7 +6065,34 @@ def v1_maybe_supervisor_handoff(cfg, sources, stop, verified, environment):
     return v1_try_supervisor_handoff(cfg, sources, stop, final_check=ready_for_handoff)
 
 
-def v1_run_supervisor(cfg, stop):
+def v1_runtime_config_valid(cfg):
+    if not isinstance(cfg, dict):
+        return False
+    if "cmux_bin" in cfg and not isinstance(cfg["cmux_bin"], str):
+        return False
+    if "match_by_label" in cfg and type(cfg["match_by_label"]) is not bool:
+        return False
+    for name in ("workspaces", "labels"):
+        value = cfg.get(name, {})
+        if not isinstance(value, dict) or any(
+            not isinstance(key, str) or not isinstance(ref, str)
+            for key, ref in value.items()
+        ):
+            return False
+    remotes = remote_configs(cfg)
+    if remotes is None:
+        return False
+    binaries = {}
+    for entry in remotes:
+        binary = entry.get("herdr_bin")
+        if binary:
+            binaries.setdefault((entry["ssh_target"], entry["session"]), set()).add(
+                binary
+            )
+    return all(len(paths) == 1 for paths in binaries.values())
+
+
+def v1_run_supervisor(cfg, stop, *, config_changed=lambda: False):
     """Maintain discovered bindings; publish only after migration commits."""
     leases = V1SupervisedLeases()
     if not leases.acquire_leader():
@@ -6092,6 +6119,8 @@ def v1_run_supervisor(cfg, stop):
         recovery_ready = False
         while not stop.is_set():
             try:
+                if config_changed():
+                    return "config-changed"
                 if time.monotonic() >= next_recovery:
                     recovery_ready = v1_recover_legacy_handoff()
                     next_recovery = time.monotonic() + 5
@@ -10226,7 +10255,36 @@ def main():
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
-        v1_run_supervisor(load_config(), stop)
+        cfg = None
+        while not stop.is_set():
+            candidate = load_config_strict()
+            if candidate is not None and v1_runtime_config_valid(candidate):
+                cfg = candidate
+                break
+            stop.wait(1)
+        if cfg is None:
+            return 0
+        while not stop.is_set():
+            changed_to = []
+
+            def config_changed(current_cfg=cfg, next_config=changed_to):
+                current = load_config_strict()
+                if (
+                    current is None
+                    or current == current_cfg
+                    or not v1_runtime_config_valid(current)
+                ):
+                    return False
+                next_config[:] = [current]
+                return True
+
+            if (
+                v1_run_supervisor(cfg, stop, config_changed=config_changed)
+                != "config-changed"
+            ):
+                break
+            if changed_to:
+                cfg = changed_to[0]
         return 0
     if mode == "supervisor-source":
         if len(sys.argv) != 4:

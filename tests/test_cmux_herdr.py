@@ -1815,6 +1815,46 @@ def test_v1_supervisor_starts_and_joins_ordinary_publisher(monkeypatch):
     ]
 
 
+def test_v1_supervisor_restarts_after_configuration_change(monkeypatch):
+    calls = []
+
+    class Leases:
+        def acquire_leader(self):
+            return True
+
+        def reconcile(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            calls.append("leases closed")
+
+    class Sources:
+        def __init__(self, _start):
+            pass
+
+        def close(self):
+            calls.append("sources closed")
+
+    class Thread:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self):
+            calls.append("publisher joined")
+
+    monkeypatch.setattr(ch, "V1SupervisedLeases", Leases)
+    monkeypatch.setattr(ch, "V1SupervisedSources", Sources)
+    monkeypatch.setattr(ch.threading, "Thread", Thread)
+    stop = SimpleNamespace(is_set=lambda: False)
+    assert (
+        ch.v1_run_supervisor({}, stop, config_changed=lambda: True) == "config-changed"
+    )
+    assert calls == ["publisher joined", "sources closed", "leases closed"]
+
+
 def test_v1_owned_supervisor_publishes_partial_scope_during_migration(
     monkeypatch, tmp_path
 ):
@@ -14815,13 +14855,117 @@ def test_supervisor_entry_runs_only_for_cmux_interactive_client(monkeypatch, tmp
     monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
     monkeypatch.setattr(ch, "load_config", lambda: {})
     calls = []
-    monkeypatch.setattr(ch, "v1_run_supervisor", lambda cfg, stop: calls.append(cfg))
+    monkeypatch.setattr(
+        ch, "v1_run_supervisor", lambda cfg, stop, **kwargs: calls.append(cfg)
+    )
     assert ch.main() == 0
     assert calls == [{}]
     calls.clear()
     monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "supervisor", "api", "schema"])
     assert ch.main() == 0
     assert not calls
+
+
+def test_supervisor_entry_reloads_configuration_after_change(monkeypatch, tmp_path):
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "w")
+    monkeypatch.setenv("CMUX_SURFACE_ID", "s")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_PLUGIN_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "supervisor"])
+    monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
+    configs = iter([{"value": "old"}, {"value": "new"}, {"value": "new"}])
+    monkeypatch.setattr(ch, "load_config_strict", lambda: next(configs))
+    calls = []
+
+    def run(cfg, stop, **kwargs):
+        calls.append(cfg)
+        return "config-changed" if kwargs["config_changed"]() else True
+
+    monkeypatch.setattr(ch, "v1_run_supervisor", run)
+    assert ch.main() == 0
+    assert calls == [{"value": "old"}, {"value": "new"}]
+
+
+def test_supervisor_keeps_running_on_invalid_remote_configuration(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "w")
+    monkeypatch.setenv("CMUX_SURFACE_ID", "s")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_PLUGIN_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "supervisor"])
+    monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
+    configs = iter([{}, {"remotes": "invalid"}])
+    monkeypatch.setattr(ch, "load_config_strict", lambda: next(configs))
+
+    def run(cfg, stop, *, config_changed):
+        assert not config_changed()
+        return True
+
+    monkeypatch.setattr(ch, "v1_run_supervisor", run)
+    assert ch.main() == 0
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"cmux_bin": 5},
+        {"workspaces": "bad"},
+        {"labels": {"x": 4}},
+        {"match_by_label": "yes"},
+    ],
+)
+def test_supervisor_rejects_malformed_runtime_configuration(invalid):
+    assert not ch.v1_runtime_config_valid(invalid)
+    assert ch.v1_runtime_config_valid({})
+
+
+def test_supervisor_waits_for_valid_initial_configuration(monkeypatch, tmp_path):
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", "w")
+    monkeypatch.setenv("CMUX_SURFACE_ID", "s")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("HERDR_PLUGIN_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "supervisor"])
+    monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
+    configs = iter([{"cmux_bin": 5}, {"cmux_bin": "/valid"}])
+    monkeypatch.setattr(ch, "load_config_strict", lambda: next(configs))
+
+    class Stop:
+        def is_set(self):
+            return False
+
+        def wait(self, timeout):
+            return False
+
+    monkeypatch.setattr(ch.threading, "Event", Stop)
+    calls = []
+    monkeypatch.setattr(
+        ch, "v1_run_supervisor", lambda cfg, stop, **kwargs: calls.append(cfg)
+    )
+    assert ch.main() == 0
+    assert calls == [{"cmux_bin": "/valid"}]
+
+
+def test_supervisor_rejects_conflicting_executables_for_same_remote():
+    cfg = {
+        "remotes": [
+            {
+                "name": "a",
+                "ssh_target": "host",
+                "session": "work",
+                "cmux_title": "a",
+                "herdr_bin": "/one/herdr",
+            },
+            {
+                "name": "b",
+                "ssh_target": "host",
+                "session": "work",
+                "cmux_title": "b",
+                "herdr_bin": "/two/herdr",
+            },
+        ]
+    }
+    assert not ch.v1_runtime_config_valid(cfg)
 
 
 def test_zsh_integration_runs_supervisor_only_in_cmux_and_preserves_exit(tmp_path):
