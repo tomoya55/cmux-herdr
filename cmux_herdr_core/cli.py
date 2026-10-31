@@ -44,107 +44,122 @@ def main():
     if mode == "force-read":
         return 0 if focus.v1_force_read_action() else 1
     if mode == "supervisor":
-        if (
-            not core.interactive_client_target(sys.argv[2:])
-            or not os.environ.get("CMUX_WORKSPACE_ID")
-            or not os.environ.get("CMUX_SURFACE_ID")
-        ):
-            return 0
-        core.state_dir, core.config_dir = core.v1_plugin_paths(os.environ)
-        core.STATE_PATH = core.state_dir / "state.json"
-        stop = threading.Event()
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        cfg = None
-        while not stop.is_set():
-            candidate = core.load_config_strict()
-            if candidate is not None and supervisor.v1_runtime_config_valid(candidate):
-                cfg = candidate
-                break
-            stop.wait(core.LOOP_TICK_SECONDS)
-        if cfg is None:
-            return 0
-        while not stop.is_set():
-            changed_to = []
-
-            def config_changed(current_cfg=cfg, next_config=changed_to):
-                current = core.load_config_strict()
-                if (
-                    current is None
-                    or current == current_cfg
-                    or not supervisor.v1_runtime_config_valid(current)
-                ):
-                    return False
-                next_config[:] = [current]
-                return True
-
-            if (
-                supervisor.v1_run_supervisor(cfg, stop, config_changed=config_changed)
-                != "config-changed"
-            ):
-                break
-            if changed_to:
-                cfg = changed_to[0]
-        return 0
+        return _run_supervisor(sys.argv[2:])
     if mode == "supervisor-source":
-        if len(sys.argv) != 4:
-            return 2
-        try:
-            source_id, target = sys.argv[2], json.loads(sys.argv[3])
-            boot = target.get("server_boot_id")
-            socket_generation = target.get("socket_generation")
-            if (
-                not isinstance(target, dict)
-                or not (
-                    isinstance(boot, str)
-                    and re.fullmatch(r"[0-9a-f]{32}", boot)
-                    or boot is None
-                    and isinstance(socket_generation, str)
-                    and re.fullmatch(r"\d+:\d+", socket_generation)
-                )
-                or source_id != core.v1_supervised_source_key(target)
-            ):
-                return 2
-        except (ValueError, TypeError, AttributeError):
-            return 2
-        core.state_dir, core.config_dir = core.v1_plugin_paths(os.environ)
-        core.STATE_PATH = core.state_dir / "state.json"
-        stop = threading.Event()
-
-        def stop_source(*_args):
-            stop.set()
-            raise SystemExit(0)
-
-        signal.signal(signal.SIGTERM, stop_source)
-        parent_pid = os.getppid()
-        if parent_pid <= 1:
-            return 1
-        threading.Thread(
-            target=watcher.v1_watch_parent, args=(parent_pid, stop), daemon=True
-        ).start()
-        try:
-            watched = watcher.run_v1_supervised_source(
-                source_id,
-                target,
-                lambda: print("ready", flush=True),
-                stop,
-                on_not_ready=lambda: print("not-ready", flush=True),
-            )
-            return 0 if watched else 1
-        except (
-            remote_bridge.SocketError,
-            OSError,
-            ValueError,
-            KeyError,
-            subprocess.TimeoutExpired,
-        ) as error:
-            core.log(f"v1 supervised source failed: {error}")
-            return 1
-        finally:
-            stop.set()
+        return _run_supervisor_source(sys.argv[2:])
     if mode == "client":
         core.log("the per-client observer cannot safely migrate existing sessions")
         return 1
+    return _run_legacy(mode)
+
+
+def _use_plugin_paths():
+    core.state_dir, core.config_dir = core.v1_plugin_paths(os.environ)
+    core.STATE_PATH = core.state_dir / "state.json"
+
+
+def _run_supervisor(argv):
+    if (
+        not core.interactive_client_target(argv)
+        or not os.environ.get("CMUX_WORKSPACE_ID")
+        or not os.environ.get("CMUX_SURFACE_ID")
+    ):
+        return 0
+    _use_plugin_paths()
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    cfg = None
+    while not stop.is_set():
+        candidate = core.load_config_strict()
+        if candidate is not None and supervisor.v1_runtime_config_valid(candidate):
+            cfg = candidate
+            break
+        stop.wait(core.LOOP_TICK_SECONDS)
+    if cfg is None:
+        return 0
+    while not stop.is_set():
+        changed_to = []
+
+        def config_changed(current_cfg=cfg, next_config=changed_to):
+            current = core.load_config_strict()
+            if (
+                current is None
+                or current == current_cfg
+                or not supervisor.v1_runtime_config_valid(current)
+            ):
+                return False
+            next_config[:] = [current]
+            return True
+
+        if (
+            supervisor.v1_run_supervisor(cfg, stop, config_changed=config_changed)
+            != "config-changed"
+        ):
+            break
+        if changed_to:
+            cfg = changed_to[0]
+    return 0
+
+
+def _run_supervisor_source(argv):
+    if len(argv) != 2:
+        return 2
+    try:
+        source_id, target = argv[0], json.loads(argv[1])
+        boot = target.get("server_boot_id")
+        socket_generation = target.get("socket_generation")
+        if (
+            not isinstance(target, dict)
+            or not (
+                isinstance(boot, str)
+                and re.fullmatch(r"[0-9a-f]{32}", boot)
+                or boot is None
+                and isinstance(socket_generation, str)
+                and re.fullmatch(r"\d+:\d+", socket_generation)
+            )
+            or source_id != core.v1_supervised_source_key(target)
+        ):
+            return 2
+    except (ValueError, TypeError, AttributeError):
+        return 2
+    _use_plugin_paths()
+    stop = threading.Event()
+
+    def stop_source(*_args):
+        stop.set()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop_source)
+    parent_pid = os.getppid()
+    if parent_pid <= 1:
+        return 1
+    threading.Thread(
+        target=watcher.v1_watch_parent, args=(parent_pid, stop), daemon=True
+    ).start()
+    try:
+        watched = watcher.run_v1_supervised_source(
+            source_id,
+            target,
+            lambda: print("ready", flush=True),
+            stop,
+            on_not_ready=lambda: print("not-ready", flush=True),
+        )
+        return 0 if watched else 1
+    except (
+        remote_bridge.SocketError,
+        OSError,
+        ValueError,
+        KeyError,
+        subprocess.TimeoutExpired,
+    ) as error:
+        core.log(f"v1 supervised source failed: {error}")
+        return 1
+    finally:
+        stop.set()
+
+
+def _run_legacy(mode):
     if mode == "reconcile" and (core.state_dir / "v1-enabled").exists():
         return 0
     cfg = core.load_config()
