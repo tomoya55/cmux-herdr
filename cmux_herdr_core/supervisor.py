@@ -378,14 +378,6 @@ class V1PublicationVerification:
             self._complete = complete
             self._surfaces = copy.deepcopy(surface_complete)
 
-    def eligible(self):
-        with self._lock:
-            desired = self._desired
-            ready = self._sources.current_ready(desired)
-            if self._surfaces is None:
-                return v1_verified_publication_targets(desired, ready)
-            return v1_verified_publication_targets(desired, ready, self._surfaces)
-
     def scope(self):
         with self._lock:
             if not self._complete and self._surfaces is None:
