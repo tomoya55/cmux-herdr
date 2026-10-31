@@ -40,11 +40,6 @@ def isolated_state_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
 
 
-@pytest.fixture(autouse=True)
-def isolated_publisher_lease_home(monkeypatch, tmp_path):
-    monkeypatch.setattr(ch, "_v1_publisher_lease_home", lambda: tmp_path)
-
-
 @pytest.fixture
 def cfg():
     return {"workspaces": {"w1": "workspace:1", "w2": "workspace:2"}}

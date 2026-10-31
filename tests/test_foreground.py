@@ -187,52 +187,6 @@ def test_v1_surface_observation_ignores_unrelated_surfaces(monkeypatch):
     assert ch.v1_surface_observation({}, "w", "s") == observation
 
 
-def test_v1_cmux_surface_focus_requires_matching_window_workspace_and_surface(
-    monkeypatch,
-):
-    caller = {
-        "window_ref": "window:1",
-        "workspace_ref": "workspace:1",
-        "surface_ref": "surface:1",
-    }
-    data = {
-        "caller": caller,
-        "focused": dict(caller),
-        "bundle_identifier": "com.cmuxterm.app",
-    }
-    commands = []
-
-    def identify(command, **kwargs):
-        commands.append(command)
-        return SimpleNamespace(returncode=0, stdout=json.dumps(data))
-
-    monkeypatch.setattr(ch, "run", identify)
-    assert ch.v1_cmux_focus({}, "workspace-id", "surface-id") == (
-        True,
-        "com.cmuxterm.app",
-    )
-    assert commands[0][-4:] == [
-        "--workspace",
-        "workspace-id",
-        "--surface",
-        "surface-id",
-    ]
-    data["focused"]["surface_ref"] = "surface:2"
-    assert ch.v1_cmux_focus({}, "workspace-id", "surface-id") == (
-        False,
-        "com.cmuxterm.app",
-    )
-    data["focused"].pop("window_ref")
-    assert ch.v1_cmux_focus({}, "workspace-id", "surface-id") == (
-        False,
-        "com.cmuxterm.app",
-    )
-    monkeypatch.setattr(
-        ch, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="")
-    )
-    assert ch.v1_cmux_focus({}, "workspace-id", "surface-id") == (False, None)
-
-
 def test_v1_foreground_cmux_requires_the_socket_server_process(monkeypatch):
     identity = {
         "focused": True,

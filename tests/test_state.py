@@ -227,3 +227,14 @@ def test_v1_remote_source_rejects_invalid_remote_config(extra):
         ]
     }
     assert ch.v1_target_with_remote_config(config, target) is None
+
+
+def test_v1_source_has_single_leader_and_recovers_after_exit(monkeypatch, tmp_path):
+    with ch.v1_source_leader("remote:server:session") as first:
+        assert first is True
+        with ch.v1_source_leader("remote:server:session") as second:
+            assert second is False
+        with ch.v1_source_leader("remote:other:session") as other:
+            assert other is True
+    with ch.v1_source_leader("remote:server:session") as replacement:
+        assert replacement is True

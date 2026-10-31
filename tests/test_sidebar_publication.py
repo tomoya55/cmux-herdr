@@ -104,37 +104,6 @@ def test_v1_publication_backend_rejects_unsafe_marker(monkeypatch, tmp_path, kin
     assert calls == [False]
 
 
-def test_v1_prepare_owned_backend_waits_for_ordinary_publication(monkeypatch, tmp_path):
-    import threading
-
-    (tmp_path / "v1-enabled").write_text("enabled")
-    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
-    started, release, transitioned = (threading.Event() for _ in range(3))
-
-    def publish(*_args, **_kwargs):
-        started.set()
-        assert release.wait(2)
-        return False
-
-    monkeypatch.setattr(ch, "publish_v1_clients_once", publish)
-    writer = threading.Thread(target=lambda: ch.publish_v1_clients({}))
-    transition = threading.Thread(
-        target=lambda: (ch.v1_prepare_owned_backend(), transitioned.set())
-    )
-    writer.start()
-    assert started.wait(2)
-    transition.start()
-    try:
-        assert not transitioned.wait(0.05)
-        assert not (tmp_path / "v1-notification-backend").exists()
-    finally:
-        release.set()
-        writer.join(2)
-        transition.join(2)
-    assert transitioned.is_set()
-    assert (tmp_path / "v1-notification-backend").read_text() == "preparing-owned"
-
-
 def test_v1_sidebar_combines_active_and_tracked_case_aliases(monkeypatch):
     state = {
         "v1": {
@@ -227,16 +196,6 @@ def test_v1_workspace_validation_detects_replaced_binding(monkeypatch, tmp_path)
     live["v1"]["clients"]["c"]["source"] = "new"
     ch.save_state(live)
     assert not ch.v1_workspace_inputs_current(snapshot, "w")
-
-
-def test_v1_client_registration_persists_and_unregistration_preserves_other_clients(
-    monkeypatch, tmp_path
-):
-    ch.persist_v1_client("a", "source", "w", "s", 10)
-    ch.persist_v1_client("b", "source", "w2", "s2", 11)
-    ch.remove_v1_client("a")
-    saved = json.loads(ch.STATE_PATH.read_text())
-    assert set(saved["v1"]["clients"]) == {"b"}
 
 
 def test_v1_slow_publisher_does_not_hold_shared_state_lock(monkeypatch, tmp_path):

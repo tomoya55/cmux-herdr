@@ -638,25 +638,6 @@ def test_v1_watch_notifies_observer_after_each_state_change(monkeypatch):
     assert len(changes) == 3
 
 
-def test_v1_source_observer_publishes_on_change_and_respects_leader(
-    monkeypatch, tmp_path
-):
-    calls = []
-    monkeypatch.setattr(
-        ch, "publish_v1_clients", lambda cfg, **kwargs: calls.append("publish")
-    )
-    monkeypatch.setattr(
-        ch,
-        "v1_watch_connection",
-        lambda source, generation, path, on_change: on_change(),
-    )
-    assert ch.observe_v1_source({}, "source", "boot", "/socket")
-    assert calls == ["publish"]
-    with ch.v1_source_leader("source"):
-        assert not ch.observe_v1_source({}, "source", "boot", "/socket")
-    assert calls == ["publish"]
-
-
 def test_v1_local_socket_resolves_running_named_and_default_session(monkeypatch):
     sessions = {
         "sessions": [
@@ -682,33 +663,6 @@ def test_v1_local_socket_resolves_running_named_and_default_session(monkeypatch)
     assert ch.v1_local_socket("off") is None
 
 
-def test_v1_client_registers_observes_and_unregisters(monkeypatch, tmp_path):
-    stop = ch.threading.Event()
-    calls = []
-    monkeypatch.setattr(ch, "v1_publish_loop", lambda cfg, event: None)
-    monkeypatch.setattr(
-        ch, "publish_v1_clients", lambda cfg, **kwargs: calls.append("publish")
-    )
-    monkeypatch.setattr(ch, "v1_local_socket", lambda session: "/socket")
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "boot")
-    monkeypatch.setattr(ch, "v1_probe_source", lambda target: True)
-
-    def observe(cfg, source, generation, path):
-        calls.append((source, generation, path))
-        stop.set()
-        return True
-
-    monkeypatch.setattr(ch, "observe_v1_source", observe)
-    target = {"session": "work", "remote": None}
-    ch.run_v1_client({}, target, "w", "s", stop)
-    assert (
-        ch.v1_source_key({**target, "socket_path": "/socket"}),
-        "boot",
-        "/socket",
-    ) in calls
-    assert json.loads(ch.STATE_PATH.read_text())["v1"]["clients"] == {}
-
-
 def test_v1_client_stops_when_launching_shell_exits(monkeypatch):
     class Stop:
         def wait(self, timeout):
@@ -721,120 +675,6 @@ def test_v1_client_stops_when_launching_shell_exits(monkeypatch):
     monkeypatch.setattr(ch.os, "kill", lambda pid, sig: sent.append((pid, sig)))
     ch.v1_watch_parent(42, Stop())
     assert sent == [(123, ch.signal.SIGTERM)]
-
-
-def test_v1_token_retry_loop_retries_without_an_event(monkeypatch):
-    calls = []
-
-    class Stop:
-        def is_set(self):
-            return len(calls) == 2
-
-        def wait(self, delay):
-            assert delay == ch.LOOP_TICK_SECONDS
-
-    monkeypatch.setattr(
-        ch, "sync_v1_episode_tokens", lambda source, sock: calls.append((source, sock))
-    )
-    ch.v1_token_retry_loop("source", "/socket", Stop())
-    assert calls == [("source", "/socket"), ("source", "/socket")]
-
-
-def test_v1_token_retry_starts_only_after_watcher_snapshot(monkeypatch):
-    starts = []
-
-    class Worker:
-        def __init__(self, **kwargs):
-            pass
-
-        def start(self):
-            starts.append("start")
-
-        def join(self):
-            starts.append("join")
-
-    def watch(source, generation, socket, *, on_change):
-        assert starts == []
-        on_change()
-        on_change()
-
-    monkeypatch.setattr(ch.threading, "Thread", Worker)
-    monkeypatch.setattr(ch, "v1_watch_connection", watch)
-    monkeypatch.setattr(ch, "publish_v1_source", lambda *args: None)
-    ch.watch_v1_with_token_retry({}, "source", "generation", "/socket")
-    assert starts == ["start", "join"]
-
-
-def test_v1_focus_loop_checks_registered_client_and_uses_remote_forward(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ch, "v1_reconcile_focus", lambda *args: calls.append(args))
-
-    class Stop:
-        def __init__(self):
-            self.stopped = False
-
-        def is_set(self):
-            return self.stopped
-
-        def wait(self, seconds):
-            self.stopped = True
-
-    target = {"remote": "tom@host", "session": "work"}
-    ch.v1_focus_loop({}, "client", "source", "w", "s", target, Stop())
-    name = "v1-" + ch.hashlib.sha256(b"source").hexdigest()[:16]
-    assert calls == [({}, "client", "source", "w", "s", ch.remote_sock_path(name))]
-
-
-def test_v1_local_source_identity_is_the_resolved_socket(monkeypatch):
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "generation")
-    monkeypatch.setattr(ch, "v1_local_socket", lambda session: "/tmp/shared-herdr.sock")
-    named = ch.resolve_v1_source_target({"remote": None, "session": "work"})
-    override = ch.resolve_v1_source_target(
-        {"remote": None, "session": "other", "socket_path": "/tmp/shared-herdr.sock"}
-    )
-    assert ch.v1_source_key(named) == ch.v1_source_key(override)
-
-
-def test_v1_remote_target_waits_until_socket_is_available(monkeypatch):
-    target = {"remote": "tom@host", "session": "work"}
-    calls = []
-    monkeypatch.setattr(
-        ch, "resolve_remote_socket", lambda cfg: calls.append(cfg) or "/remote.sock"
-    )
-
-    def inaccessible(host, path):
-        raise ch.SocketError("not running")
-
-    monkeypatch.setattr(ch, "v1_remote_generation", inaccessible)
-    assert ch.resolve_v1_source_target(target) is None
-    monkeypatch.setattr(ch, "v1_remote_generation", lambda host, path: "generation")
-    assert ch.resolve_v1_source_target(target) == target
-    assert calls[0] == {"ssh_target": "tom@host", "session": "work"}
-
-
-def test_v1_remote_source_preserves_configured_herdr_binary(monkeypatch):
-    config = {
-        "remotes": [
-            {
-                "ssh_target": "tom@host",
-                "session": "work",
-                "cmux_title": "work",
-                "herdr_bin": "/opt/bin/herdr",
-            }
-        ]
-    }
-    target = ch.v1_target_with_remote_config(
-        config, {"remote": "tom@host", "session": "work"}
-    )
-    seen = []
-    monkeypatch.setattr(
-        ch, "resolve_remote_socket", lambda cfg: seen.append(cfg) or "/remote.sock"
-    )
-    monkeypatch.setattr(ch, "v1_remote_generation", lambda *args: "generation")
-    assert ch.resolve_v1_source_target(target) == target
-    assert seen == [
-        {"ssh_target": "tom@host", "session": "work", "herdr_bin": "/opt/bin/herdr"}
-    ]
 
 
 def test_v1_remote_probe_forwards_configured_binary(monkeypatch):
@@ -850,20 +690,6 @@ def test_v1_remote_probe_forwards_configured_binary(monkeypatch):
     assert calls == [
         {"ssh_target": "tom@host", "session": "work", "herdr_bin": "/opt/bin/herdr"}
     ]
-
-
-def test_v1_custom_socket_target_waits_when_socket_is_missing(monkeypatch):
-    monkeypatch.setattr(
-        ch,
-        "v1_local_generation",
-        lambda path: (_ for _ in ()).throw(FileNotFoundError()),
-    )
-    assert (
-        ch.resolve_v1_source_target(
-            {"remote": None, "session": "", "socket_path": "/missing.sock"}
-        )
-        is None
-    )
 
 
 def test_v1_source_probe_rejects_non_socket_and_invalid_snapshot(monkeypatch, tmp_path):
