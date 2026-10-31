@@ -4023,9 +4023,25 @@ def v1_focus_observations_match(before, after):
     return {**before, "observation": first} == {**after, "observation": second}
 
 
+def v1_has_acknowledgeable_completion(state, source_id):
+    attention = (
+        state.get("v1", {}).get("sources", {}).get(source_id, {}).get("attention", {})
+    )
+    return any(
+        isinstance(entry, dict)
+        and entry.get("status") == "done"
+        and not entry.get("provisional")
+        for entry in attention.values()
+    )
+
+
 def v1_reconcile_focus(cfg, client_id, source_id, workspace_id, surface_id, sock_path):
     """Acknowledge a completion only after two matching focus observations."""
     try:
+        # Focus observation spawns several cmux processes; skip it while the
+        # source has nothing focus could acknowledge.
+        if not v1_has_acknowledgeable_completion(load_state(), source_id):
+            return False
         if not v1_cmux_is_foreground(cfg, workspace_id, surface_id):
             return False
         before = v1_surface_observation(cfg, workspace_id, surface_id)

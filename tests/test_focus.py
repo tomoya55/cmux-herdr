@@ -627,3 +627,29 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
         ch.load_state()["v1"]["sources"]["src"]["attention"]["p"]["acknowledged"]
         == "g:t:7"
     )
+
+
+@pytest.mark.parametrize(
+    "attention",
+    [
+        {},
+        {"p": {"status": "blocked", "episode": "blocked"}},
+        {"p": {"status": "working"}},
+        {"p": {"acknowledged": "g:t:7"}},
+        {"p": {"status": "done", "episode": "g:t:7", "provisional": True}},
+    ],
+)
+def test_v1_focus_skips_observation_without_acknowledgeable_completion(
+    monkeypatch, attention
+):
+    ch.save_state({"v1": {"sources": {"src": {"attention": attention}}}})
+    calls = []
+    monkeypatch.setattr(
+        ch, "v1_cmux_is_foreground", lambda *args: calls.append("foreground")
+    )
+    monkeypatch.setattr(
+        ch, "v1_surface_observation", lambda *args: calls.append("observation")
+    )
+
+    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert calls == []
