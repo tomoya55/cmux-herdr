@@ -37,6 +37,19 @@ def test_state_roundtrip(monkeypatch, tmp_path):
     assert ch.load_state()["sessions"]["tom"]["workspaces"]["w1"]["label"] == "x"
 
 
+def test_save_state_skips_rewriting_identical_content(tmp_path):
+    path = tmp_path / "state.json"
+    ch.save_state({"sessions": {"tom": {}}})
+    written = path.stat().st_ino
+
+    ch.save_state({"sessions": {"tom": {}}})
+    assert path.stat().st_ino == written
+
+    ch.save_state({"sessions": {}})
+    assert path.stat().st_ino != written
+    assert ch.load_state() == {"sessions": {}}
+
+
 def test_load_state_drops_legacy_flat_format(monkeypatch, tmp_path):
     (tmp_path / "state.json").write_text(
         json.dumps(
