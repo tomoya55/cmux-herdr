@@ -1,7 +1,7 @@
 id = "cmux-herdr"
 name = "cmux-herdr"
-version = "0.6.0"
-min_herdr_version = "0.8.0"
+version = "1.0.0"
+min_herdr_version = "0.9.1"
 description = "Propagate herdr agent status to the cmux sidebar"
 platforms = ["macos"]
 
@@ -12,6 +12,11 @@ command = ["/bin/zsh", "-c", "python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" recon
 id = "refresh"
 title = "Refresh cmux sidebar"
 command = ["/bin/zsh", "-c", "python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" reconcile; nohup python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" remote </dev/null >>\"$HERDR_PLUGIN_STATE_DIR/remote.log\" 2>&1 &; nohup python3 \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" watch </dev/null >>\"$HERDR_PLUGIN_STATE_DIR/watch.log\" 2>&1 &"]
+
+[[actions]]
+id = "mark-agent-read"
+title = "Mark focused agent result as read"
+command = ["/bin/zsh", "-c", "for python in python3 python3.14 python3.13 python3.12 python3.11; do if command -v \"$python\" >/dev/null 2>&1 && \"$python\" -c 'import sys, tomllib; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then exec \"$python\" \"$HERDR_PLUGIN_ROOT/cmux_herdr.py\" force-read; fi; done; print -u2 'cmux-herdr: Python 3.11 or newer is required'; exit 1"]
 
 [[events]]
 on = "pane.agent_status_changed"

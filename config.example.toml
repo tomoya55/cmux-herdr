@@ -7,8 +7,9 @@ match_by_label = true
 
 # Remote herdr sessions to watch over SSH. The plugin spawns a local daemon
 # (from its startup hook) that forwards each remote session's herdr API
-# socket and polls agent status, so remote agents get the same sidebar
-# notifications and status pill as local ones.
+# socket and polls agent status. Remote client attribution may be ambiguous
+# with upstream Herdr, so v1 acknowledgment is not always available and a
+# configured remote can delay the v1 handoff. See README.md for limitations.
 #
 # Requirements per remote:
 # - non-interactive SSH auth (a key accepted by the remote host; the daemon
