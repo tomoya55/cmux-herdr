@@ -176,7 +176,7 @@ def v1_read_client_response(path, expected_peer=None, *, timeout=2):
             conn.settimeout(timeout)
             conn.connect(str(path))
             if expected_peer is not None and (
-                sys.platform != "darwin" or conn.getsockopt(0, 2) != expected_peer
+                sys.platform != "darwin" or core.darwin_peer_pid(conn) != expected_peer
             ):
                 return None
             data = b""

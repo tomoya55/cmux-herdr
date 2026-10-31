@@ -116,6 +116,15 @@ config_dir = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "."))
 STATE_PATH = state_dir / "state.json"
 
 
+# Darwin <sys/un.h>: socket option level and option for a Unix peer's PID.
+SOL_LOCAL = 0
+LOCAL_PEERPID = 2
+
+
+def darwin_peer_pid(sock):
+    return sock.getsockopt(SOL_LOCAL, LOCAL_PEERPID)
+
+
 def v1_plugin_paths(env):
     """Resolve the Herdr plugin directories for a shell-launched observer."""
     user_home = Path(env.get("HOME") or str(Path.home()))

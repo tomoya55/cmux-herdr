@@ -599,3 +599,17 @@ def test_v1_remote_probe_closes_forward_on_failure(monkeypatch):
     )
     assert not watcher.v1_probe_source({"remote": "tom@host", "session": "work"})
     assert len(calls) == 1 and calls[0].startswith("v1-probe-")
+
+
+def test_send_herdr_request_writes_one_ndjson_line():
+    sent = []
+    conn = SimpleNamespace(sendall=sent.append)
+    remote_bridge.send_herdr_request(conn, "1", "pane.list", {"a": 1})
+    assert sent == [b'{"id": "1", "method": "pane.list", "params": {"a": 1}}\n']
+
+
+def test_darwin_peer_pid_reads_local_peerpid_option():
+    calls = []
+    conn = SimpleNamespace(getsockopt=lambda *args: calls.append(args) or 42)
+    assert core.darwin_peer_pid(conn) == 42
+    assert calls == [(0, 2)]
