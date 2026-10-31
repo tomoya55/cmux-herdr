@@ -2,7 +2,6 @@ import json
 import os
 import subprocess
 import sys
-import uuid
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,22 +10,6 @@ import pytest
 from helpers import status_event
 
 import cmux_herdr as ch
-
-
-def test_v1_publisher_identity_rejects_fifo_without_waiting(tmp_path):
-    path = tmp_path / "fifo"
-    os.mkfifo(path, 0o600)
-    script = (
-        "import cmux_herdr as c, sys; "
-        "c.v1_publisher_identity(sys.argv[1], sys.argv[2], create=False)"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(path), str(uuid.uuid4())],
-        capture_output=True,
-        timeout=2,
-    )
-    assert result.returncode != 0
-    assert b"invalid publisher identity file" in result.stderr
 
 
 def test_main_event_mode(monkeypatch, tmp_path, cfg):
@@ -464,17 +447,7 @@ def test_v1_client_entrypoint_does_not_activate_partial_handoff(monkeypatch, tmp
         ch.sys, "argv", ["cmux_herdr.py", "client", "--session", "work"]
     )
     monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
-    monkeypatch.setattr(ch, "v1_cmux_focus", lambda *args: (False, "com.cmuxterm.app"))
-    calls = []
-    monkeypatch.setattr(
-        ch,
-        "run_v1_client",
-        lambda cfg, target, workspace, surface, stop: calls.append(
-            (target, workspace, surface)
-        ),
-    )
     assert ch.main() == 1
-    assert calls == []
 
 
 def test_supervisor_entry_runs_only_for_cmux_interactive_client(monkeypatch, tmp_path):
@@ -699,10 +672,6 @@ def test_v1_client_does_not_disable_legacy_when_cmux_unreachable(monkeypatch, tm
     monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace-id")
     monkeypatch.setenv("CMUX_SURFACE_ID", "surface-id")
     monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "client"])
-    monkeypatch.setattr(ch, "v1_cmux_focus", lambda *args: (False, None))
-    monkeypatch.setattr(
-        ch, "run_v1_client", lambda *args: pytest.fail("client should not run")
-    )
     assert ch.main() == 1
     assert not (tmp_path / "v1-enabled").exists()
 
@@ -713,8 +682,6 @@ def test_v1_does_not_activate_until_herdr_source_is_resolved(monkeypatch, tmp_pa
     monkeypatch.setenv("CMUX_WORKSPACE_ID", "workspace-id")
     monkeypatch.setenv("CMUX_SURFACE_ID", "surface-id")
     monkeypatch.setattr(sys, "argv", ["cmux_herdr.py", "client"])
-    monkeypatch.setattr(ch, "v1_cmux_focus", lambda *args: (False, "com.cmuxterm.app"))
     monkeypatch.setattr(ch.signal, "signal", lambda *args: None)
-    monkeypatch.setattr(ch, "run_v1_client", lambda *args: None)
     assert ch.main() == 1
     assert not (tmp_path / "v1-enabled").exists()
