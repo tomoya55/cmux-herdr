@@ -935,3 +935,23 @@ def test_local_discovery_does_not_guess_legacy_session_from_socket(monkeypatch):
     }
     target = next(iter(discovery.v1_discovered_targets(inventory).values()))
     assert "legacy_target" not in target
+
+
+def test_v1_process_named_matches_name_or_executable_basename():
+    assert discovery._v1_process_named("herdr", None, "herdr")
+    assert discovery._v1_process_named(None, "/usr/local/bin/herdr", "herdr")
+    assert not discovery._v1_process_named("zsh", "/bin/zsh", "herdr")
+    assert not discovery._v1_process_named("herdr-helper", None, "herdr")
+
+
+def test_v1_is_verified_upstream_server_requires_known_socket_paths(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        process_identity,
+        "v1_is_verified_local_server",
+        lambda pid, paths, *, deadline: calls.append((pid, paths)) or True,
+    )
+    assert not discovery._v1_is_verified_upstream_server(1, None, 0)
+    assert not discovery._v1_is_verified_upstream_server(1, lambda: None, 0)
+    assert discovery._v1_is_verified_upstream_server(1, lambda: ["/s"], 0)
+    assert calls == [(1, ["/s"])]

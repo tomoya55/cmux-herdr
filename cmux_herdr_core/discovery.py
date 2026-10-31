@@ -77,6 +77,30 @@ def v1_validate_discovery_tree(payload, deadline):
         return False
 
 
+def _v1_process_named(name, path, expected):
+    return name == expected or isinstance(path, str) and Path(path).name == expected
+
+
+def _v1_is_verified_upstream_server(pid, upstream_sockets, deadline):
+    """A Herdr server process on the surface is expected, not an unknown client."""
+    paths = upstream_sockets() if upstream_sockets is not None else None
+    return paths is not None and process_identity.v1_is_verified_local_server(
+        pid, paths, deadline=deadline
+    )
+
+
+def _v1_discovered_client(pid, workspace_id, surface_id, inventory, **extra):
+    return {
+        "pid": pid,
+        "workspace": workspace_id,
+        "surface": surface_id,
+        "instance": inventory["instance"],
+        "sources": inventory["sources"],
+        "sources_complete": inventory["sources_complete"],
+        **extra,
+    }
+
+
 def v1_discover_clients_in_tree(
     payload, directories, *, deadline=None, upstream_sockets=None
 ):
@@ -174,31 +198,15 @@ def v1_discover_clients_in_tree(
                                 continue
                             if pid in owners or pid in transports:
                                 continue
-                            if (
-                                name == "ssh"
-                                or isinstance(path, str)
-                                and Path(path).name == "ssh"
-                            ):
+                            if _v1_process_named(name, path, "ssh"):
                                 # A remote shell may hide a Herdr client.
                                 complete = False
                                 surface_complete[key] = False
-                            if not (
-                                name == "herdr"
-                                or isinstance(path, str)
-                                and Path(path).name == "herdr"
-                            ):
+                            if not _v1_process_named(name, path, "herdr"):
                                 continue
                             if type(process.get("tty_device")) is not int:
-                                paths = (
-                                    upstream_sockets()
-                                    if upstream_sockets is not None
-                                    else None
-                                )
-                                if (
-                                    paths is not None
-                                    and process_identity.v1_is_verified_local_server(
-                                        pid, paths, deadline=deadline
-                                    )
+                                if _v1_is_verified_upstream_server(
+                                    pid, upstream_sockets, deadline
                                 ):
                                     continue
                                 complete = False
@@ -209,17 +217,13 @@ def v1_discover_clients_in_tree(
                             if pid in native_clients:
                                 inventory, ownership = native_clients[pid]
                                 clients.append(
-                                    {
-                                        "pid": pid,
-                                        "workspace": workspace_id,
-                                        "surface": surface_id,
-                                        "instance": inventory["instance"],
-                                        "sources": inventory["sources"],
-                                        "sources_complete": inventory[
-                                            "sources_complete"
-                                        ],
-                                        "native_ownership": ownership,
-                                    }
+                                    _v1_discovered_client(
+                                        pid,
+                                        workspace_id,
+                                        surface_id,
+                                        inventory,
+                                        native_ownership=ownership,
+                                    )
                                 )
                                 continue
                             sockets = [
@@ -248,16 +252,8 @@ def v1_discover_clients_in_tree(
                             else:
                                 inventory = None
                             if not inventory:
-                                paths = (
-                                    upstream_sockets()
-                                    if upstream_sockets is not None
-                                    else None
-                                )
-                                if (
-                                    paths is not None
-                                    and process_identity.v1_is_verified_local_server(
-                                        pid, paths, deadline=deadline
-                                    )
+                                if _v1_is_verified_upstream_server(
+                                    pid, upstream_sockets, deadline
                                 ):
                                     continue
                                 complete = False
@@ -266,14 +262,9 @@ def v1_discover_clients_in_tree(
                             complete &= inventory["sources_complete"]
                             surface_complete[key] &= inventory["sources_complete"]
                             clients.append(
-                                {
-                                    "pid": pid,
-                                    "workspace": workspace_id,
-                                    "surface": surface_id,
-                                    "instance": inventory["instance"],
-                                    "sources": inventory["sources"],
-                                    "sources_complete": inventory["sources_complete"],
-                                }
+                                _v1_discovered_client(
+                                    pid, workspace_id, surface_id, inventory
+                                )
                             )
         return {
             "clients": clients,
