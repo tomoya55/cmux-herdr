@@ -712,7 +712,7 @@ def test_v1_client_registers_observes_and_unregisters(monkeypatch, tmp_path):
 def test_v1_client_stops_when_launching_shell_exits(monkeypatch):
     class Stop:
         def wait(self, timeout):
-            assert timeout == 1
+            assert timeout == ch.LOOP_TICK_SECONDS
             return False
 
     sent = []
@@ -731,7 +731,7 @@ def test_v1_token_retry_loop_retries_without_an_event(monkeypatch):
             return len(calls) == 2
 
         def wait(self, delay):
-            assert delay == 1
+            assert delay == ch.LOOP_TICK_SECONDS
 
     monkeypatch.setattr(
         ch, "sync_v1_episode_tokens", lambda source, sock: calls.append((source, sock))
