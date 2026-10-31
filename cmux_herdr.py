@@ -53,6 +53,9 @@ PANE_STATUS_PRIORITIES = {"blocked": "15", "done": "14", "working": "5"}
 DETECT_TTL_SECONDS = 300
 NOTIFICATION_SUBTITLE = "herdr"
 NOTIFICATION_TITLE_RE = re.compile(r": (waiting for input|finished)$")
+# Interval between iterations of the long-running supervisor, watch and
+# client loops.
+LOOP_TICK_SECONDS = 1.0
 
 REMOTE_KEY_PREFIX = "herdr.remote."
 REMOTE_REF_TTL_SECONDS = 60
@@ -6094,7 +6097,7 @@ def v1_supervised_publish_loop(cfg, stop, verified):
             subprocess.TimeoutExpired,
         ) as error:
             log(f"v1 supervisor publication failed: {error}")
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def v1_supervised_owned_publish_loop(stop, verified, environment):
@@ -6104,7 +6107,7 @@ def v1_supervised_owned_publish_loop(stop, verified, environment):
     while not stop.is_set():
         try:
             if (state_dir / "v1-enabled").read_text() != "enabled":
-                stop.wait(1)
+                stop.wait(LOOP_TICK_SECONDS)
                 continue
             with v1_owned_socket_transport(
                 identity_path, environment, account_home
@@ -6122,12 +6125,12 @@ def v1_supervised_owned_publish_loop(stop, verified, environment):
                         v1_transition_owned_backend(session, publisher, verified)
                     else:
                         raise ValueError("invalid notification backend")
-                    stop.wait(1)
+                    stop.wait(LOOP_TICK_SECONDS)
         except FileNotFoundError:
             pass
         except (OSError, SocketError, ValueError, KeyError, TypeError) as error:
             log(f"v1 owned publication failed: {error}")
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def v1_maybe_supervisor_handoff(cfg, sources, stop, verified, environment):
@@ -6246,7 +6249,7 @@ def v1_run_supervisor(cfg, stop, *, config_changed=lambda: False):
                 subprocess.TimeoutExpired,
             ) as error:
                 log(f"v1 supervisor reconciliation failed: {error}")
-            stop.wait(1)
+            stop.wait(LOOP_TICK_SECONDS)
         return True
     finally:
         publisher_stop.set()
@@ -9762,7 +9765,7 @@ def v1_token_retry_loop(source_id, socket_path, stop):
             sync_v1_episode_tokens(source_id, socket_path)
         except OSError as e:
             log(f"v1 token retry failed: {e}")
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def watch_v1_with_token_retry(cfg, source_id, generation, socket_path):
@@ -9897,7 +9900,7 @@ def v1_supervised_token_loop(source_id, socket_path, expected_boot, stop, fence=
                 pass
             except (OSError, SocketError, ValueError, KeyError, TypeError) as error:
                 log(f"v1 supervised token sync failed: {error}")
-            stop.wait(1)
+            stop.wait(LOOP_TICK_SECONDS)
     finally:
         HERDR_SOURCE_FENCE.reset(token)
 
@@ -9936,7 +9939,7 @@ def run_v1_supervised_source(
             log(f"v1 supervised source reconnecting: {error}")
         finally:
             not_ready()
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
     return True
 
 
@@ -9962,12 +9965,12 @@ def v1_publish_loop(cfg, stop):
             publish_v1_clients(cfg)
         except OSError as e:
             log(f"v1 publication failed: {e}")
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def v1_watch_parent(parent_pid, stop):
     """Retire a shell-launched observer if its owning shell disappears."""
-    while not stop.wait(1):
+    while not stop.wait(LOOP_TICK_SECONDS):
         if os.getppid() != parent_pid:
             os.kill(os.getpid(), signal.SIGTERM)
             return
@@ -9985,7 +9988,7 @@ def v1_focus_loop(cfg, client_id, source_id, workspace_id, surface_id, target, s
         v1_reconcile_focus(
             cfg, client_id, source_id, workspace_id, surface_id, sock_path
         )
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def run_v1_client(cfg, target, workspace_id, surface_id, stop):
@@ -10104,7 +10107,7 @@ def activate_v1_client(
             return True
         if stop.is_set():
             return False
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def _activate_v1_client_once(
@@ -10166,7 +10169,7 @@ def run_v1_client_with_lease(cfg, target, workspace_id, surface_id, stop, client
         if resolved and v1_probe_source(resolved):
             target = resolved
             break
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
     else:
         return
     source_id = v1_source_key(target)
@@ -10213,7 +10216,7 @@ def run_v1_client_with_lease(cfg, target, workspace_id, surface_id, stop, client
                         )
             except (SocketError, OSError, ValueError, subprocess.TimeoutExpired) as e:
                 log(f"v1 observer disconnected: {e}")
-            stop.wait(1)
+            stop.wait(LOOP_TICK_SECONDS)
     finally:
         stop.set()
         for worker in (publisher, focus):
@@ -10281,7 +10284,7 @@ def legacy_retry_loop(cfg, stop, session=None):
             retry_legacy_notifications(cfg, session=session)
         except (OSError, ValueError, KeyError, TypeError) as error:
             log(f"legacy notification retry failed: {error}")
-        stop.wait(1)
+        stop.wait(LOOP_TICK_SECONDS)
 
 
 def watch_daemon(cfg):
@@ -10366,7 +10369,7 @@ def main():
             if candidate is not None and v1_runtime_config_valid(candidate):
                 cfg = candidate
                 break
-            stop.wait(1)
+            stop.wait(LOOP_TICK_SECONDS)
         if cfg is None:
             return 0
         while not stop.is_set():

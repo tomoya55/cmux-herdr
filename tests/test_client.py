@@ -313,7 +313,7 @@ def test_v1_activation_retries_retirement_before_registering(monkeypatch, tmp_pa
             return False
 
         def wait(self, seconds):
-            assert seconds == 1
+            assert seconds == ch.LOOP_TICK_SECONDS
 
     assert ch.activate_v1_client("c", "source", "w", "s", None, Stop())
     assert attempts == ["retire", "retire"]

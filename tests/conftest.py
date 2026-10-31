@@ -30,6 +30,11 @@ def no_session_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def fast_loop_tick(monkeypatch):
+    monkeypatch.setattr(ch, "LOOP_TICK_SECONDS", 0.01)
+
+
+@pytest.fixture(autouse=True)
 def isolated_state_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(ch, "state_dir", tmp_path)
     monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
