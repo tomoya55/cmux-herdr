@@ -244,7 +244,7 @@ class state_lock:
         fcntl.flock(self._lock, fcntl.LOCK_EX)
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc_info):
         self._lock.close()
         return False
 
@@ -271,7 +271,7 @@ class v1_source_leader:
             return False
         return True
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc_info):
         if self._lock is not None:
             self._lock.close()
         return False

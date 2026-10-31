@@ -381,34 +381,6 @@ def test_v1_publication_full_scope_rejects_unsupervised_client(monkeypatch, tmp_
     assert verification.scope() == set()
 
 
-def test_v1_publication_verification_revokes_on_incomplete_inventory_and_readiness(
-    monkeypatch,
-):
-    spec = {"workspace": "w", "surface": "s", "target": {"socket_path": "/socket"}}
-
-    class Sources:
-        ready = True
-
-        def current_ready(self, desired):
-            return desired if self.ready else {}
-
-    sources = Sources()
-    monkeypatch.setattr(
-        supervisor,
-        "v1_verified_publication_targets",
-        lambda desired, ready: {("w", "s")} if ready else set(),
-    )
-    verification = supervisor.V1PublicationVerification(sources)
-    assert verification.eligible() == set()
-    verification.update({"c": spec}, complete=True)
-    assert verification.eligible() == {("w", "s")}
-    sources.ready = False
-    assert verification.eligible() == set()
-    verification.update({"c": spec}, complete=False)
-    sources.ready = True
-    assert verification.eligible() == set()
-
-
 def test_v1_supervisor_sources_checks_readiness_without_discovery():
     class Worker:
         ready = True

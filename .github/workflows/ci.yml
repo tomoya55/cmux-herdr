@@ -30,5 +30,7 @@ jobs:
         run: uv run ruff check .
       - name: Format check
         run: uv run ruff format --check .
+      - name: Unused code check
+        run: uv run vulture
       - name: Test
         run: uv run pytest -q
