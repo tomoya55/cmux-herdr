@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import cmux_herdr as ch
+from cmux_herdr_core import cmux, discovery, focus, process_identity
 
 
 def test_v1_foreground_observation_requires_one_observable_herdr(monkeypatch, tmp_path):
@@ -14,24 +14,28 @@ def test_v1_foreground_observation_requires_one_observable_herdr(monkeypatch, tm
     }
     available = {20}
     monkeypatch.setattr(
-        ch, "v1_observer_socket_exists", lambda path: int(path.stem) in available
+        process_identity,
+        "v1_observer_socket_exists",
+        lambda path: int(path.stem) in available,
     )
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_client_observation",
         lambda path, pid, **kwargs: {"pid": pid, "instance": "i"},
     )
-    assert ch.v1_foreground_observation(processes, [tmp_path]) == {
+    assert discovery.v1_foreground_observation(processes, [tmp_path]) == {
         "pid": 20,
         "instance": "i",
     }
     processes[30] = {"pid": 30, "name": "herdr", "path": "/bin/herdr"}
-    assert ch.v1_foreground_observation(processes, [tmp_path]) is None
+    assert discovery.v1_foreground_observation(processes, [tmp_path]) is None
     available.add(30)
-    assert ch.v1_foreground_observation(processes, [tmp_path]) is None
+    assert discovery.v1_foreground_observation(processes, [tmp_path]) is None
     del processes[30]
-    monkeypatch.setattr(ch, "v1_client_observation", lambda path, pid, **kwargs: None)
-    assert ch.v1_foreground_observation(processes, [tmp_path]) is None
+    monkeypatch.setattr(
+        process_identity, "v1_client_observation", lambda path, pid, **kwargs: None
+    )
+    assert discovery.v1_foreground_observation(processes, [tmp_path]) is None
 
 
 def test_v1_foreground_observation_accepts_remote_parent_and_client(
@@ -41,14 +45,18 @@ def test_v1_foreground_observation_accepts_remote_parent_and_client(
         20: {"pid": 20, "ppid": 10, "name": "herdr", "path": "/bin/herdr"},
         21: {"pid": 21, "ppid": 20, "name": "herdr", "path": "/bin/herdr"},
     }
-    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: path.stem == "21")
     monkeypatch.setattr(
-        ch, "v1_client_observation", lambda path, pid, **kwargs: {"pid": pid}
+        process_identity, "v1_observer_socket_exists", lambda path: path.stem == "21"
     )
-    assert ch.v1_foreground_observation(processes, [tmp_path]) == {"pid": 21}
+    monkeypatch.setattr(
+        process_identity,
+        "v1_client_observation",
+        lambda path, pid, **kwargs: {"pid": pid},
+    )
+    assert discovery.v1_foreground_observation(processes, [tmp_path]) == {"pid": 21}
     processes[20]["ppid"] = 21
     processes[21]["ppid"] = 10
-    assert ch.v1_foreground_observation(processes, [tmp_path]) is None
+    assert discovery.v1_foreground_observation(processes, [tmp_path]) is None
 
 
 @pytest.mark.parametrize("server_tty", [None, 42])
@@ -59,14 +67,20 @@ def test_v1_foreground_observation_ignores_verified_server(
         20: {"pid": 20, "ppid": 1, "name": "herdr", "tty_device": server_tty},
         21: {"pid": 21, "ppid": 10, "name": "herdr", "tty_device": 42},
     }
-    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: path.stem == "21")
     monkeypatch.setattr(
-        ch, "v1_client_observation", lambda path, pid, **kwargs: {"pid": pid}
+        process_identity, "v1_observer_socket_exists", lambda path: path.stem == "21"
     )
     monkeypatch.setattr(
-        ch, "v1_is_verified_local_server", lambda pid, paths, **kwargs: pid == 20
+        process_identity,
+        "v1_client_observation",
+        lambda path, pid, **kwargs: {"pid": pid},
     )
-    assert ch.v1_foreground_observation(
+    monkeypatch.setattr(
+        process_identity,
+        "v1_is_verified_local_server",
+        lambda pid, paths, **kwargs: pid == 20,
+    )
+    assert discovery.v1_foreground_observation(
         processes,
         [tmp_path],
         upstream_sockets=lambda: ["/source"],
@@ -76,13 +90,17 @@ def test_v1_foreground_observation_ignores_verified_server(
 
 def test_v1_foreground_observation_does_not_query_after_deadline(monkeypatch, tmp_path):
     processes = {21: {"pid": 21, "ppid": 10, "name": "herdr", "tty_device": 42}}
-    monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: True)
+    monkeypatch.setattr(
+        process_identity, "v1_observer_socket_exists", lambda path: True
+    )
     calls = []
     monkeypatch.setattr(
-        ch, "v1_client_observation", lambda *args, **kwargs: calls.append(args)
+        process_identity,
+        "v1_client_observation",
+        lambda *args, **kwargs: calls.append(args),
     )
     assert (
-        ch.v1_foreground_observation(
+        discovery.v1_foreground_observation(
             processes, [tmp_path], deadline=time.monotonic() - 1
         )
         is None
@@ -93,15 +111,19 @@ def test_v1_foreground_observation_does_not_query_after_deadline(monkeypatch, tm
 def test_v1_surface_observation_requests_both_cmux_ids(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        ch,
+        cmux,
         "run",
         lambda command, **kwargs: (
             calls.append(command) or SimpleNamespace(returncode=0, stdout="{}")
         ),
     )
-    monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
-    monkeypatch.setattr(ch, "v1_foreground_observation", lambda *args, **kwargs: None)
-    ch.v1_surface_observation({}, "workspace-uuid", "surface-uuid")
+    monkeypatch.setattr(
+        process_identity, "v1_foreground_surface_processes", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        discovery, "v1_foreground_observation", lambda *args, **kwargs: None
+    )
+    focus.v1_surface_observation({}, "workspace-uuid", "surface-uuid")
     assert (
         "--id-format" in calls[0]
         and calls[0][calls[0].index("--id-format") + 1] == "both"
@@ -115,14 +137,16 @@ def test_v1_surface_observation_requires_current_native_ownership(monkeypatch):
         ]
     }
     monkeypatch.setattr(
-        ch,
+        cmux,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(tree)),
     )
-    monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
+    monkeypatch.setattr(
+        process_identity, "v1_foreground_surface_processes", lambda *args: {}
+    )
     observation = {"pid": 42, "instance": "i", "observation": {}}
     monkeypatch.setattr(
-        ch, "v1_foreground_observation", lambda *args, **kwargs: observation
+        discovery, "v1_foreground_observation", lambda *args, **kwargs: observation
     )
     record = {"connection_id": "bound"}
     client = {
@@ -133,16 +157,18 @@ def test_v1_surface_observation_requires_current_native_ownership(monkeypatch):
         "native_ownership": record,
     }
     scan = {"complete": True, "clients": [client]}
-    monkeypatch.setattr(ch, "v1_discover_clients_in_tree", lambda *args, **kwargs: scan)
-    assert ch.v1_surface_observation({}, "w", "s") == {
+    monkeypatch.setattr(
+        discovery, "v1_discover_clients_in_tree", lambda *args, **kwargs: scan
+    )
+    assert focus.v1_surface_observation({}, "w", "s") == {
         **observation,
         "native_ownership": record,
     }
     scan["complete"] = False
-    assert ch.v1_surface_observation({}, "w", "s") is None
+    assert focus.v1_surface_observation({}, "w", "s") is None
     scan["complete"] = True
     client["instance"] = "different"
-    assert ch.v1_surface_observation({}, "w", "s") is None
+    assert focus.v1_surface_observation({}, "w", "s") is None
 
 
 def test_v1_surface_observation_ignores_unrelated_surfaces(monkeypatch):
@@ -161,13 +187,15 @@ def test_v1_surface_observation_ignores_unrelated_surfaces(monkeypatch):
     observation = {"pid": 42, "instance": "i", "observation": {}}
     client = {"pid": 42, "instance": "i", "workspace": "w", "surface": "s"}
     monkeypatch.setattr(
-        ch,
+        cmux,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(tree)),
     )
-    monkeypatch.setattr(ch, "v1_foreground_surface_processes", lambda *args: {})
     monkeypatch.setattr(
-        ch, "v1_foreground_observation", lambda *args, **kwargs: observation
+        process_identity, "v1_foreground_surface_processes", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        discovery, "v1_foreground_observation", lambda *args, **kwargs: observation
     )
 
     def scan(value, directories, **kwargs):
@@ -183,8 +211,8 @@ def test_v1_surface_observation_ignores_unrelated_surfaces(monkeypatch):
             "clients": [client],
         }
 
-    monkeypatch.setattr(ch, "v1_discover_clients_in_tree", scan)
-    assert ch.v1_surface_observation({}, "w", "s") == observation
+    monkeypatch.setattr(discovery, "v1_discover_clients_in_tree", scan)
+    assert focus.v1_surface_observation({}, "w", "s") == observation
 
 
 def test_v1_foreground_cmux_requires_the_socket_server_process(monkeypatch):
@@ -193,15 +221,19 @@ def test_v1_foreground_cmux_requires_the_socket_server_process(monkeypatch):
         "bundle": "com.cmuxterm.app",
         "socket_path": "/cmux.sock",
     }
-    monkeypatch.setattr(ch, "v1_cmux_identity", lambda *args: identity)
-    monkeypatch.setattr(ch, "v1_frontmost_app", lambda: ("com.cmuxterm.app", 12))
-    monkeypatch.setattr(ch, "v1_cmux_terminal_focus", lambda *args: True, raising=False)
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 13)
-    assert not ch.v1_cmux_is_foreground({}, "w", "s")
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 12)
-    assert ch.v1_cmux_is_foreground({}, "w", "s")
+    monkeypatch.setattr(focus, "v1_cmux_identity", lambda *args: identity)
+    monkeypatch.setattr(
+        process_identity, "v1_frontmost_app", lambda: ("com.cmuxterm.app", 12)
+    )
+    monkeypatch.setattr(
+        focus, "v1_cmux_terminal_focus", lambda *args: True, raising=False
+    )
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path: 13)
+    assert not focus.v1_cmux_is_foreground({}, "w", "s")
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path: 12)
+    assert focus.v1_cmux_is_foreground({}, "w", "s")
     identity["focused"] = False
-    assert not ch.v1_cmux_is_foreground({}, "w", "s")
+    assert not focus.v1_cmux_is_foreground({}, "w", "s")
 
 
 def test_v1_cmux_terminal_focus_requires_key_window_and_first_responder(monkeypatch):
@@ -215,13 +247,13 @@ def test_v1_cmux_terminal_focus_requires_key_window_and_first_responder(monkeypa
         "surface_view_first_responder": True,
     }
     monkeypatch.setattr(
-        ch,
+        cmux,
         "run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=0, stdout=json.dumps({"terminals": [terminal]})
         ),
     )
-    assert ch.v1_cmux_terminal_focus({}, "w", "s")
+    assert focus.v1_cmux_terminal_focus({}, "w", "s")
     for key in (
         "window_key",
         "surface_view_first_responder",
@@ -230,5 +262,5 @@ def test_v1_cmux_terminal_focus_requires_key_window_and_first_responder(monkeypa
         "mapped",
     ):
         terminal[key] = False
-        assert not ch.v1_cmux_terminal_focus({}, "w", "s")
+        assert not focus.v1_cmux_terminal_focus({}, "w", "s")
         terminal[key] = True

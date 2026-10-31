@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-import cmux_herdr as ch
+from cmux_herdr_core import attention_ledger, publication, remote_bridge, source_sync
 
 
 def test_v1_missing_agent_after_generation_change_retires_old_blocked():
@@ -14,19 +14,19 @@ def test_v1_missing_agent_after_generation_change_retires_old_blocked():
         "state_change_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "old", [agent], ["p"])
+    attention_ledger.apply_v1_snapshot(state, "source", "old", [agent], ["p"])
     absent = {**agent, "agent_status": "unknown", "state_change_seq": 1}
-    ch.apply_v1_snapshot(
+    attention_ledger.apply_v1_snapshot(
         state, "source", "new", [], ["p"], pane_records=[absent], reconnect=True
     )
     source = state["v1"]["sources"]["source"]
-    assert not ch.has_pending_attention(source["attention"], "p")
-    assert ch.sidebar_panes(source["panes"], source["attention"]) == {}
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
+    assert publication.sidebar_panes(source["panes"], source["attention"]) == {}
     snapshot = {"agents": [], "panes": [absent]}
-    ch.v1_reconcile_absent_agents(
+    attention_ledger.v1_reconcile_absent_agents(
         state, "source", "new", snapshot, [], [absent], snapshot
     )
-    assert ch.sidebar_panes(source["panes"], source["attention"]) == {}
+    assert publication.sidebar_panes(source["panes"], source["attention"]) == {}
 
 
 def test_v1_unknown_snapshot_after_generation_change_retires_old_blocked():
@@ -38,12 +38,14 @@ def test_v1_unknown_snapshot_after_generation_change_retires_old_blocked():
         "state_change_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "old", [agent], ["p"])
+    attention_ledger.apply_v1_snapshot(state, "source", "old", [agent], ["p"])
     unknown = {**agent, "agent_status": "unknown", "state_change_seq": 1}
-    ch.apply_v1_snapshot(state, "source", "new", [unknown], ["p"], reconnect=True)
+    attention_ledger.apply_v1_snapshot(
+        state, "source", "new", [unknown], ["p"], reconnect=True
+    )
     source = state["v1"]["sources"]["source"]
-    assert not ch.has_pending_attention(source["attention"], "p")
-    assert ch.sidebar_panes(source["panes"], source["attention"]) == {}
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
+    assert publication.sidebar_panes(source["panes"], source["attention"]) == {}
 
 
 def test_v1_legacy_unknown_absence_without_identity_stays_blocked(monkeypatch):
@@ -55,8 +57,8 @@ def test_v1_legacy_unknown_absence_without_identity_stays_blocked(monkeypatch):
         "state_change_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"])
-    assert ch.apply_v1_status_event(
+    attention_ledger.apply_v1_snapshot(state, "source", "g", [agent], ["p"])
+    assert attention_ledger.apply_v1_status_event(
         state, "source", {"pane_id": "p", "agent_status": "unknown"}
     )
     pane = {
@@ -71,8 +73,10 @@ def test_v1_legacy_unknown_absence_without_identity_stays_blocked(monkeypatch):
             return {"snapshot": {"agents": [], "panes": [pane]}}
         return {"agents": []} if method == "agent.list" else {"panes": [pane]}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert source_sync.refresh_v1_source(
+        state, "source", "g", "/socket", reconnect=True
+    )
     source = state["v1"]["sources"]["source"]
     assert source["attention"]["p"]["status"] == "blocked"
 
@@ -87,10 +91,12 @@ def test_v1_unknown_snapshot_of_present_agent_preserves_blocked():
         "state_change_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    attention_ledger.apply_v1_snapshot(
+        state, "source", "g", [agent], ["p"], boot_id=boot
+    )
     source = state["v1"]["sources"]["source"]
     unknown = {**agent, "agent_status": "unknown", "state_change_seq": 8}
-    ch.apply_v1_snapshot(
+    attention_ledger.apply_v1_snapshot(
         state, "source", "g", [unknown], ["p"], boot_id=boot, reconnect=True
     )
     assert source["attention"]["p"]["status"] == "blocked"
@@ -107,7 +113,9 @@ def test_v1_unknown_keeps_blocked_until_confirmed_absence():
         "state_change_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    attention_ledger.apply_v1_snapshot(
+        state, "source", "g", [agent], ["p"], boot_id=boot
+    )
     source = state["v1"]["sources"]["source"]
     source["server_boot_id"] = boot
     unknown = {
@@ -116,7 +124,9 @@ def test_v1_unknown_keeps_blocked_until_confirmed_absence():
         "agent_status": "unknown",
         "state_change_seq": 8,
     }
-    assert ch.apply_v1_status_event(state, "source", unknown, event_boot=boot)
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", unknown, event_boot=boot
+    )
     assert source["attention"]["p"]["status"] == "blocked"
     assert source["attention"]["p"]["sequence"] == 8
     absent = {
@@ -127,10 +137,10 @@ def test_v1_unknown_keeps_blocked_until_confirmed_absence():
         "state_change_seq": 8,
     }
     snapshot = {"server_boot_id": boot, "agents": [], "panes": [absent]}
-    ch.v1_reconcile_absent_agents(
+    attention_ledger.v1_reconcile_absent_agents(
         state, "source", "g", snapshot, [], [absent], snapshot
     )
-    assert not ch.has_pending_attention(source["attention"], "p")
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
 
 
 def test_v1_reconnect_retires_missing_agent_and_rejects_queued_old_events(monkeypatch):
@@ -160,20 +170,24 @@ def test_v1_reconnect_retires_missing_agent_and_rejects_queued_old_events(monkey
             }
         return {"agents": agents} if method == "agent.list" else {"panes": [pane]}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
     state = {}
-    assert ch.refresh_v1_source(state, "source", "g", "/socket")
+    assert source_sync.refresh_v1_source(state, "source", "g", "/socket")
     present = False
-    assert ch.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
+    assert source_sync.refresh_v1_source(
+        state, "source", "g", "/socket", reconnect=True
+    )
     source = state["v1"]["sources"]["source"]
-    assert not ch.has_pending_attention(source["attention"], "p")
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
     assert source["panes"]["p"]["status"] == "unknown"
-    assert ch.apply_v1_status_event(state, "source", agent, event_boot=boot)
-    assert not ch.has_pending_attention(source["attention"], "p")
-    assert ch.apply_v1_status_event(
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", agent, event_boot=boot
+    )
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
+    assert attention_ledger.apply_v1_status_event(
         state, "source", {**agent, "state_change_seq": 9}, event_boot=boot
     )
-    assert ch.has_pending_attention(source["attention"], "p")
+    assert attention_ledger.has_pending_attention(source["attention"], "p")
 
 
 def test_v1_absent_agent_with_replaced_terminal_rejects_old_events(monkeypatch):
@@ -195,7 +209,7 @@ def test_v1_absent_agent_with_replaced_terminal_rejects_old_events(monkeypatch):
     }
     state = {}
     generation = json.dumps(["g", boot], separators=(",", ":"))
-    ch.apply_v1_snapshot(state, "source", generation, [old], ["p"])
+    attention_ledger.apply_v1_snapshot(state, "source", generation, [old], ["p"])
     state["v1"]["sources"]["source"]["server_boot_id"] = boot
 
     def rpc(path, method, params):
@@ -203,19 +217,23 @@ def test_v1_absent_agent_with_replaced_terminal_rejects_old_events(monkeypatch):
             return {"snapshot": {"server_boot_id": boot, "agents": [], "panes": [pane]}}
         return {"agents": []} if method == "agent.list" else {"panes": [pane]}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert source_sync.refresh_v1_source(
+        state, "source", "g", "/socket", reconnect=True
+    )
     source = state["v1"]["sources"]["source"]
-    assert not ch.has_pending_attention(source["attention"], "p")
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
     assert source["panes"]["p"]["terminal_id"] == "new"
-    assert not ch.apply_v1_status_event(state, "source", old, event_boot=boot)
-    assert ch.apply_v1_status_event(
+    assert not attention_ledger.apply_v1_status_event(
+        state, "source", old, event_boot=boot
+    )
+    assert attention_ledger.apply_v1_status_event(
         state,
         "source",
         {**old, "terminal_id": "new", "state_change_seq": 10},
         event_boot=boot,
     )
-    assert ch.has_pending_attention(source["attention"], "p")
+    assert attention_ledger.has_pending_attention(source["attention"], "p")
 
 
 def test_v1_absent_agent_preserves_known_unread_completion_and_label(monkeypatch):
@@ -237,7 +255,7 @@ def test_v1_absent_agent_preserves_known_unread_completion_and_label(monkeypatch
         "state_change_seq": 8,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", generation, [old], ["p"])
+    attention_ledger.apply_v1_snapshot(state, "source", generation, [old], ["p"])
     state["v1"]["sources"]["source"]["server_boot_id"] = boot
 
     def rpc(path, method, params):
@@ -245,8 +263,10 @@ def test_v1_absent_agent_preserves_known_unread_completion_and_label(monkeypatch
             return {"snapshot": {"server_boot_id": boot, "agents": [], "panes": [pane]}}
         return {"agents": []} if method == "agent.list" else {"panes": [pane]}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert source_sync.refresh_v1_source(
+        state, "source", "g", "/socket", reconnect=True
+    )
     source = state["v1"]["sources"]["source"]
     assert source["attention"]["p"]["status"] == "done"
     assert source["panes"]["p"]["agent"] == "codex"
@@ -272,7 +292,7 @@ def test_v1_missing_agent_keeps_attention_when_snapshots_disagree(
         "agent": "codex",
     }
     state = {}
-    ch.apply_v1_snapshot(
+    attention_ledger.apply_v1_snapshot(
         state, "source", json.dumps(["g", boot], separators=(",", ":")), [old], ["p"]
     )
     source = state["v1"]["sources"]["source"]
@@ -301,6 +321,8 @@ def test_v1_missing_agent_keeps_attention_when_snapshots_disagree(
             }
         return {"agents": []} if method == "agent.list" else {"panes": [pane]}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    ch.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
-    assert ch.has_pending_attention(state["v1"]["sources"]["source"]["attention"], "p")
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    source_sync.refresh_v1_source(state, "source", "g", "/socket", reconnect=True)
+    assert attention_ledger.has_pending_attention(
+        state["v1"]["sources"]["source"]["attention"], "p"
+    )
