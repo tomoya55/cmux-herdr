@@ -3338,6 +3338,15 @@ def v1_discover_clients_in_tree(
                             else:
                                 inventory = None
                             if not inventory:
+                                paths = (
+                                    upstream_sockets()
+                                    if upstream_sockets is not None
+                                    else None
+                                )
+                                if paths is not None and v1_is_verified_local_server(
+                                    pid, paths, deadline=deadline
+                                ):
+                                    continue
                                 complete = False
                                 surface_complete[key] = False
                                 continue
@@ -3653,10 +3662,7 @@ def v1_foreground_observation(
     for pid, process in processes.items():
         name, path = process.get("name"), process.get("path")
         if name == "herdr" or isinstance(path, str) and Path(path).name == "herdr":
-            if (
-                type(process.get("tty_device")) is not int
-                and upstream_sockets is not None
-            ):
+            if upstream_sockets is not None:
                 paths = upstream_sockets()
                 if paths is not None and v1_is_verified_local_server(
                     pid, paths, deadline=deadline

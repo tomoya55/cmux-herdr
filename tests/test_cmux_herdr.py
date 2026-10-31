@@ -5229,7 +5229,10 @@ def test_v1_discovery_uses_verified_upstream_local_client(monkeypatch, tmp_path)
     assert not result["complete"]
 
 
-def test_discovery_excludes_only_verified_ttyless_herdr_server(monkeypatch, tmp_path):
+@pytest.mark.parametrize("server_tty", [None, 42])
+def test_discovery_excludes_only_verified_herdr_server(
+    monkeypatch, tmp_path, server_tty
+):
     monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 42)
     monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: False)
     monkeypatch.setattr(
@@ -5254,7 +5257,7 @@ def test_discovery_excludes_only_verified_ttyless_herdr_server(monkeypatch, tmp_
                                             {
                                                 "pid": 200,
                                                 "name": "herdr",
-                                                "tty_device": None,
+                                                "tty_device": server_tty,
                                                 "children": [],
                                             }
                                         ],
@@ -9311,11 +9314,12 @@ def test_v1_foreground_observation_accepts_remote_parent_and_client(
     assert ch.v1_foreground_observation(processes, [tmp_path]) is None
 
 
-def test_v1_foreground_observation_ignores_verified_ttyless_server(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("server_tty", [None, 42])
+def test_v1_foreground_observation_ignores_verified_server(
+    monkeypatch, tmp_path, server_tty
 ):
     processes = {
-        20: {"pid": 20, "ppid": 1, "name": "herdr", "tty_device": None},
+        20: {"pid": 20, "ppid": 1, "name": "herdr", "tty_device": server_tty},
         21: {"pid": 21, "ppid": 10, "name": "herdr", "tty_device": 42},
     }
     monkeypatch.setattr(ch, "v1_observer_socket_exists", lambda path: path.stem == "21")
