@@ -144,11 +144,17 @@ def load_state():
 
 
 def save_state(state):
+    data = json.dumps(state)
+    # Long-running loops save every tick; rewriting identical content would
+    # only churn the file.
+    with suppress(OSError, ValueError):
+        if STATE_PATH.read_text() == data:
+            return
     state_dir.mkdir(parents=True, exist_ok=True)
     # Per-process tmp name: concurrent hooks from different sessions share
     # this file and must not move each other's tmp away mid-save.
     tmp = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(state))
+    tmp.write_text(data)
     tmp.replace(STATE_PATH)
 
 
