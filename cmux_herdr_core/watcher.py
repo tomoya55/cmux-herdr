@@ -6,7 +6,6 @@ import json
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -216,23 +215,10 @@ def v1_local_socket(session):
 
 def open_subscription(sock_path, subscriptions, *, timeout=None):
     """Connected socket streaming the subscribed events as NDJSON."""
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn = remote_bridge.connect_herdr_socket(sock_path, timeout)
     try:
-        if timeout is not None:
-            conn.settimeout(timeout)
-        conn.connect(str(sock_path))
-        remote_bridge.v1_check_connected_herdr_peer(
-            conn, remote_bridge.v1_check_herdr_source_fence(sock_path)
-        )
-        conn.sendall(
-            json.dumps(
-                {
-                    "id": "watch",
-                    "method": "events.subscribe",
-                    "params": {"subscriptions": subscriptions},
-                }
-            ).encode()
-            + b"\n"
+        remote_bridge.send_herdr_request(
+            conn, "watch", "events.subscribe", {"subscriptions": subscriptions}
         )
     except BaseException:
         conn.close()

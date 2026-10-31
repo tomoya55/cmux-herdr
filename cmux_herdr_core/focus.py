@@ -69,7 +69,7 @@ def v1_unix_peer_pid(path, *, timeout=1):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(timeout)
             conn.connect(path)
-            pid = conn.getsockopt(0, 2)  # Darwin SOL_LOCAL, LOCAL_PEERPID
+            pid = core.darwin_peer_pid(conn)
             return pid if pid > 0 else None
     except OSError:
         return None

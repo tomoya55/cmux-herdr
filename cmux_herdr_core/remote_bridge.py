@@ -55,7 +55,7 @@ def v1_check_connected_herdr_peer(sock, expected_peer):
     if expected_peer is None:
         return
     if sys.platform == "darwin":
-        peer_pid = sock.getsockopt(0, 2)  # SOL_LOCAL, LOCAL_PEERPID
+        peer_pid = core.darwin_peer_pid(sock)
     elif sys.platform.startswith("linux"):
         credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         peer_pid, _uid, _gid = struct.unpack("3i", credentials)
@@ -65,12 +65,13 @@ def v1_check_connected_herdr_peer(sock, expected_peer):
         raise SocketError("Herdr server incarnation changed")
 
 
-def socket_rpc(sock_path, method, params, timeout=10, *, expected_peer=None):
-    """Single NDJSON request/response against a herdr API socket."""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+def connect_herdr_socket(sock_path, timeout=None, *, expected_peer=None):
+    """Connect to a Herdr API socket and verify the server process behind it."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(timeout)
-        s.connect(str(sock_path))
+        if timeout is not None:
+            conn.settimeout(timeout)
+        conn.connect(str(sock_path))
         fenced_peer = v1_check_herdr_source_fence(sock_path)
         if (
             expected_peer is not None
@@ -78,10 +79,23 @@ def socket_rpc(sock_path, method, params, timeout=10, *, expected_peer=None):
             and expected_peer != fenced_peer
         ):
             raise SocketError("Herdr server identity conflict")
-        v1_check_connected_herdr_peer(s, expected_peer or fenced_peer)
-        s.sendall(
-            json.dumps({"id": "1", "method": method, "params": params}).encode() + b"\n"
-        )
+        v1_check_connected_herdr_peer(conn, expected_peer or fenced_peer)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def send_herdr_request(conn, request_id, method, params):
+    request = {"id": request_id, "method": method, "params": params}
+    conn.sendall(json.dumps(request).encode() + b"\n")
+
+
+def socket_rpc(sock_path, method, params, timeout=10, *, expected_peer=None):
+    """Single NDJSON request/response against a herdr API socket."""
+    s = connect_herdr_socket(sock_path, timeout, expected_peer=expected_peer)
+    try:
+        send_herdr_request(s, "1", method, params)
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(1 << 16)
