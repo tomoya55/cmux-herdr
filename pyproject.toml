@@ -1,6 +1,6 @@
 [project]
 name = "cmux-herdr"
-version = "1.0.0"
+version = "1.1.0"
 description = "herdr plugin that propagates agent status to the cmux sidebar"
 readme = "README.md"
 license = { text = "MIT" }
