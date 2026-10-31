@@ -191,17 +191,48 @@ def _v1_publisher_lock(directory_fd, name):
         dir_fd=directory_fd,
     )
     try:
-        info = os.fstat(lock_fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_mode & 0o077
-        ):
-            raise ValueError("invalid publisher lock")
+        _v1_check_private_file(os.fstat(lock_fd), "invalid publisher lock")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(lock_fd)
+
+
+def _v1_check_private_file(info, message, *, max_size=None):
+    """Require a regular file owned by this user and closed to everyone else."""
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+        or (max_size is not None and info.st_size > max_size)
+    ):
+        raise ValueError(message)
+
+
+@contextmanager
+def _v1_private_temporary(directory_fd, prefix, data):
+    """Durably write data to a new private file and yield its name and stat.
+
+    The caller installs the file (link or replace); whatever is left under the
+    temporary name is removed afterwards.
+    """
+    temporary = f".{prefix}-{uuid.uuid4()}"
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+            info = os.fstat(file.fileno())
+        yield temporary, info
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
 
 
 def _v1_publisher_identity_at(path, directory_fd, store_id, *, create):
@@ -216,37 +247,28 @@ def _v1_publisher_identity_at(path, directory_fd, store_id, *, create):
             "destinations": [],
             "pending": None,
         }
-        temporary = f".publisher-{uuid.uuid4()}"
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=directory_fd,
-        )
+        encoded = json.dumps(identity, separators=(",", ":")).encode("utf-8")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(identity, file, separators=(",", ":"))
-                file.flush()
-                os.fsync(file.fileno())
-            os.link(
-                temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
-            )
-            os.fsync(directory_fd)
+            with _v1_private_temporary(directory_fd, "publisher", encoded) as (
+                temporary,
+                _,
+            ):
+                os.link(
+                    temporary,
+                    path.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                os.fsync(directory_fd)
         finally:
-            os.unlink(temporary, dir_fd=directory_fd)
             os.fsync(directory_fd)
     fd = os.open(
         path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
     )
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_mode & 0o077
-            or info.st_size > 10 * 1024 * 1024
-        ):
-            raise ValueError("invalid publisher identity file")
+        _v1_check_private_file(
+            os.fstat(fd), "invalid publisher identity file", max_size=10 * 1024 * 1024
+        )
         data = os.read(fd, 10 * 1024 * 1024 + 1)
         if len(data) > 10 * 1024 * 1024:
             raise ValueError("invalid publisher identity file")
@@ -520,13 +542,7 @@ def v1_publisher_prepare_set(path, store_id, destinations, *, expected_epoch):
             dir_fd=directory_fd,
         )
         try:
-            lock_info = os.fstat(lock_fd)
-            if (
-                not stat.S_ISREG(lock_info.st_mode)
-                or lock_info.st_uid != os.getuid()
-                or lock_info.st_mode & 0o077
-            ):
-                raise ValueError("invalid publisher lock")
+            _v1_check_private_file(os.fstat(lock_fd), "invalid publisher lock")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             journal = _v1_publisher_identity_at(
                 path, directory_fd, store_id, create=False
@@ -563,18 +579,7 @@ def _v1_write_publisher_journal(path, directory_fd, info, journal):
     encoded = json.dumps(journal, separators=(",", ":")).encode("utf-8")
     if len(encoded) > 10 * 1024 * 1024:
         raise ValueError("publisher journal exceeds size limit")
-    temporary = f".publisher-{uuid.uuid4()}"
-    fd = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-        dir_fd=directory_fd,
-    )
-    try:
-        with os.fdopen(fd, "wb") as file:
-            file.write(encoded)
-            file.flush()
-            os.fsync(file.fileno())
+    with _v1_private_temporary(directory_fd, "publisher", encoded) as (temporary, _):
         current = os.stat(path.parent, follow_symlinks=False)
         if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
             raise ValueError("publisher directory changed")
@@ -585,9 +590,6 @@ def _v1_write_publisher_journal(path, directory_fd, info, journal):
         current = os.stat(path.parent, follow_symlinks=False)
         if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
             raise ValueError("publisher directory changed")
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary, dir_fd=directory_fd)
 
 
 def v1_publisher_ack_set(path, store_id, pending):
@@ -965,13 +967,9 @@ def v1_owned_publisher(path, store_id, send, *, send_guarded=None):
                     dir_fd=directory_fd,
                 )
                 locks.callback(os.close, lock_fd)
-                lock_info = os.fstat(lock_fd)
-                if (
-                    not stat.S_ISREG(lock_info.st_mode)
-                    or lock_info.st_uid != os.getuid()
-                    or lock_info.st_mode & 0o077
-                ):
-                    raise ValueError("invalid publisher stable lock")
+                _v1_check_private_file(
+                    os.fstat(lock_fd), "invalid publisher stable lock"
+                )
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -1001,13 +999,7 @@ def _v1_owned_publisher_locked(path, store_id, send, expected_producer, send_gua
             dir_fd=directory_fd,
         )
         try:
-            lock_info = os.fstat(lock_fd)
-            if (
-                not stat.S_ISREG(lock_info.st_mode)
-                or lock_info.st_uid != os.getuid()
-                or lock_info.st_mode & 0o077
-            ):
-                raise ValueError("invalid publisher leader lock")
+            _v1_check_private_file(os.fstat(lock_fd), "invalid publisher leader lock")
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -5697,18 +5689,9 @@ def v1_write_activation_marker(value):
             raise ValueError("activation directory changed")
         if info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise ValueError("invalid activation directory")
-        temporary = f".activation-{uuid.uuid4()}"
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=directory_fd,
-        )
-        try:
-            with os.fdopen(fd, "wb") as file:
-                file.write(value.encode("ascii"))
-                file.flush()
-                os.fsync(file.fileno())
+        with _v1_private_temporary(
+            directory_fd, "activation", value.encode("ascii")
+        ) as (temporary, _):
             current = os.stat(state_dir, follow_symlinks=False)
             if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
                 raise ValueError("activation directory changed")
@@ -5722,9 +5705,6 @@ def v1_write_activation_marker(value):
             current = os.stat(state_dir, follow_symlinks=False)
             if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
                 raise ValueError("activation directory changed")
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary, dir_fd=directory_fd)
     finally:
         os.close(directory_fd)
 
@@ -6562,18 +6542,10 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
             raise ValueError("invalid cleanup inventory directory")
         with _v1_publisher_lock(directory_fd, path.name):
             if encoded is not None:
-                temporary = f".cleanup-{uuid.uuid4()}"
-                fd = os.open(
+                with _v1_private_temporary(directory_fd, "cleanup", encoded) as (
                     temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=directory_fd,
-                )
-                try:
-                    with os.fdopen(fd, "wb") as file:
-                        file.write(encoded)
-                        file.flush()
-                        os.fsync(file.fileno())
+                    _,
+                ):
                     with suppress(FileExistsError):
                         os.link(
                             temporary,
@@ -6582,8 +6554,6 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
                             dst_dir_fd=directory_fd,
                         )
                     os.fsync(directory_fd)
-                finally:
-                    os.unlink(temporary, dir_fd=directory_fd)
             fd = os.open(
                 path.name,
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -6591,13 +6561,9 @@ def v1_prepare_ordinary_cleanup(path, inventory=None, *, replace_unfenced=False)
             )
             try:
                 info = os.fstat(fd)
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077
-                    or info.st_size > 10 * 1024 * 1024
-                ):
-                    raise ValueError("invalid cleanup inventory file")
+                _v1_check_private_file(
+                    info, "invalid cleanup inventory file", max_size=10 * 1024 * 1024
+                )
                 with os.fdopen(fd, "rb", closefd=False) as file:
                     saved = json.load(file)
                 os.fsync(fd)
@@ -6909,39 +6875,27 @@ def v1_prepare_owned_backend(*, preflight=None):
             if info.st_uid != os.getuid() or info.st_mode & 0o022:
                 raise ValueError("invalid notification backend directory")
             name = "v1-notification-backend"
-            temporary = f".backend-{uuid.uuid4()}"
-            fd = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=directory_fd,
-            )
-            try:
-                with os.fdopen(fd, "wb") as file:
-                    file.write(b"preparing-owned")
-                    file.flush()
-                    os.fsync(file.fileno())
-                with suppress(FileExistsError):
-                    os.link(
-                        temporary,
-                        name,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
-                    )
-            finally:
-                os.unlink(temporary, dir_fd=directory_fd)
+            with (
+                _v1_private_temporary(directory_fd, "backend", b"preparing-owned") as (
+                    temporary,
+                    _,
+                ),
+                suppress(FileExistsError),
+            ):
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
             fd = os.open(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
             )
             try:
                 marker = os.fstat(fd)
-                if (
-                    not stat.S_ISREG(marker.st_mode)
-                    or marker.st_uid != os.getuid()
-                    or marker.st_mode & 0o077
-                    or marker.st_size > 32
-                ):
-                    raise ValueError("invalid notification backend file")
+                _v1_check_private_file(
+                    marker, "invalid notification backend file", max_size=32
+                )
                 value = os.read(fd, 33).decode("utf-8")
                 os.fsync(fd)
                 current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -6957,18 +6911,9 @@ def v1_prepare_owned_backend(*, preflight=None):
                 if value == "owned":
                     return False
                 if value == "ordinary":
-                    temporary = f".backend-{uuid.uuid4()}"
-                    replacement = os.open(
-                        temporary,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=directory_fd,
-                    )
-                    try:
-                        with os.fdopen(replacement, "wb") as file:
-                            file.write(b"preparing-owned")
-                            file.flush()
-                            os.fsync(file.fileno())
+                    with _v1_private_temporary(
+                        directory_fd, "backend", b"preparing-owned"
+                    ) as (temporary, _):
                         current = os.stat(
                             name, dir_fd=directory_fd, follow_symlinks=False
                         )
@@ -6990,9 +6935,6 @@ def v1_prepare_owned_backend(*, preflight=None):
                             info.st_ino,
                         ):
                             raise ValueError("notification backend directory changed")
-                    finally:
-                        with suppress(FileNotFoundError):
-                            os.unlink(temporary, dir_fd=directory_fd)
                     return True
                 if value != "preparing-owned":
                     raise ValueError("invalid notification backend")
@@ -7013,14 +6955,9 @@ def v1_notification_backend():
     except FileNotFoundError:
         return "ordinary"
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_mode & 0o077
-            or info.st_size > 32
-        ):
-            raise ValueError("invalid notification backend file")
+        _v1_check_private_file(
+            os.fstat(fd), "invalid notification backend file", max_size=32
+        )
         return os.read(fd, 33).decode("utf-8")
     finally:
         os.close(fd)
@@ -7195,13 +7132,10 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
                 )
                 try:
                     marker = os.fstat(fd)
-                    if (
-                        not stat.S_ISREG(marker.st_mode)
-                        or marker.st_uid != os.getuid()
-                        or marker.st_mode & 0o077
-                        or marker.st_size > 32
-                        or os.read(fd, 33).decode("utf-8") != backend
-                    ):
+                    _v1_check_private_file(
+                        marker, "invalid notification backend file", max_size=32
+                    )
+                    if os.read(fd, 33).decode("utf-8") != backend:
                         raise ValueError("invalid notification backend file")
                     os.fsync(fd)
                     current_marker = os.stat(
@@ -7213,19 +7147,9 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
                     ):
                         raise ValueError("notification backend file changed")
                     if backend == "preparing-owned":
-                        temporary = f".backend-{uuid.uuid4()}"
-                        replacement = os.open(
-                            temporary,
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                            0o600,
-                            dir_fd=directory_fd,
-                        )
-                        try:
-                            with os.fdopen(replacement, "wb") as file:
-                                file.write(b"owned")
-                                file.flush()
-                                os.fsync(file.fileno())
-                                installed = os.fstat(file.fileno())
+                        with _v1_private_temporary(
+                            directory_fd, "backend", b"owned"
+                        ) as (temporary, installed):
                             current_marker = os.stat(
                                 name, dir_fd=directory_fd, follow_symlinks=False
                             )
@@ -7248,9 +7172,6 @@ def _v1_commit_owned_backend_pinned(session, publisher, receipt, pinned):
                                 current_marker.st_ino,
                             ):
                                 raise ValueError("notification backend file changed")
-                        finally:
-                            with suppress(FileNotFoundError):
-                                os.unlink(temporary, dir_fd=directory_fd)
                     os.fsync(directory_fd)
                 finally:
                     os.close(fd)
