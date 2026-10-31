@@ -3,7 +3,15 @@ from types import SimpleNamespace
 
 import pytest
 
-import cmux_herdr as ch
+from cmux_herdr_core import (
+    attention_ledger,
+    cmux,
+    core,
+    focus,
+    process_identity,
+    publication,
+    remote_bridge,
+)
 
 
 def test_v1_focus_episode_requires_matching_server_and_current_completion():
@@ -44,25 +52,25 @@ def test_v1_focus_episode_requires_matching_server_and_current_completion():
         }
     }
     assert (
-        ch.v1_verified_focus_episode(state, "source", observation, snapshot)
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot)
         == "gen:t:7"
     )
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", {**observation, "boot_id": "b" * 32}, snapshot
         )
         is None
     )
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", {**observation, "outer_focused": False}, snapshot
         )
         is None
     )
     stale = {**snapshot, "agents": [{**snapshot["agents"][0], "state_change_seq": 8}]}
-    assert ch.v1_verified_focus_episode(state, "source", observation, stale) is None
+    assert focus.v1_verified_focus_episode(state, "source", observation, stale) is None
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", {**observation, "agent_state_change_seq": 6}, snapshot
         )
         is None
@@ -71,10 +79,14 @@ def test_v1_focus_episode_requires_matching_server_and_current_completion():
         **snapshot,
         "agents": [{**snapshot["agents"][0], "agent_status": "blocked"}],
     }
-    assert ch.v1_verified_focus_episode(state, "source", observation, blocked) is None
+    assert (
+        focus.v1_verified_focus_episode(state, "source", observation, blocked) is None
+    )
     entry = state["v1"]["sources"]["source"]["attention"]["p"]
     entry["server_boot_id"] = "b" * 32
-    assert ch.v1_verified_focus_episode(state, "source", observation, snapshot) is None
+    assert (
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot) is None
+    )
 
 
 def test_v1_focus_episode_after_agent_release_requires_presented_release():
@@ -106,7 +118,7 @@ def test_v1_focus_episode_after_agent_release_requires_presented_release():
         "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 8}],
     }
     assert (
-        ch.v1_verified_focus_episode(state, "source", observation, snapshot)
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot)
         == "gen:t:7"
     )
     simultaneous = {
@@ -118,7 +130,7 @@ def test_v1_focus_episode_after_agent_release_requires_presented_release():
         "panes": [{**snapshot["panes"][0], "state_change_seq": 7}],
     }
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", simultaneous, simultaneous_snapshot
         )
         == "gen:t:7"
@@ -128,7 +140,7 @@ def test_v1_focus_episode_after_agent_release_requires_presented_release():
         "pane_state": {**simultaneous["pane_state"], "released_completion_seq": None},
     }
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", missing_provenance, simultaneous_snapshot
         )
         is None
@@ -141,19 +153,19 @@ def test_v1_focus_episode_after_agent_release_requires_presented_release():
         {**observation["pane_state"], "state_change_seq": 9},
     ):
         assert (
-            ch.v1_verified_focus_episode(
+            focus.v1_verified_focus_episode(
                 state, "source", {**observation, "pane_state": pane_state}, snapshot
             )
             is None
         )
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", observation, {**snapshot, "panes": snapshot["panes"] * 2}
         )
         is None
     )
     assert (
-        ch.v1_verified_focus_episode(
+        focus.v1_verified_focus_episode(
             state, "source", observation, {**snapshot, "agents": [{"pane_id": "p"}]}
         )
         is None
@@ -170,10 +182,12 @@ def test_v1_focus_episode_after_agent_release_requires_presented_release():
         **snapshot,
         "panes": [{**snapshot["panes"][0], "state_change_seq": 10}],
     }
-    assert ch.v1_verified_focus_episode(state, "source", later, later_snapshot) is None
+    assert (
+        focus.v1_verified_focus_episode(state, "source", later, later_snapshot) is None
+    )
     later["pane_state"]["released_completion_seq"] = 7
     assert (
-        ch.v1_verified_focus_episode(state, "source", later, later_snapshot)
+        focus.v1_verified_focus_episode(state, "source", later, later_snapshot)
         == "gen:t:7"
     )
 
@@ -218,9 +232,10 @@ def test_v1_saved_unknown_state_recovers_exact_completion_identity():
         "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 10}],
     }
     assert (
-        ch.v1_verified_focus_episode(state, "source", observation, snapshot) == "g:t:7"
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot)
+        == "g:t:7"
     )
-    assert ch.apply_v1_status_event(
+    assert attention_ledger.apply_v1_status_event(
         state,
         "source",
         {
@@ -232,10 +247,13 @@ def test_v1_saved_unknown_state_recovers_exact_completion_identity():
         event_boot=boot,
     )
     assert (
-        ch.v1_verified_focus_episode(state, "source", observation, snapshot) == "g:t:7"
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot)
+        == "g:t:7"
     )
     entry["episode"] = "other:t:7"
-    assert ch.v1_verified_focus_episode(state, "source", observation, snapshot) is None
+    assert (
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot) is None
+    )
 
 
 def test_v1_focus_acknowledges_only_verified_focused_done():
@@ -260,14 +278,16 @@ def test_v1_focus_acknowledges_only_verified_focused_done():
         "episode": "done-1",
     }
     for condition in ("single_client", "foreground", "surface_focused"):
-        assert not ch.apply_v1_focus_ack(
+        assert not focus.apply_v1_focus_ack(
             state, "source", {**evidence, condition: False}
         )
-    assert not ch.apply_v1_focus_ack(state, "source", {**evidence, "episode": "stale"})
-    assert not ch.apply_v1_focus_ack(
+    assert not focus.apply_v1_focus_ack(
+        state, "source", {**evidence, "episode": "stale"}
+    )
+    assert not focus.apply_v1_focus_ack(
         state, "source", {**evidence, "pane_id": "q", "episode": "blocked-1"}
     )
-    assert ch.apply_v1_focus_ack(state, "source", evidence)
+    assert focus.apply_v1_focus_ack(state, "source", evidence)
     attention = state["v1"]["sources"]["source"]["attention"]
     assert attention["p"]["acknowledged"] == "done-1"
     assert attention["q"]["status"] == "blocked"
@@ -311,9 +331,9 @@ def test_v1_focus_reconciliation_acknowledges_presented_release(
             },
         }
     }
-    ch.save_state(state)
-    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
-    monkeypatch.setattr(ch, "v1_cmux_is_foreground", lambda *args: True)
+    core.save_state(state)
+    monkeypatch.setattr(publication, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(focus, "v1_cmux_is_foreground", lambda *args: True)
     observation = {
         "pid": 42,
         "instance": "instance",
@@ -340,19 +360,20 @@ def test_v1_focus_reconciliation_acknowledges_presented_release(
         ],
     }
     monkeypatch.setattr(
-        ch, "socket_rpc", lambda *args, **kwargs: {"snapshot": snapshot}
+        remote_bridge, "socket_rpc", lambda *args, **kwargs: {"snapshot": snapshot}
     )
-    monkeypatch.setattr(ch, "v1_surface_observation", lambda *args: observation)
+    monkeypatch.setattr(focus, "v1_surface_observation", lambda *args: observation)
 
     observation["observation"]["pane_state"]["released_completion_seq"] = 9
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     assert (
-        "acknowledged" not in ch.load_state()["v1"]["sources"]["src"]["attention"]["p"]
+        "acknowledged"
+        not in core.load_state()["v1"]["sources"]["src"]["attention"]["p"]
     )
 
     observation["observation"]["pane_state"]["released_completion_seq"] = 7
-    assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
-    attention = ch.load_state()["v1"]["sources"]["src"]["attention"]
+    assert focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    attention = core.load_state()["v1"]["sources"]["src"]["attention"]
     assert attention["p"]["acknowledged"] == episode
     assert attention["q"]["status"] == "blocked"
     assert "acknowledged" not in attention["q"]
@@ -394,9 +415,9 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
             },
         }
     }
-    ch.save_state(state)
-    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
-    monkeypatch.setattr(ch, "v1_cmux_is_foreground", lambda *args: True)
+    core.save_state(state)
+    monkeypatch.setattr(publication, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(focus, "v1_cmux_is_foreground", lambda *args: True)
     observation = {
         "pid": 42,
         "instance": "instance",
@@ -411,9 +432,9 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
         },
     }
     observed = []
-    monkeypatch.setattr(ch, "v1_surface_observation", lambda *args: observed.pop(0))
+    monkeypatch.setattr(focus, "v1_surface_observation", lambda *args: observed.pop(0))
     monkeypatch.setattr(
-        ch,
+        remote_bridge,
         "socket_rpc",
         lambda *args, **kwargs: {
             "snapshot": {
@@ -445,15 +466,15 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
         },
     ):
         observed[:] = [wrong, wrong]
-        assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+        assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     ownership = {"connection_id": "original"}
     state["v1"]["clients"]["c"]["native_ownership"] = ownership
-    ch.save_state(state)
+    core.save_state(state)
     observed[:] = [observation, observation]
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     wrong = {**observation, "native_ownership": {"connection_id": "replacement"}}
     observed[:] = [wrong, wrong]
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     observation["native_ownership"] = ownership
     observed[:] = [
         {
@@ -462,7 +483,7 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
         },
         observation,
     ]
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     observed[:] = [
         observation,
         {
@@ -470,20 +491,20 @@ def test_v1_focus_reconciliation_acknowledges_only_stable_current_target(
             "observation": {**observation["observation"], "snapshot_revision": 2},
         },
     ]
-    assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
-    attention = ch.load_state()["v1"]["sources"]["src"]["attention"]
+    assert focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    attention = core.load_state()["v1"]["sources"]["src"]["attention"]
     assert attention["p"]["acknowledged"] == episode
     assert attention["q"]["status"] == "blocked"
-    ch.save_state(state)
+    core.save_state(state)
     observed[:] = [observation, {**observation, "instance": "other"}]
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
-    assert ch.load_state()["v1"] == state["v1"]
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert core.load_state()["v1"] == state["v1"]
 
 
 def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
     monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(publication, "prune_v1_clients", lambda state: None)
     boot = "a" * 32
     state = {
         "v1": {
@@ -515,7 +536,7 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
             },
         }
     }
-    ch.save_state(state)
+    core.save_state(state)
     caller = {
         "window_ref": "window:1",
         "workspace_ref": "workspace:1",
@@ -565,12 +586,14 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
             result = tree
         return SimpleNamespace(returncode=0, stdout=json.dumps(result))
 
-    monkeypatch.setattr(ch, "run", fake_run)
-    monkeypatch.setattr(ch, "v1_frontmost_app", lambda: ("com.cmuxterm.app", 12))
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path: 12)
-    monkeypatch.setattr(ch, "v1_tty_device", lambda tty: 100)
+    monkeypatch.setattr(cmux, "run", fake_run)
     monkeypatch.setattr(
-        ch,
+        process_identity, "v1_frontmost_app", lambda: ("com.cmuxterm.app", 12)
+    )
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path: 12)
+    monkeypatch.setattr(process_identity, "v1_tty_device", lambda tty: 100)
+    monkeypatch.setattr(
+        process_identity,
         "v1_observer_socket_exists",
         lambda path: (
             path.parent.name == "client-observers"
@@ -578,7 +601,7 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
         ),
     )
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_client_source_inventory",
         lambda *args, **kwargs: {
             "pid": 20,
@@ -600,10 +623,12 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
         },
     }
     monkeypatch.setattr(
-        ch, "v1_client_observation", lambda path, pid, **kwargs: observation
+        process_identity,
+        "v1_client_observation",
+        lambda path, pid, **kwargs: observation,
     )
     monkeypatch.setattr(
-        ch,
+        remote_bridge,
         "socket_rpc",
         lambda *args, **kwargs: {
             "snapshot": {
@@ -620,11 +645,11 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
         },
     )
     terminal["surface_view_first_responder"] = False
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     terminal["surface_view_first_responder"] = True
-    assert ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     assert (
-        ch.load_state()["v1"]["sources"]["src"]["attention"]["p"]["acknowledged"]
+        core.load_state()["v1"]["sources"]["src"]["attention"]["p"]["acknowledged"]
         == "g:t:7"
     )
 
@@ -642,14 +667,14 @@ def test_v1_focus_reconciliation_combines_real_cmux_and_client_checks(
 def test_v1_focus_skips_observation_without_acknowledgeable_completion(
     monkeypatch, attention
 ):
-    ch.save_state({"v1": {"sources": {"src": {"attention": attention}}}})
+    core.save_state({"v1": {"sources": {"src": {"attention": attention}}}})
     calls = []
     monkeypatch.setattr(
-        ch, "v1_cmux_is_foreground", lambda *args: calls.append("foreground")
+        focus, "v1_cmux_is_foreground", lambda *args: calls.append("foreground")
     )
     monkeypatch.setattr(
-        ch, "v1_surface_observation", lambda *args: calls.append("observation")
+        focus, "v1_surface_observation", lambda *args: calls.append("observation")
     )
 
-    assert not ch.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
+    assert not focus.v1_reconcile_focus({}, "c", "src", "w", "s", "/socket")
     assert calls == []

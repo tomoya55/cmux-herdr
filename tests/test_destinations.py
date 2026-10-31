@@ -1,12 +1,12 @@
 import json
 from types import SimpleNamespace
 
-import cmux_herdr as ch
+from cmux_herdr_core import cmux, core, legacy_daemons, publication
 
 
 def test_v1_supervisor_never_marks_unrelated_notice_with_stale_id(monkeypatch):
     calls = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: calls.append(args) or True)
+    monkeypatch.setattr(cmux, "cmux_cli", lambda cfg, args: calls.append(args) or True)
     foreign = [
         {
             "id": "stale",
@@ -17,12 +17,12 @@ def test_v1_supervisor_never_marks_unrelated_notice_with_stale_id(monkeypatch):
             "is_read": False,
         }
     ]
-    ch.reconcile_aggregate_notification({}, "w", "s", {}, foreign, "stale")
+    publication.reconcile_aggregate_notification({}, "w", "s", {}, foreign, "stale")
     assert calls == []
 
 
 def test_v1_retiring_destination_does_not_read_foreign_stale_id(monkeypatch):
-    key = ch.v1_destination_key("w", "s")
+    key = publication.v1_destination_key("w", "s")
     state = {"v1": {"destinations": {key: {"notification_id": "stale"}}}}
     foreign = [
         {
@@ -34,10 +34,10 @@ def test_v1_retiring_destination_does_not_read_foreign_stale_id(monkeypatch):
             "is_read": False,
         }
     ]
-    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: foreign)
+    monkeypatch.setattr(cmux, "cmux_notifications_checked", lambda cfg: foreign)
     calls = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: calls.append(args) or True)
-    assert ch.retire_v1_destination({}, state, key)
+    monkeypatch.setattr(cmux, "cmux_cli", lambda cfg, args: calls.append(args) or True)
+    assert publication.retire_v1_destination({}, state, key)
     assert calls == []
 
 
@@ -61,19 +61,19 @@ def test_v1_supervisor_keeps_previous_bindings_until_replacements_are_ready():
         "connection_generation": 2,
     }
     desired = {"new": entry}
-    assert not ch.reconcile_v1_supervised_bindings(
+    assert not publication.reconcile_v1_supervised_bindings(
         state, desired, {}, complete=True, supervisor_pid=9
     )
     assert state["v1"]["clients"] == {"old": old}
-    assert ch.reconcile_v1_supervised_bindings(
+    assert publication.reconcile_v1_supervised_bindings(
         state, desired, {"new": entry}, complete=False, supervisor_pid=9
     )
     assert set(state["v1"]["clients"]) == {"old", "new"}
-    assert ch.reconcile_v1_supervised_bindings(
+    assert publication.reconcile_v1_supervised_bindings(
         state, desired, {"new": entry}, complete=True, supervisor_pid=9
     )
     assert set(state["v1"]["clients"]) == {"new"}
-    assert state["v1"]["clients"]["new"]["source"] == ch.v1_supervised_source_key(
+    assert state["v1"]["clients"]["new"]["source"] == core.v1_supervised_source_key(
         entry["target"]
     )
 
@@ -98,7 +98,7 @@ def test_v1_certified_binding_retirement_normalizes_surface_ids():
         "target": {"remote": None, "socket_path": "/a", "server_boot_id": "a" * 32},
         "connection_generation": 1,
     }
-    ch.reconcile_v1_supervised_bindings(
+    publication.reconcile_v1_supervised_bindings(
         state,
         {"new": spec},
         {},
@@ -123,7 +123,7 @@ def test_v1_supervisor_retires_binding_from_certified_empty_surface():
             }
         }
     }
-    ch.reconcile_v1_supervised_bindings(
+    publication.reconcile_v1_supervised_bindings(
         state,
         {},
         {},
@@ -149,7 +149,7 @@ def test_v1_supervisor_retires_departed_binding_on_certified_surface():
         "target": {"remote": None, "socket_path": "/a", "server_boot_id": "a" * 32},
         "connection_generation": 1,
     }
-    ch.reconcile_v1_supervised_bindings(
+    publication.reconcile_v1_supervised_bindings(
         state,
         {"new": spec},
         {"new": spec},
@@ -188,7 +188,7 @@ def test_v1_supervisor_retires_departed_binding_on_ready_surface_only():
         "target": {"remote": None, "socket_path": "/b", "server_boot_id": "b" * 32},
         "connection_generation": 1,
     }
-    ch.reconcile_v1_supervised_bindings(
+    publication.reconcile_v1_supervised_bindings(
         state, {"a": a, "b": b}, {"a": a}, complete=True, supervisor_pid=9
     )
     assert set(state["v1"]["clients"]) == {"a", "offline-old"}
@@ -202,7 +202,9 @@ def test_v1_supervisor_does_not_retire_unmanaged_clients():
             }
         }
     }
-    ch.reconcile_v1_supervised_bindings(state, {}, {}, complete=True, supervisor_pid=9)
+    publication.reconcile_v1_supervised_bindings(
+        state, {}, {}, complete=True, supervisor_pid=9
+    )
     assert "manual" in state["v1"]["clients"]
 
 
@@ -225,7 +227,7 @@ def test_v1_supervisor_rejects_stale_prepared_binding():
         },
         "connection_generation": 2,
     }
-    assert not ch.reconcile_v1_supervised_bindings(
+    assert not publication.reconcile_v1_supervised_bindings(
         state,
         {"c": entry},
         {"c": {**entry, "connection_generation": 1}},
@@ -236,7 +238,10 @@ def test_v1_supervisor_rejects_stale_prepared_binding():
 
 
 def test_v1_destination_stops_after_alias_cleanup_invalidates_plan(monkeypatch):
-    upper, lower = ch.v1_destination_key("W", "S"), ch.v1_destination_key("w", "s")
+    upper, lower = (
+        publication.v1_destination_key("W", "S"),
+        publication.v1_destination_key("w", "s"),
+    )
     state = {
         "v1": {
             "sources": {"a": {"attention": {}}},
@@ -252,11 +257,11 @@ def test_v1_destination_stops_after_alias_cleanup_invalidates_plan(monkeypatch):
             "workspace_id": "w",
             "surface_id": "s",
             "is_read": False,
-            "subtitle": ch.NOTIFICATION_SUBTITLE,
+            "subtitle": core.NOTIFICATION_SUBTITLE,
         }
         for name in ("first", "second")
     ]
-    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: notices)
+    monkeypatch.setattr(cmux, "cmux_notifications_checked", lambda cfg: notices)
     current = [True]
     effects = []
 
@@ -265,8 +270,8 @@ def test_v1_destination_stops_after_alias_cleanup_invalidates_plan(monkeypatch):
         current[0] = False
         return True
 
-    monkeypatch.setattr(ch, "cmux_cli", mark)
-    assert not ch.reconcile_v1_destination(
+    monkeypatch.setattr(cmux, "cmux_cli", mark)
+    assert not publication.reconcile_v1_destination(
         {}, state, "w", "s", ["a"], is_current=lambda: current[0]
     )
     assert len(effects) == 1
@@ -274,7 +279,10 @@ def test_v1_destination_stops_after_alias_cleanup_invalidates_plan(monkeypatch):
 
 
 def test_v1_destination_merges_duplicate_owned_aliases(monkeypatch):
-    upper, lower = ch.v1_destination_key("W", "S"), ch.v1_destination_key("w", "s")
+    upper, lower = (
+        publication.v1_destination_key("W", "S"),
+        publication.v1_destination_key("w", "s"),
+    )
     state = {
         "v1": {
             "sources": {"a": {"attention": {}}},
@@ -290,20 +298,22 @@ def test_v1_destination_merges_duplicate_owned_aliases(monkeypatch):
             "workspace_id": "w",
             "surface_id": "s",
             "is_read": False,
-            "subtitle": ch.NOTIFICATION_SUBTITLE,
+            "subtitle": core.NOTIFICATION_SUBTITLE,
         }
         for name in ("first", "second")
     ]
-    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: notices)
+    monkeypatch.setattr(cmux, "cmux_notifications_checked", lambda cfg: notices)
     effects = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: effects.append(args) or True)
-    assert ch.reconcile_v1_destination({}, state, "w", "s", ["a"])
+    monkeypatch.setattr(
+        cmux, "cmux_cli", lambda cfg, args: effects.append(args) or True
+    )
+    assert publication.reconcile_v1_destination({}, state, "w", "s", ["a"])
     assert {args[-1] for args in effects} == {"first", "second"}
     assert len(state["v1"]["destinations"]) == 1
 
 
 def test_v1_destination_owns_notification_across_id_case(monkeypatch):
-    key = ch.v1_destination_key("W", "S")
+    key = publication.v1_destination_key("W", "S")
     state = {
         "v1": {
             "sources": {"a": {"attention": {}}},
@@ -316,22 +326,24 @@ def test_v1_destination_owns_notification_across_id_case(monkeypatch):
             "workspace_id": "w",
             "surface_id": "s",
             "is_read": False,
-            "subtitle": ch.NOTIFICATION_SUBTITLE,
+            "subtitle": core.NOTIFICATION_SUBTITLE,
         }
     ]
-    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: notices)
+    monkeypatch.setattr(cmux, "cmux_notifications_checked", lambda cfg: notices)
     effects = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: effects.append(args) or True)
-    ch.reconcile_v1_destination({}, state, "w", "s", ["a"])
+    monkeypatch.setattr(
+        cmux, "cmux_cli", lambda cfg, args: effects.append(args) or True
+    )
+    publication.reconcile_v1_destination({}, state, "w", "s", ["a"])
     assert ["mark-notification-read", "--id", "owned"] in effects
     assert set(state["v1"]["destinations"]) == {key}
 
 
 def test_v1_retire_destination_matches_notification_case(monkeypatch):
-    key = ch.v1_destination_key("W", "S")
+    key = publication.v1_destination_key("W", "S")
     state = {"v1": {"destinations": {key: {"notification_id": "owned"}}}}
     monkeypatch.setattr(
-        ch,
+        cmux,
         "cmux_notifications_checked",
         lambda cfg: [
             {
@@ -339,19 +351,21 @@ def test_v1_retire_destination_matches_notification_case(monkeypatch):
                 "workspace_id": "w",
                 "surface_id": "s",
                 "is_read": False,
-                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "subtitle": core.NOTIFICATION_SUBTITLE,
             }
         ],
     )
     effects = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: effects.append(args) or True)
-    assert ch.retire_v1_destination({}, state, key)
+    monkeypatch.setattr(
+        cmux, "cmux_cli", lambda cfg, args: effects.append(args) or True
+    )
+    assert publication.retire_v1_destination({}, state, key)
     assert ["mark-notification-read", "--id", "owned"] in effects
 
 
 def test_v1_partial_publication_retires_certified_empty_surface(monkeypatch, tmp_path):
-    key = ch.v1_destination_key("w", "s")
-    ch.save_state(
+    key = publication.v1_destination_key("w", "s")
+    core.save_state(
         {
             "v1": {
                 "destinations": {key: {"notification_id": "owned"}},
@@ -359,10 +373,10 @@ def test_v1_partial_publication_retires_certified_empty_surface(monkeypatch, tmp
             }
         }
     )
-    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
-    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(publication, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(legacy_daemons, "retire_v1_legacy_daemons", lambda: True)
     monkeypatch.setattr(
-        ch,
+        cmux,
         "cmux_notifications_checked",
         lambda cfg: [
             {
@@ -370,28 +384,30 @@ def test_v1_partial_publication_retires_certified_empty_surface(monkeypatch, tmp
                 "workspace_id": "w",
                 "surface_id": "s",
                 "is_read": False,
-                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "subtitle": core.NOTIFICATION_SUBTITLE,
             }
         ],
     )
     effects = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: effects.append(args) or True)
-    ch.publish_v1_clients({}, eligible_destinations={("w", "s")})
+    monkeypatch.setattr(
+        cmux, "cmux_cli", lambda cfg, args: effects.append(args) or True
+    )
+    publication.publish_v1_clients({}, eligible_destinations={("w", "s")})
     assert ["mark-notification-read", "--id", "owned"] in effects
     assert ["clear-status", "old", "--workspace", "w"] in effects
-    assert key not in ch.load_state()["v1"]["destinations"]
+    assert key not in core.load_state()["v1"]["destinations"]
 
 
 def test_v1_publish_retires_only_owned_notification_after_last_client_leaves(
     monkeypatch, tmp_path
 ):
-    key = ch.v1_destination_key("w", "s")
+    key = publication.v1_destination_key("w", "s")
     state = {
         "v1": {"clients": {}, "destinations": {key: {"notification_id": "our-id"}}}
     }
-    ch.save_state(state)
+    core.save_state(state)
     monkeypatch.setattr(
-        ch,
+        cmux,
         "cmux_notifications_checked",
         lambda cfg: [
             {
@@ -399,7 +415,7 @@ def test_v1_publish_retires_only_owned_notification_after_last_client_leaves(
                 "workspace_id": "w",
                 "surface_id": "s",
                 "is_read": False,
-                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "subtitle": core.NOTIFICATION_SUBTITLE,
             },
             {
                 "id": "foreign",
@@ -410,17 +426,17 @@ def test_v1_publish_retires_only_owned_notification_after_last_client_leaves(
         ],
     )
     calls = []
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: calls.append(args) or True)
-    ch.publish_v1_clients({})
+    monkeypatch.setattr(cmux, "cmux_cli", lambda cfg, args: calls.append(args) or True)
+    publication.publish_v1_clients({})
     assert calls == [["mark-notification-read", "--id", "our-id"]]
-    assert key not in json.loads(ch.STATE_PATH.read_text())["v1"]["destinations"]
+    assert key not in json.loads(core.STATE_PATH.read_text())["v1"]["destinations"]
 
 
 def test_v1_destination_retirement_retries_when_cmux_fails(monkeypatch):
-    key = ch.v1_destination_key("w", "s")
+    key = publication.v1_destination_key("w", "s")
     state = {"v1": {"destinations": {key: {"notification_id": "our-id"}}}}
     monkeypatch.setattr(
-        ch,
+        cmux,
         "cmux_notifications_checked",
         lambda cfg: [
             {
@@ -428,12 +444,12 @@ def test_v1_destination_retirement_retries_when_cmux_fails(monkeypatch):
                 "workspace_id": "w",
                 "surface_id": "s",
                 "is_read": False,
-                "subtitle": ch.NOTIFICATION_SUBTITLE,
+                "subtitle": core.NOTIFICATION_SUBTITLE,
             }
         ],
     )
-    monkeypatch.setattr(ch, "cmux_cli", lambda cfg, args: False)
-    assert not ch.retire_v1_destination({}, state, key)
+    monkeypatch.setattr(cmux, "cmux_cli", lambda cfg, args: False)
+    assert not publication.retire_v1_destination({}, state, key)
     assert key in state["v1"]["destinations"]
 
 
@@ -442,8 +458,8 @@ def test_v1_publisher_does_not_restore_acknowledged_attention_from_stale_snapsho
 ):
     import threading
 
-    key = ch.v1_destination_key("w", "s")
-    ch.save_state(
+    key = publication.v1_destination_key("w", "s")
+    core.save_state(
         {
             "v1": {
                 "sources": {
@@ -455,18 +471,18 @@ def test_v1_publisher_does_not_restore_acknowledged_attention_from_stale_snapsho
         }
     )
     entered, release = threading.Event(), threading.Event()
-    monkeypatch.setattr(ch, "retire_v1_legacy_daemons", lambda: True)
-    monkeypatch.setattr(ch, "prune_v1_clients", lambda state: None)
-    monkeypatch.setattr(ch, "load_remote_state", lambda: {})
-    monkeypatch.setattr(ch, "reconcile_v1_legacy_sidebar", lambda *args: None)
+    monkeypatch.setattr(legacy_daemons, "retire_v1_legacy_daemons", lambda: True)
+    monkeypatch.setattr(publication, "prune_v1_clients", lambda state: None)
+    monkeypatch.setattr(core, "load_remote_state", lambda: {})
+    monkeypatch.setattr(publication, "reconcile_v1_legacy_sidebar", lambda *args: None)
 
     def sidebar(*args):
         entered.set()
         assert release.wait(5)
 
-    monkeypatch.setattr(ch, "reconcile_v1_sidebar", sidebar)
+    monkeypatch.setattr(publication, "reconcile_v1_sidebar", sidebar)
     monkeypatch.setattr(
-        ch,
+        cmux,
         "cmux_notifications_checked",
         lambda cfg: [
             {"id": "owned", "workspace_id": "w", "surface_id": "s", "is_read": True}
@@ -474,21 +490,21 @@ def test_v1_publisher_does_not_restore_acknowledged_attention_from_stale_snapsho
     )
     creates = []
     monkeypatch.setattr(
-        ch,
+        cmux,
         "run",
         lambda *args, **kwargs: (
             creates.append(True)
             or SimpleNamespace(returncode=0, stdout='{"id":"new"}', stderr="")
         ),
     )
-    worker = threading.Thread(target=lambda: ch.publish_v1_clients({}))
+    worker = threading.Thread(target=lambda: publication.publish_v1_clients({}))
     worker.start()
     try:
         assert entered.wait(3)
-        with ch.state_lock():
-            state = ch.load_state()
+        with core.state_lock():
+            state = core.load_state()
             state["v1"]["sources"]["a"]["attention"].clear()
-            ch.save_state(state)
+            core.save_state(state)
     finally:
         release.set()
         worker.join(5)
@@ -503,7 +519,7 @@ def test_supervised_remote_binding_adopts_matching_legacy_notification(monkeypat
         "target": {"remote": "tom@host", "session": "work", "server_boot_id": "a" * 32},
     }
     state = {}
-    ch.reconcile_v1_supervised_bindings(
+    publication.reconcile_v1_supervised_bindings(
         state, {"c": spec}, {"c": spec}, complete=True, supervisor_pid=123
     )
     source_id = state["v1"]["clients"]["c"]["source"]
@@ -517,7 +533,7 @@ def test_supervised_remote_binding_adopts_matching_legacy_notification(monkeypat
         "identity": ["tom@host", "work"],
         "panes": {"p": {"agent": "codex", "status": "blocked"}},
     }
-    monkeypatch.setattr(ch, "load_remote_state", lambda: {"remotes": {"one": entry}})
+    monkeypatch.setattr(core, "load_remote_state", lambda: {"remotes": {"one": entry}})
     notification = {
         "id": "legacy",
         "workspace_id": "w",
@@ -527,6 +543,8 @@ def test_supervised_remote_binding_adopts_matching_legacy_notification(monkeypat
         "is_read": False,
     }
     assert (
-        ch.find_v1_legacy_notification(state, [source_id], "w", "s", [notification])
+        publication.find_v1_legacy_notification(
+            state, [source_id], "w", "s", [notification]
+        )
         == "legacy"
     )

@@ -1,8 +1,9 @@
 import json
+import os
 
 import pytest
 
-import cmux_herdr as ch
+from cmux_herdr_core import focus, remote_bridge
 
 
 @pytest.mark.usefixtures("force_action_identity")
@@ -27,8 +28,8 @@ def test_v1_force_read_action_targets_only_context_pane(monkeypatch):
             }
         return {"type": "ok"}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert focus.v1_force_read_action()
     assert calls[-1][1] == "pane.report_metadata_if_boot"
     assert calls[-1][2]["pane_id"] == "p"
     assert calls[-1][2]["tokens"] == {"cmux_herdr_ack": "episode-id"}
@@ -54,8 +55,8 @@ def test_v1_force_read_action_does_not_acknowledge_blocked(monkeypatch):
             }
         }
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert not ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert not focus.v1_force_read_action()
     assert calls == ["session.snapshot", "pane.get"]
 
 
@@ -65,7 +66,7 @@ def test_v1_force_read_upstream_requires_original_server_peer(monkeypatch):
         "HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"focused_pane_id": "p"})
     )
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
-    monkeypatch.setattr(ch.os, "getppid", lambda: 1234)
+    monkeypatch.setattr(os, "getppid", lambda: 1234)
     calls = []
 
     def rpc(path, method, params, **kwargs):
@@ -82,8 +83,8 @@ def test_v1_force_read_upstream_requires_original_server_peer(monkeypatch):
             }
         return {"type": "ok"}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert focus.v1_force_read_action()
     assert calls == [
         ("session.snapshot", {"expected_peer": 1234}),
         ("pane.get", {"expected_peer": 1234}),
@@ -114,8 +115,8 @@ def test_v1_force_read_action_accepts_retained_completion_after_agent_exit(monke
             }
         return {"type": "ok"}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert focus.v1_force_read_action()
     assert calls[-1][1]["tokens"] == {"cmux_herdr_ack": "episode"}
 
 
@@ -126,7 +127,7 @@ def test_v1_force_read_action_rejects_unknown_state_for_present_agent(monkeypatc
     )
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/socket")
     monkeypatch.setattr(
-        ch,
+        remote_bridge,
         "socket_rpc",
         lambda path, method, params, **kwargs: (
             {"snapshot": {"server_boot_id": "a" * 32}}
@@ -141,7 +142,7 @@ def test_v1_force_read_action_rejects_unknown_state_for_present_agent(monkeypatc
             }
         ),
     )
-    assert not ch.v1_force_read_action()
+    assert not focus.v1_force_read_action()
 
 
 @pytest.mark.usefixtures("force_action_identity")
@@ -167,8 +168,8 @@ def test_v1_force_read_writes_only_with_verified_server_boot(monkeypatch):
             }
         return {"type": "ok"}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    assert ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    assert focus.v1_force_read_action()
     assert calls[-1][0] == "pane.report_metadata_if_boot"
     assert calls[-1][1]["expected_server_boot_id"] == boot
 
@@ -185,8 +186,8 @@ def test_v1_force_read_rejects_missing_or_restarted_server_identity(monkeypatch)
         calls.append(method)
         return {"snapshot": {}}
 
-    monkeypatch.setattr(ch, "socket_rpc", no_boot)
-    assert not ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", no_boot)
+    assert not focus.v1_force_read_action()
     assert calls == ["session.snapshot", "pane.get"]
 
     def restarted(path, method, params, **kwargs):
@@ -200,7 +201,7 @@ def test_v1_force_read_rejects_missing_or_restarted_server_identity(monkeypatch)
                     "tokens": {"cmux_herdr_done": "episode"},
                 }
             }
-        raise ch.SocketError("server boot changed")
+        raise remote_bridge.SocketError("server boot changed")
 
-    monkeypatch.setattr(ch, "socket_rpc", restarted)
-    assert not ch.v1_force_read_action()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", restarted)
+    assert not focus.v1_force_read_action()

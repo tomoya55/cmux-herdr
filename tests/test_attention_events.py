@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-import cmux_herdr as ch
+from cmux_herdr_core import attention_ledger, core, focus, remote_bridge, source_sync
 
 
 def test_v1_status_event_rejects_a_stale_subscription_server():
@@ -18,7 +18,7 @@ def test_v1_status_event_rejects_a_stale_subscription_server():
         }
     }
     before = json.loads(json.dumps(state))
-    assert not ch.apply_v1_status_event(
+    assert not attention_ledger.apply_v1_status_event(
         state, "source", {"pane_id": "p", "agent_status": "done"}, event_boot="b" * 32
     )
     assert state == before
@@ -35,7 +35,9 @@ def test_v1_unknown_keeps_blocked_until_known_transition(next_status):
         "state_change_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    attention_ledger.apply_v1_snapshot(
+        state, "source", "g", [agent], ["p"], boot_id=boot
+    )
     source = state["v1"]["sources"]["source"]
     source["server_boot_id"] = boot
     unknown = {
@@ -44,10 +46,14 @@ def test_v1_unknown_keeps_blocked_until_known_transition(next_status):
         "agent_status": "unknown",
         "state_change_seq": 8,
     }
-    assert ch.apply_v1_status_event(state, "source", unknown, event_boot=boot)
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", unknown, event_boot=boot
+    )
     assert source["attention"]["p"]["status"] == "blocked"
     known = {**unknown, "agent_status": next_status, "state_change_seq": 9}
-    assert ch.apply_v1_status_event(state, "source", known, event_boot=boot)
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", known, event_boot=boot
+    )
     assert source["attention"]["p"].get("status") != "blocked"
 
 
@@ -62,7 +68,9 @@ def test_v1_unknown_event_preserves_completion_identity_and_ordering():
         "completion_seq": 7,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"], boot_id=boot)
+    attention_ledger.apply_v1_snapshot(
+        state, "source", "g", [agent], ["p"], boot_id=boot
+    )
     source = state["v1"]["sources"]["source"]
     source["server_boot_id"] = boot
     source["attention"]["p"]["server_boot_id"] = boot
@@ -72,7 +80,9 @@ def test_v1_unknown_event_preserves_completion_identity_and_ordering():
         "state_change_seq": 8,
         "agent_status": "unknown",
     }
-    assert ch.apply_v1_status_event(state, "source", event, event_boot=boot)
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", event, event_boot=boot
+    )
     observation = {
         "boot_id": boot,
         "pane_id": "p",
@@ -91,9 +101,10 @@ def test_v1_unknown_event_preserves_completion_identity_and_ordering():
         "panes": [{"pane_id": "p", "terminal_id": "t", "state_change_seq": 9}],
     }
     assert (
-        ch.v1_verified_focus_episode(state, "source", observation, snapshot) == "g:t:7"
+        focus.v1_verified_focus_episode(state, "source", observation, snapshot)
+        == "g:t:7"
     )
-    assert ch.apply_v1_status_event(
+    assert attention_ledger.apply_v1_status_event(
         state,
         "source",
         {**event, "state_change_seq": 7, "agent_status": "blocked"},
@@ -113,7 +124,7 @@ def test_v1_idle_snapshot_does_not_skip_unprocessed_later_completion():
         "state_change_seq": 6,
     }
     state = {}
-    ch.apply_v1_snapshot(state, "source", "g", [agent], ["p"])
+    attention_ledger.apply_v1_snapshot(state, "source", "g", [agent], ["p"])
     source = state["v1"]["sources"]["source"]
     source["server_boot_id"] = boot
 
@@ -125,18 +136,22 @@ def test_v1_idle_snapshot_does_not_skip_unprocessed_later_completion():
             "agent_status": status,
         }
 
-    assert ch.apply_v1_status_event(state, "source", event("done", 7), event_boot=boot)
-    ch.apply_v1_snapshot(
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", event("done", 7), event_boot=boot
+    )
+    attention_ledger.apply_v1_snapshot(
         state,
         "source",
         "g",
         [{**agent, "agent_status": "idle", "state_change_seq": 9}],
         ["p"],
     )
-    assert ch.apply_v1_status_event(
+    assert attention_ledger.apply_v1_status_event(
         state, "source", event("working", 8), event_boot=boot
     )
-    assert ch.apply_v1_status_event(state, "source", event("done", 9), event_boot=boot)
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", event("done", 9), event_boot=boot
+    )
     assert source["attention"]["p"]["episode"] == "g:t:9"
 
 
@@ -151,10 +166,10 @@ def test_v1_ack_event_rejects_another_server_subscription(monkeypatch, tmp_path)
             }
         }
     }
-    ch.save_state(state)
+    core.save_state(state)
     data = {"pane": {"pane_id": "p", "tokens": {"cmux_herdr_ack": "episode"}}}
-    assert not ch.persist_v1_ack_event("source", data, "b" * 32)
-    assert ch.load_state()["v1"] == state["v1"]
+    assert not source_sync.persist_v1_ack_event("source", data, "b" * 32)
+    assert core.load_state()["v1"] == state["v1"]
 
 
 def test_v1_status_events_keep_each_connected_completion_distinct(monkeypatch):
@@ -166,18 +181,22 @@ def test_v1_status_events_keep_each_connected_completion_distinct(monkeypatch):
         "agent_status": "working",
         "state_change_seq": 1,
     }
-    ch.apply_v1_snapshot(state, "source", "boot", [agent], ["p"])
+    attention_ledger.apply_v1_snapshot(state, "source", "boot", [agent], ["p"])
     ids = iter(["episode-a", "episode-b"])
-    monkeypatch.setattr(ch, "new_v1_episode_id", lambda: next(ids))
-    ch.apply_v1_status_event(state, "source", {"pane_id": "p", "agent_status": "done"})
+    monkeypatch.setattr(attention_ledger, "new_v1_episode_id", lambda: next(ids))
+    attention_ledger.apply_v1_status_event(
+        state, "source", {"pane_id": "p", "agent_status": "done"}
+    )
     a = state["v1"]["sources"]["source"]["attention"]["p"]["episode"]
-    ch.apply_v1_status_event(
+    attention_ledger.apply_v1_status_event(
         state, "source", {"pane_id": "p", "agent_status": "working"}
     )
-    ch.apply_v1_status_event(state, "source", {"pane_id": "p", "agent_status": "done"})
+    attention_ledger.apply_v1_status_event(
+        state, "source", {"pane_id": "p", "agent_status": "done"}
+    )
     b = state["v1"]["sources"]["source"]["attention"]["p"]["episode"]
     assert (a, b) == ("episode-a", "episode-b")
-    assert not ch.force_acknowledge_attention(
+    assert not attention_ledger.force_acknowledge_attention(
         state["v1"]["sources"]["source"]["attention"], "p", a
     )
 
@@ -193,13 +212,13 @@ def test_v1_remote_ack_event_only_accepts_matching_done_episode():
             }
         }
     }
-    assert not ch.apply_v1_ack_event(
+    assert not attention_ledger.apply_v1_ack_event(
         state, "remote", {"pane": {"pane_id": "p", "tokens": {"cmux_herdr_ack": "a"}}}
     )
-    assert ch.apply_v1_ack_event(
+    assert attention_ledger.apply_v1_ack_event(
         state, "remote", {"pane": {"pane_id": "p", "tokens": {"cmux_herdr_ack": "b"}}}
     )
-    assert not ch.has_pending_attention(
+    assert not attention_ledger.has_pending_attention(
         state["v1"]["sources"]["remote"]["attention"], "p"
     )
 
@@ -215,12 +234,12 @@ def test_v1_ack_event_persists_matching_completion(monkeypatch, tmp_path):
             }
         }
     }
-    ch.save_state(state)
-    assert ch.persist_v1_ack_event(
+    core.save_state(state)
+    assert source_sync.persist_v1_ack_event(
         "remote", {"pane": {"pane_id": "p", "tokens": {"cmux_herdr_ack": "b"}}}
     )
-    saved = json.loads(ch.STATE_PATH.read_text())
-    assert not ch.has_pending_attention(
+    saved = json.loads(core.STATE_PATH.read_text())
+    assert not attention_ledger.has_pending_attention(
         saved["v1"]["sources"]["remote"]["attention"], "p"
     )
 
@@ -240,9 +259,9 @@ def test_v1_missing_agent_blocks_stale_blocked_but_preserves_queued_done(monkeyp
             return {"snapshot": {"server_boot_id": boot, "agents": [], "panes": [pane]}}
         return {"agents": []} if method == "agent.list" else {"panes": [pane]}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
     state = {}
-    assert ch.refresh_v1_source(state, "source", "g", "/socket")
+    assert source_sync.refresh_v1_source(state, "source", "g", "/socket")
     source = state["v1"]["sources"]["source"]
     blocked = {
         "pane_id": "p",
@@ -250,15 +269,19 @@ def test_v1_missing_agent_blocks_stale_blocked_but_preserves_queued_done(monkeyp
         "agent_status": "blocked",
         "state_change_seq": 6,
     }
-    assert ch.apply_v1_status_event(state, "source", blocked, event_boot=boot)
-    assert not ch.has_pending_attention(source["attention"], "p")
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", blocked, event_boot=boot
+    )
+    assert not attention_ledger.has_pending_attention(source["attention"], "p")
     done = {
         **blocked,
         "agent_status": "done",
         "state_change_seq": 7,
         "completion_seq": 7,
     }
-    assert ch.apply_v1_status_event(state, "source", done, event_boot=boot)
+    assert attention_ledger.apply_v1_status_event(
+        state, "source", done, event_boot=boot
+    )
     assert source["attention"]["p"]["status"] == "done"
 
 
@@ -267,7 +290,7 @@ def test_v1_slow_token_write_does_not_block_updates_or_commit_stale_episode(
 ):
     import threading
 
-    ch.save_state(
+    core.save_state(
         {
             "v1": {
                 "sources": {
@@ -292,17 +315,19 @@ def test_v1_slow_token_write_does_not_block_updates_or_commit_stale_episode(
         writes.append(value)
         return {}
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
     worker = threading.Thread(
-        target=lambda: ch.sync_v1_episode_tokens("a", "/socket", expected_boot="boot")
+        target=lambda: source_sync.sync_v1_episode_tokens(
+            "a", "/socket", expected_boot="boot"
+        )
     )
 
     def update():
-        with ch.state_lock():
-            state = ch.load_state()
+        with core.state_lock():
+            state = core.load_state()
             state["v1"]["sources"]["a"]["attention"]["p"]["episode"] = "new"
             state["v1"]["sources"]["b"]["value"] = 2
-            ch.save_state(state)
+            core.save_state(state)
         updated.set()
 
     writer = threading.Thread(target=update)
@@ -316,12 +341,12 @@ def test_v1_slow_token_write_does_not_block_updates_or_commit_stale_episode(
         worker.join(5)
         if writer.ident is not None:
             writer.join(5)
-    state = ch.load_state()["v1"]["sources"]
+    state = core.load_state()["v1"]["sources"]
     assert state["b"]["value"] == 2
     assert state["a"]["published_tokens"]["p"] != "old"
-    ch.sync_v1_episode_tokens("a", "/socket", expected_boot="boot")
+    source_sync.sync_v1_episode_tokens("a", "/socket", expected_boot="boot")
     assert writes == ["old", "new"]
-    assert ch.load_state()["v1"]["sources"]["a"]["published_tokens"]["p"] == "new"
+    assert core.load_state()["v1"]["sources"]["a"]["published_tokens"]["p"] == "new"
 
 
 def test_v1_episode_tokens_publish_only_confirmed_completions(monkeypatch, tmp_path):
@@ -342,23 +367,23 @@ def test_v1_episode_tokens_publish_only_confirmed_completions(monkeypatch, tmp_p
             }
         }
     }
-    ch.save_state(state)
+    core.save_state(state)
     calls = []
     monkeypatch.setattr(
-        ch,
+        remote_bridge,
         "socket_rpc",
         lambda path, method, params: calls.append((method, params)) or {"type": "ok"},
     )
-    ch.sync_v1_episode_tokens("source", "/socket")
+    source_sync.sync_v1_episode_tokens("source", "/socket")
     assert len(calls) == 1
     assert calls[0][1]["pane_id"] == "p"
     assert calls[0][1]["tokens"] == {"cmux_herdr_done": "confirmed"}
-    ch.sync_v1_episode_tokens("source", "/socket")
+    source_sync.sync_v1_episode_tokens("source", "/socket")
     assert len(calls) == 1
 
 
 def test_v1_episode_tokens_retry_clear_after_lost_write_response(monkeypatch, tmp_path):
-    ch.save_state(
+    core.save_state(
         {
             "v1": {
                 "sources": {
@@ -375,24 +400,24 @@ def test_v1_episode_tokens_retry_clear_after_lost_write_response(monkeypatch, tm
 
     def lost_response(path, method, params):
         remote.update(params["tokens"])
-        raise ch.SocketError("response lost")
+        raise remote_bridge.SocketError("response lost")
 
-    monkeypatch.setattr(ch, "socket_rpc", lost_response)
-    ch.sync_v1_episode_tokens("source", "/socket", expected_boot="boot")
-    state = ch.load_state()
+    monkeypatch.setattr(remote_bridge, "socket_rpc", lost_response)
+    source_sync.sync_v1_episode_tokens("source", "/socket", expected_boot="boot")
+    state = core.load_state()
     state["v1"]["sources"]["source"]["attention"] = {}
-    ch.save_state(state)
+    core.save_state(state)
     monkeypatch.setattr(
-        ch,
+        remote_bridge,
         "socket_rpc",
         lambda path, method, params: remote.update(params["tokens"]) or {},
     )
-    ch.sync_v1_episode_tokens("source", "/socket", expected_boot="boot")
+    source_sync.sync_v1_episode_tokens("source", "/socket", expected_boot="boot")
     assert remote["cmux_herdr_done"] is None
 
 
 def test_v1_episode_tokens_use_stored_boot_for_legacy_caller(monkeypatch, tmp_path):
-    ch.save_state(
+    core.save_state(
         {
             "v1": {
                 "sources": {
@@ -407,11 +432,11 @@ def test_v1_episode_tokens_use_stored_boot_for_legacy_caller(monkeypatch, tmp_pa
     )
     calls = []
     monkeypatch.setattr(
-        ch,
+        remote_bridge,
         "socket_rpc",
         lambda path, method, params: calls.append((method, params)) or {},
     )
-    ch.sync_v1_episode_tokens("s", "/socket")
+    source_sync.sync_v1_episode_tokens("s", "/socket")
     assert calls[0][0] == "pane.report_metadata_if_boot"
     assert calls[0][1]["expected_server_boot_id"] == "boot"
 
@@ -419,7 +444,7 @@ def test_v1_episode_tokens_use_stored_boot_for_legacy_caller(monkeypatch, tmp_pa
 def test_v1_episode_tokens_clear_after_acknowledgment_or_pane_close(
     monkeypatch, tmp_path
 ):
-    ch.save_state(
+    core.save_state(
         {
             "v1": {
                 "sources": {
@@ -434,17 +459,19 @@ def test_v1_episode_tokens_clear_after_acknowledgment_or_pane_close(
     )
     calls = []
     monkeypatch.setattr(
-        ch, "socket_rpc", lambda path, method, params: calls.append(params) or {}
+        remote_bridge,
+        "socket_rpc",
+        lambda path, method, params: calls.append(params) or {},
     )
-    ch.sync_v1_episode_tokens("source", "/socket")
+    source_sync.sync_v1_episode_tokens("source", "/socket")
     assert [(call["pane_id"], call["tokens"]) for call in calls] == [
         ("p", {"cmux_herdr_done": None})
     ]
-    assert ch.load_state()["v1"]["sources"]["source"]["published_tokens"] == {}
+    assert core.load_state()["v1"]["sources"]["source"]["published_tokens"] == {}
 
 
 def test_v1_episode_tokens_guard_writes_with_server_boot(monkeypatch, tmp_path):
-    ch.save_state(
+    core.save_state(
         {
             "v1": {
                 "sources": {
@@ -461,12 +488,13 @@ def test_v1_episode_tokens_guard_writes_with_server_boot(monkeypatch, tmp_path):
 
     def rpc(path, method, params):
         calls.append((method, params))
-        raise ch.SocketError("server boot identity changed")
+        raise remote_bridge.SocketError("server boot identity changed")
 
-    monkeypatch.setattr(ch, "socket_rpc", rpc)
-    ch.sync_v1_episode_tokens("source", "/socket", expected_boot="old")
+    monkeypatch.setattr(remote_bridge, "socket_rpc", rpc)
+    source_sync.sync_v1_episode_tokens("source", "/socket", expected_boot="old")
     assert calls[0][0] == "pane.report_metadata_if_boot"
     assert calls[0][1]["expected_server_boot_id"] == "old"
     assert (
-        ch.load_state()["v1"]["sources"]["source"]["published_tokens"]["p"] != "episode"
+        core.load_state()["v1"]["sources"]["source"]["published_tokens"]["p"]
+        != "episode"
     )

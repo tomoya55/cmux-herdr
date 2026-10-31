@@ -8,7 +8,7 @@ import time
 import pytest
 from helpers import short_sock_path
 
-import cmux_herdr as ch
+from cmux_herdr_core import core, discovery, focus, process_identity
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS socket peer PID")
@@ -45,7 +45,7 @@ def test_v1_client_observation_reads_and_validates_private_socket():
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     assert ready.wait(5)
-    assert ch.v1_client_observation(path, os.getpid()) == payload
+    assert process_identity.v1_client_observation(path, os.getpid()) == payload
     thread.join(5)
     path.unlink(missing_ok=True)
 
@@ -53,11 +53,11 @@ def test_v1_client_observation_reads_and_validates_private_socket():
 def test_v1_focus_observation_requires_matching_socket_peer(monkeypatch):
     seen = []
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_read_client_response",
         lambda path, expected_peer=None, timeout=2: seen.append(expected_peer),
     )
-    assert ch.v1_client_observation("/tmp/client.sock", 42) is None
+    assert process_identity.v1_client_observation("/tmp/client.sock", 42) is None
     assert seen == [42]
 
 
@@ -79,7 +79,7 @@ def test_v1_observer_response_rejects_duplicate_json_keys():
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     assert ready.wait(5)
-    assert ch.v1_read_client_response(path) is None
+    assert process_identity.v1_read_client_response(path) is None
     thread.join(5)
     path.unlink(missing_ok=True)
 
@@ -110,7 +110,7 @@ def test_v1_client_observation_rejects_untrusted_responses(change):
             "agent_state_change_seq": 4,
         },
     }
-    assert not ch.valid_v1_client_observation({**payload, **change}, 42)
+    assert not process_identity.valid_v1_client_observation({**payload, **change}, 42)
 
 
 def test_v1_lsof_unix_peers_match_distinct_process_connections():
@@ -135,9 +135,9 @@ def test_v1_lsof_unix_peers_match_distinct_process_connections():
             "n/path/herdr-client.sock",
         ]
     )
-    peers = ch.v1_parse_lsof_unix_peers(output)
-    assert ch.v1_lsof_processes_connected(peers, 100, 200)
-    assert not ch.v1_lsof_processes_connected(peers, 100, 300)
+    peers = process_identity.v1_parse_lsof_unix_peers(output)
+    assert process_identity.v1_lsof_processes_connected(peers, 100, 200)
+    assert not process_identity.v1_lsof_processes_connected(peers, 100, 300)
 
 
 def test_v1_lsof_client_path_accepts_equivalent_symlink(tmp_path):
@@ -157,20 +157,20 @@ def test_v1_lsof_client_path_accepts_equivalent_symlink(tmp_path):
             f"n{alias}/herdr-client.sock",
         ]
     )
-    peers = ch.v1_parse_lsof_unix_peers(output)
-    assert ch.v1_lsof_processes_connected(
+    peers = process_identity.v1_parse_lsof_unix_peers(output)
+    assert process_identity.v1_lsof_processes_connected(
         peers, 100, 200, str(real / "herdr-client.sock")
     )
 
 
 def test_v1_upstream_client_inventory_requires_unique_stable_server(monkeypatch):
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    monkeypatch.setattr(core, "v1_local_generation", lambda path: "1:2")
     output = "\n".join(
         [
             "p100",
@@ -183,27 +183,33 @@ def test_v1_upstream_client_inventory_requires_unique_stable_server(monkeypatch)
             "n/tmp/herdr-client.sock",
         ]
     )
-    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
-    result = ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/herdr.sock"])
+    monkeypatch.setattr(
+        discovery, "v1_bounded_command_output", lambda *args, **kwargs: output
+    )
+    result = process_identity.v1_upstream_local_client_inventory(
+        100, 42, ["/tmp/herdr.sock"]
+    )
     assert result["sources"][0]["api_socket_path"] == "/tmp/herdr.sock"
     assert result["sources"][0]["socket_generation"] == "1:2"
     assert result["sources"][0]["server_pid"] == 200
     assert result["sources"][0]["server_start_token"] == 201
     assert result["observation"] is None
     assert (
-        ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/a.sock", "/tmp/b.sock"])
+        process_identity.v1_upstream_local_client_inventory(
+            100, 42, ["/tmp/a.sock", "/tmp/b.sock"]
+        )
         is None
     )
 
 
 def test_v1_upstream_client_inventory_rejects_api_only_connection(monkeypatch):
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    monkeypatch.setattr(core, "v1_local_generation", lambda path: "1:2")
     output = "\n".join(
         [
             "p100",
@@ -216,18 +222,25 @@ def test_v1_upstream_client_inventory_rejects_api_only_connection(monkeypatch):
             "n/tmp/herdr.sock",
         ]
     )
-    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
-    assert ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/herdr.sock"]) is None
+    monkeypatch.setattr(
+        discovery, "v1_bounded_command_output", lambda *args, **kwargs: output
+    )
+    assert (
+        process_identity.v1_upstream_local_client_inventory(
+            100, 42, ["/tmp/herdr.sock"]
+        )
+        is None
+    )
 
 
 def test_v1_upstream_client_inventory_rejects_unidentified_connection(monkeypatch):
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    monkeypatch.setattr(core, "v1_local_generation", lambda path: "1:2")
     output = "\n".join(
         [
             "p100",
@@ -243,22 +256,29 @@ def test_v1_upstream_client_inventory_rejects_unidentified_connection(monkeypatc
             "n/tmp/herdr-client.sock",
         ]
     )
-    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
-    assert ch.v1_upstream_local_client_inventory(100, 42, ["/tmp/herdr.sock"]) is None
+    monkeypatch.setattr(
+        discovery, "v1_bounded_command_output", lambda *args, **kwargs: output
+    )
+    assert (
+        process_identity.v1_upstream_local_client_inventory(
+            100, 42, ["/tmp/herdr.sock"]
+        )
+        is None
+    )
 
 
 def test_v1_upstream_client_inventory_allows_unrelated_running_server(monkeypatch):
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
     monkeypatch.setattr(
-        ch,
+        focus,
         "v1_unix_peer_pid",
         lambda path, **kwargs: 200 if path == "/tmp/a.sock" else 300,
     )
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(core, "v1_local_generation", lambda path: "1:2")
 
     def lsof(args, **kwargs):
         server = int(args[-2].split(",")[1])
@@ -266,8 +286,8 @@ def test_v1_upstream_client_inventory_allows_unrelated_running_server(monkeypatc
         name = "/tmp/a-client.sock" if server == 200 else "/tmp/b-client.sock"
         return f"p100\nf4\nd0x111\nn->0x222\np{server}\nf9\nd{server_socket}\nn{name}\n"
 
-    monkeypatch.setattr(ch, "v1_bounded_command_output", lsof)
-    result = ch.v1_upstream_local_client_inventory(
+    monkeypatch.setattr(discovery, "v1_bounded_command_output", lsof)
+    result = process_identity.v1_upstream_local_client_inventory(
         100, 42, ["/tmp/b.sock", "/tmp/a.sock"]
     )
     assert result["sources"][0]["api_socket_path"] == "/tmp/a.sock"
@@ -275,21 +295,23 @@ def test_v1_upstream_client_inventory_allows_unrelated_running_server(monkeypatc
 
 def test_v1_upstream_client_inventory_skips_disappeared_unrelated_server(monkeypatch):
     monkeypatch.setattr(
-        ch,
+        process_identity,
         "v1_native_process_info",
         lambda pid: {"pid": pid, "start_token": pid + 1, "tty_device": 42},
     )
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path, **kwargs: 200)
 
     def generation(path):
         if path == "/tmp/stale.sock":
             raise FileNotFoundError(path)
         return "1:2"
 
-    monkeypatch.setattr(ch, "v1_local_generation", generation)
+    monkeypatch.setattr(core, "v1_local_generation", generation)
     output = "p100\nf4\nd0x111\nn->0x222\np200\nf9\nd0x222\nn/tmp/herdr-client.sock\n"
-    monkeypatch.setattr(ch, "v1_bounded_command_output", lambda *args, **kwargs: output)
-    result = ch.v1_upstream_local_client_inventory(
+    monkeypatch.setattr(
+        discovery, "v1_bounded_command_output", lambda *args, **kwargs: output
+    )
+    result = process_identity.v1_upstream_local_client_inventory(
         100, 42, ["/tmp/stale.sock", "/tmp/herdr.sock"]
     )
     assert result["sources"][0]["api_socket_path"] == "/tmp/herdr.sock"
@@ -297,7 +319,9 @@ def test_v1_upstream_client_inventory_skips_disappeared_unrelated_server(monkeyp
 
 def test_server_verification_continues_past_stale_socket(monkeypatch):
     monkeypatch.setattr(
-        ch, "v1_native_process_info", lambda pid: {"pid": pid, "start_token": 5}
+        process_identity,
+        "v1_native_process_info",
+        lambda pid: {"pid": pid, "start_token": 5},
     )
 
     def generation(path):
@@ -305,9 +329,9 @@ def test_server_verification_continues_past_stale_socket(monkeypatch):
             raise FileNotFoundError(path)
         return "1:2"
 
-    monkeypatch.setattr(ch, "v1_local_generation", generation)
-    monkeypatch.setattr(ch, "v1_unix_peer_pid", lambda path, **kwargs: 200)
-    assert ch.v1_is_verified_local_server(
+    monkeypatch.setattr(core, "v1_local_generation", generation)
+    monkeypatch.setattr(focus, "v1_unix_peer_pid", lambda path, **kwargs: 200)
+    assert process_identity.v1_is_verified_local_server(
         200, ["/stale", "/live"], deadline=time.monotonic() + 5
     )
 
@@ -327,8 +351,8 @@ def test_v1_source_inventory_accepts_only_local_verified_socket_without_boot():
         "sources_complete": True,
         "sources": [source],
     }
-    assert ch.valid_v1_source_inventory(payload, 42)
-    assert not ch.valid_v1_source_inventory(
+    assert process_identity.valid_v1_source_inventory(payload, 42)
+    assert not process_identity.valid_v1_source_inventory(
         {**payload, "sources": [{**source, "socket_generation": "unknown"}]}, 42
     )
     remote = {
@@ -338,7 +362,9 @@ def test_v1_source_inventory_accepts_only_local_verified_socket_without_boot():
         "socket_generation": "1:2",
         "connection_generation": 1,
     }
-    assert not ch.valid_v1_source_inventory({**payload, "sources": [remote]}, 42)
+    assert not process_identity.valid_v1_source_inventory(
+        {**payload, "sources": [remote]}, 42
+    )
 
 
 def test_v1_source_inventory_accepts_unfocused_client_and_multiple_endpoints():
@@ -365,23 +391,27 @@ def test_v1_source_inventory_accepts_unfocused_client_and_multiple_endpoints():
             },
         ],
     }
-    assert ch.valid_v1_source_inventory(payload, 42)
+    assert process_identity.valid_v1_source_inventory(payload, 42)
     native_remote = {**payload["sources"][1], "endpoint": "local"}
-    assert ch.valid_v1_source_inventory({**payload, "sources": [native_remote]}, 42)
-    assert not ch.valid_v1_client_observation(payload, 42)
-    assert not ch.valid_v1_source_inventory({**payload, "pid": 43}, 42)
-    assert not ch.valid_v1_source_inventory({**payload, "sources_complete": 1}, 42)
-    assert not ch.valid_v1_source_inventory(
+    assert process_identity.valid_v1_source_inventory(
+        {**payload, "sources": [native_remote]}, 42
+    )
+    assert not process_identity.valid_v1_client_observation(payload, 42)
+    assert not process_identity.valid_v1_source_inventory({**payload, "pid": 43}, 42)
+    assert not process_identity.valid_v1_source_inventory(
+        {**payload, "sources_complete": 1}, 42
+    )
+    assert not process_identity.valid_v1_source_inventory(
         {**payload, "sources": payload["sources"] * 2}, 42
     )
-    assert not ch.valid_v1_source_inventory(
+    assert not process_identity.valid_v1_source_inventory(
         {
             **payload,
             "sources": [{**payload["sources"][0], "api_socket_path": "relative.sock"}],
         },
         42,
     )
-    assert not ch.valid_v1_source_inventory(
+    assert not process_identity.valid_v1_source_inventory(
         {
             **payload,
             "sources": [{**payload["sources"][1], "ssh_target": "-oProxyCommand=x"}],
@@ -407,8 +437,8 @@ def test_v1_response_rejects_excessive_json_nesting(monkeypatch):
         def recv(self, size):
             return b"[" * 1100 + b"0" + b"]" * 1100 + b"\n"
 
-    monkeypatch.setattr(ch.socket, "socket", lambda *args: Socket())
-    assert ch.v1_read_client_response("/fake") is None
+    monkeypatch.setattr(socket, "socket", lambda *args: Socket())
+    assert process_identity.v1_read_client_response("/fake") is None
 
 
 def test_v1_response_rejects_non_object_even_if_decoder_accepts_it(monkeypatch):
@@ -428,8 +458,8 @@ def test_v1_response_rejects_non_object_even_if_decoder_accepts_it(monkeypatch):
         def recv(self, size):
             return b"[]\n"
 
-    monkeypatch.setattr(ch.socket, "socket", lambda *args: Socket())
-    assert ch.v1_read_client_response("/fake") is None
+    monkeypatch.setattr(socket, "socket", lambda *args: Socket())
+    assert process_identity.v1_read_client_response("/fake") is None
 
 
 def test_v1_response_has_absolute_deadline(monkeypatch):
@@ -453,9 +483,9 @@ def test_v1_response_has_absolute_deadline(monkeypatch):
             reads.append(size)
             return b" "
 
-    monkeypatch.setattr(ch.time, "monotonic", lambda: next(now))
-    monkeypatch.setattr(ch.socket, "socket", lambda *args: Socket())
-    assert ch.v1_read_client_response("/fake") is None
+    monkeypatch.setattr(time, "monotonic", lambda: next(now))
+    monkeypatch.setattr(socket, "socket", lambda *args: Socket())
+    assert process_identity.v1_read_client_response("/fake") is None
     assert len(reads) == 1
 
 
@@ -463,21 +493,21 @@ def test_v1_response_has_absolute_deadline(monkeypatch):
 def test_v1_native_process_identity_checks_live_kernel_incarnation():
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        info = ch.v1_native_process_info(child.pid)
+        info = process_identity.v1_native_process_info(child.pid)
         assert info is not None
         assert info["pid"] == child.pid
         assert info["ppid"] == os.getpid()
         assert info["pgid"] == os.getpgid(child.pid)
         assert info["start_token"] > 0
-        assert ch.v1_native_process_info(child.pid) == info
+        assert process_identity.v1_native_process_info(child.pid) == info
         child.kill()
         deadline = time.monotonic() + 3
-        while ch.v1_wait_child_state(child.pid) is None:
+        while discovery.v1_wait_child_state(child.pid) is None:
             assert time.monotonic() < deadline
             time.sleep(0.01)
-        assert ch.v1_native_process_info(child.pid) is None
+        assert process_identity.v1_native_process_info(child.pid) is None
         child.wait(timeout=3)
-        assert ch.v1_native_process_info(child.pid) is None
+        assert process_identity.v1_native_process_info(child.pid) is None
     finally:
         if child.poll() is None:
             child.kill()
@@ -486,7 +516,7 @@ def test_v1_native_process_identity_checks_live_kernel_incarnation():
 
 @pytest.mark.parametrize("invalid_pid", [0, -1, 2**31, True, 1.5, "1"])
 def test_v1_native_process_info_rejects_invalid_pid(invalid_pid):
-    assert ch.v1_native_process_info(invalid_pid) is None
+    assert process_identity.v1_native_process_info(invalid_pid) is None
 
 
 def test_v1_native_transport_envelope_requires_matching_live_socket_owner(monkeypatch):
@@ -502,15 +532,19 @@ def test_v1_native_transport_envelope_requires_matching_live_socket_owner(monkey
         "bridges": [],
     }
     calls = []
-    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: identity.copy())
     monkeypatch.setattr(
-        ch,
+        process_identity, "v1_native_process_info", lambda pid: identity.copy()
+    )
+    monkeypatch.setattr(
+        process_identity,
         "v1_read_client_response",
         lambda path, expected_peer=None, **kw: (
             calls.append(expected_peer) or response.copy()
         ),
     )
-    assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) == response
+    assert (
+        process_identity.v1_native_transport_envelope("/tmp/owner.sock", 42) == response
+    )
     assert calls == [42]
     for change in (
         {"owner_pid": 43},
@@ -520,17 +554,25 @@ def test_v1_native_transport_envelope_requires_matching_live_socket_owner(monkey
         {"version": True},
     ):
         monkeypatch.setattr(
-            ch,
+            process_identity,
             "v1_read_client_response",
             lambda *args, change=change, **kwargs: {**response, **change},
         )
-        assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
-    monkeypatch.setattr(ch, "v1_read_client_response", lambda *args, **kwargs: None)
-    assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
+        assert (
+            process_identity.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
+        )
+    monkeypatch.setattr(
+        process_identity, "v1_read_client_response", lambda *args, **kwargs: None
+    )
+    assert process_identity.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
     identities = iter([identity, {**identity, "start_token": 124}])
-    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: next(identities))
-    monkeypatch.setattr(ch, "v1_read_client_response", lambda *args, **kwargs: response)
-    assert ch.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
+    monkeypatch.setattr(
+        process_identity, "v1_native_process_info", lambda pid: next(identities)
+    )
+    monkeypatch.setattr(
+        process_identity, "v1_read_client_response", lambda *args, **kwargs: response
+    )
+    assert process_identity.v1_native_transport_envelope("/tmp/owner.sock", 42) is None
 
 
 def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
@@ -581,7 +623,7 @@ def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
         "bridges": [bridge],
         "bound_observations": [bound],
     }
-    claims = ch.v1_native_transport_claims(response)
+    claims = process_identity.v1_native_transport_claims(response)
     assert claims is not None and len(claims) == 1
     pane = {
         "endpoint": "local",
@@ -593,7 +635,7 @@ def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
         "agent_state_change_seq": None,
     }
     pane_bound = {**bound, "observation": {**client, "observation": pane}}
-    assert ch.v1_native_transport_claims(
+    assert process_identity.v1_native_transport_claims(
         {**response, "bound_observations": [pane_bound]}
     )
     for key in ("snapshot_revision", "agent_state_change_seq"):
@@ -602,7 +644,9 @@ def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
             "observation": {**client, "observation": {**pane, key: 2**64}},
         }
         assert (
-            ch.v1_native_transport_claims({**response, "bound_observations": [invalid]})
+            process_identity.v1_native_transport_claims(
+                {**response, "bound_observations": [invalid]}
+            )
             is None
         )
     for change in (
@@ -621,7 +665,9 @@ def test_v1_native_transport_claims_validate_exact_authenticated_bindings():
         },
         {"bridges": [{**bridge, "source": {"target": "other", "session": "work"}}]},
     ):
-        assert ch.v1_native_transport_claims({**response, **change}) is None
+        assert (
+            process_identity.v1_native_transport_claims({**response, **change}) is None
+        )
 
 
 def test_v1_native_topology_requires_same_surface_kernel_parentage_and_tty(monkeypatch):
@@ -669,8 +715,13 @@ def test_v1_native_topology_requires_same_surface_kernel_parentage_and_tty(monke
         43: {"pid": 43, "ppid": 40, "name": "ssh", "tty_device": 100},
     }
     nodes[40]["children"] = [nodes[42], nodes[43]]
-    monkeypatch.setattr(ch, "v1_native_process_info", lambda pid: live.get(pid))
-    assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is not None
+    monkeypatch.setattr(
+        process_identity, "v1_native_process_info", lambda pid: live.get(pid)
+    )
+    assert (
+        process_identity.v1_native_transport_topology(owner, [claim], nodes, 100)
+        is not None
+    )
     for pid, key, value in (
         (42, "ppid", 10),
         (43, "tty_device", 101),
@@ -679,10 +730,16 @@ def test_v1_native_topology_requires_same_surface_kernel_parentage_and_tty(monke
     ):
         original = live[pid][key]
         live[pid][key] = value
-        assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is None
+        assert (
+            process_identity.v1_native_transport_topology(owner, [claim], nodes, 100)
+            is None
+        )
         live[pid][key] = original
     nodes[43]["ppid"] = 10
-    assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is None
+    assert (
+        process_identity.v1_native_transport_topology(owner, [claim], nodes, 100)
+        is None
+    )
     nodes[43]["ppid"] = 40
     calls = {40: 0, 42: 0, 43: 0}
 
@@ -694,5 +751,8 @@ def test_v1_native_topology_requires_same_surface_kernel_parentage_and_tty(monke
             else live[pid].copy()
         )
 
-    monkeypatch.setattr(ch, "v1_native_process_info", replaced)
-    assert ch.v1_native_transport_topology(owner, [claim], nodes, 100) is None
+    monkeypatch.setattr(process_identity, "v1_native_process_info", replaced)
+    assert (
+        process_identity.v1_native_transport_topology(owner, [claim], nodes, 100)
+        is None
+    )

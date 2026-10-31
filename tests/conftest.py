@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import cmux_herdr as ch
+from cmux_herdr_core import cmux, core, remote_bridge
 
 
 @pytest.fixture
@@ -12,7 +12,7 @@ def state():
 
 @pytest.fixture
 def bucket(state):
-    return ch.session_bucket(state)
+    return core.session_bucket(state)
 
 
 @pytest.fixture
@@ -31,13 +31,13 @@ def no_session_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def fast_loop_tick(monkeypatch):
-    monkeypatch.setattr(ch, "LOOP_TICK_SECONDS", 0.01)
+    monkeypatch.setattr(core, "LOOP_TICK_SECONDS", 0.01)
 
 
 @pytest.fixture(autouse=True)
 def isolated_state_dir(monkeypatch, tmp_path):
-    monkeypatch.setattr(ch, "state_dir", tmp_path)
-    monkeypatch.setattr(ch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(core, "state_dir", tmp_path)
+    monkeypatch.setattr(core, "STATE_PATH", tmp_path / "state.json")
 
 
 @pytest.fixture
@@ -48,25 +48,25 @@ def cfg():
 @pytest.fixture
 def cmux_calls(monkeypatch):
     calls = []
-    monkeypatch.setattr(ch, "cmux_notifications_checked", lambda cfg: [])
+    monkeypatch.setattr(cmux, "cmux_notifications_checked", lambda cfg: [])
 
     def fake_run(cmd, timeout=10):
         calls.append(cmd[1:])
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(ch, "run", fake_run)
+    monkeypatch.setattr(cmux, "run", fake_run)
     return calls
 
 
 @pytest.fixture(autouse=True)
 def no_label_lookup(monkeypatch):
-    monkeypatch.setattr(ch, "workspace_label", lambda ws_id: "")
+    monkeypatch.setattr(cmux, "workspace_label", lambda ws_id: "")
 
 
 @pytest.fixture
 def remote_title_map(monkeypatch):
     monkeypatch.setattr(
-        ch, "cmux_workspaces_by_title", lambda cfg: {"maguro:hd:tom": "workspace:9"}
+        cmux, "cmux_workspaces_by_title", lambda cfg: {"maguro:hd:tom": "workspace:9"}
     )
 
 
@@ -81,5 +81,7 @@ def watch_state(tmp_path):
 
 @pytest.fixture
 def force_action_identity(monkeypatch):
-    monkeypatch.setattr(ch, "v1_herdr_process_identity", lambda pid: {"start_token": 1})
-    monkeypatch.setattr(ch, "v1_local_generation", lambda path: "1:2")
+    monkeypatch.setattr(
+        remote_bridge, "v1_herdr_process_identity", lambda pid: {"start_token": 1}
+    )
+    monkeypatch.setattr(core, "v1_local_generation", lambda path: "1:2")
