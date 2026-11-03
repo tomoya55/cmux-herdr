@@ -8,7 +8,7 @@ When an agent needs input, the workspace shows a waiting notification and status
 
 - macOS and cmux.app
 - Herdr 0.9.1 or newer
-- Python 3.11 or newer
+- Python 3.14 or newer
 - zsh for the optional shell integration below
 
 The integration uses the cmux CLI at `/Applications/cmux.app/Contents/Resources/bin/cmux` by default. Set `cmux_bin` in the plugin configuration if it is installed elsewhere.
@@ -95,7 +95,13 @@ herdr plugin uninstall cmux-herdr
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/):
+Requires [mise](https://mise.jdx.dev/) to install the development tools:
+
+```bash
+mise install
+```
+
+Then run:
 
 ```bash
 uv sync
@@ -104,7 +110,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-CI tests Python 3.11 and 3.13. The plugin has no third-party runtime dependencies.
+CI tests Python 3.14. The plugin has no third-party runtime dependencies.
 
 ## License
 
